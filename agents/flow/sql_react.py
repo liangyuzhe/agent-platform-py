@@ -1,5 +1,7 @@
 """SQL React 图：自然语言 -> SQL -> 审批 -> 执行。"""
 
+import asyncio
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -15,7 +17,7 @@ from agents.config.settings import settings
 async def sql_retrieve(state: SQLReactState) -> dict:
     """检索表结构信息。"""
     retriever = HybridRetriever()
-    docs = await retriever.retrieve(state["query"])
+    docs = await asyncio.to_thread(retriever.retrieve, state["query"])
     return {"docs": docs}
 
 
