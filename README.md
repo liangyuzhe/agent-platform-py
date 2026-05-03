@@ -111,7 +111,7 @@ agent-platform-py/
 │   │   └── rrf.py                  # RRF 融合
 │   │
 │   └── static/                     # 前端
-│       └── index.html              # Chat UI
+│       └── index.html              # Chat + SQL Agent + 文档上传 UI
 │
 ├── tests/                          # 测试
 ├── docs/                           # 技术文档
@@ -188,9 +188,14 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 服务启动后访问：
-- API 文档：http://localhost:8080/docs
-- Chat UI：http://localhost:8080/
-- 健康检查：http://localhost:8080/health
+
+| 页面 | 路径 | 说明 |
+|------|------|------|
+| Chat UI | http://localhost:8080/ | RAG 对话（Tab 1） |
+| SQL Agent | http://localhost:8080/ | 意图自动路由：SQL 查询 / 普通对话（Tab 2） |
+| 文档上传 | http://localhost:8080/ | 上传文档并索引到 RAG（Tab 3） |
+| API 文档 | http://localhost:8080/docs | Swagger UI |
+| 健康检查 | http://localhost:8080/health | 服务状态 |
 
 ## API 接口
 
@@ -233,6 +238,19 @@ curl -X POST http://localhost:8080/api/rag/chat/stream \
 curl -X POST http://localhost:8080/api/final/invoke \
   -H "Content-Type: application/json" \
   -d '{"query": "查询最近 7 天的订单数量", "session_id": "user1"}'
+```
+
+### 文档上传
+
+```bash
+# 上传文档并索引（默认 RAG 模式）
+curl -X POST http://localhost:8080/api/document/insert \
+  -F "file=@document.pdf"
+
+# 指定 Parent Document RAG 模式
+curl -X POST http://localhost:8080/api/document/insert \
+  -F "file=@document.pdf" \
+  -F "rag_mode=parent"
 ```
 
 ## 核心设计
@@ -365,6 +383,21 @@ TOP_K=5                      # 检索返回文档数
 
 ```bash
 MAX_HISTORY_LEN=3            # 保留最近 N 轮对话
+```
+
+### 链路追踪
+
+```bash
+# LangSmith
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your-key
+
+# CozeLoop (JWT OAuth)
+COZELOOP_TRACING=true
+COZELOOP_WORKSPACE_ID=your-workspace-id
+COZELOOP_JWT_OAUTH_CLIENT_ID=your-client-id
+COZELOOP_JWT_OAUTH_PRIVATE_KEY=your-private-key
+COZELOOP_JWT_OAUTH_PUBLIC_KEY_ID=your-public-key-id
 ```
 
 ## Docker 部署
