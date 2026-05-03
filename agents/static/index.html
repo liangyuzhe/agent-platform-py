@@ -50,57 +50,33 @@
             return div.querySelector('.bubble');
         }
 
-        function send() {
+        async function send() {
             const query = queryInput.value.trim();
             if (!query) return;
             queryInput.value = '';
             btn.disabled = true;
             addMessage('user', query);
 
-            let assistantContent = '';
-            const bubble = addMessage('assistant', '...');
-            let finished = false;
+            const bubble = addMessage('assistant', '思考中...');
 
-            const url = `/api/rag/chat/stream?query=${encodeURIComponent(query)}&session_id=${encodeURIComponent(sessionId)}`;
-            const evtSource = new EventSource(url);
+            try {
+                const resp = await fetch('/api/rag/ask', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query, session_id: sessionId}),
+                });
 
-            // Handle streamed message chunks
-            evtSource.addEventListener('message', function(event) {
-                assistantContent += event.data;
-                bubble.textContent = assistantContent;
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            });
-
-            // Handle [DONE] signal - clean close
-            evtSource.addEventListener('done', function() {
-                finished = true;
-                evtSource.close();
-                if (!assistantContent) {
-                    bubble.textContent = '(无响应)';
+                if (!resp.ok) {
+                    bubble.textContent = '请求失败: HTTP ' + resp.status;
+                } else {
+                    const data = await resp.json();
+                    bubble.textContent = data.answer || '(无响应)';
                 }
-                btn.disabled = false;
-            });
+            } catch (e) {
+                bubble.textContent = '请求失败: ' + e.message;
+            }
 
-            // Handle server-sent error events
-            evtSource.addEventListener('error', function(event) {
-                if (event.data) {
-                    bubble.textContent = '服务器错误: ' + event.data;
-                    finished = true;
-                    evtSource.close();
-                    btn.disabled = false;
-                }
-            });
-
-            // Handle connection errors (network issues, server crash)
-            evtSource.onerror = function() {
-                if (!finished) {
-                    evtSource.close();
-                    if (!assistantContent) {
-                        bubble.textContent = '(无响应)';
-                    }
-                    btn.disabled = false;
-                }
-            };
+            btn.disabled = false;
         }
     </script>
 </body>
