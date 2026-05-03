@@ -130,6 +130,9 @@ agent-platform-py/
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
+
+# 如需链路追踪（CozeLoop）
+pip install cozeloop
 ```
 
 ### 2. 启动基础设施
@@ -386,6 +389,14 @@ MAX_HISTORY_LEN=3            # 保留最近 N 轮对话
 ```
 
 ### 链路追踪
+
+LangSmith 通过环境变量自动启用，CozeLoop 需额外安装：
+
+```bash
+pip install cozeloop
+```
+
+`.env` 配置：
 
 ```bash
 # LangSmith
