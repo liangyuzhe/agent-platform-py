@@ -9,7 +9,19 @@
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
         .container { max-width: 800px; margin: 0 auto; padding: 20px; }
         h1 { text-align: center; margin-bottom: 20px; color: #333; }
-        .chat-box { background: white; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+
+        /* Tabs */
+        .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+        .tabs button {
+            flex: 1; padding: 10px; border: none; background: #ddd; cursor: pointer;
+            font-size: 14px; border-radius: 8px 8px 0 0; color: #555;
+        }
+        .tabs button.active { background: white; color: #007AFF; font-weight: 600; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Chat */
+        .chat-box { background: white; border-radius: 0 12px 12px 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
         .messages { height: 500px; overflow-y: auto; padding: 20px; }
         .message { margin-bottom: 16px; display: flex; }
         .message.user { justify-content: flex-end; }
@@ -22,20 +34,86 @@
         .input-area button { padding: 12px 24px; background: #007AFF; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }
         .input-area button:hover { background: #0056b3; }
         .input-area button:disabled { background: #ccc; cursor: not-allowed; }
+
+        /* Upload */
+        .upload-box { background: white; border-radius: 0 12px 12px 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); padding: 24px; }
+        .upload-zone {
+            border: 2px dashed #ccc; border-radius: 12px; padding: 40px; text-align: center;
+            cursor: pointer; transition: border-color 0.2s, background 0.2s; margin-bottom: 16px;
+        }
+        .upload-zone:hover, .upload-zone.dragover { border-color: #007AFF; background: #f0f8ff; }
+        .upload-zone p { color: #888; margin-top: 8px; font-size: 14px; }
+        .upload-zone .icon { font-size: 36px; }
+        .upload-options { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+        .upload-options label { font-size: 14px; color: #555; }
+        .upload-options select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+        .upload-btn {
+            width: 100%; padding: 12px; background: #007AFF; color: white; border: none;
+            border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500;
+        }
+        .upload-btn:hover { background: #0056b3; }
+        .upload-btn:disabled { background: #ccc; cursor: not-allowed; }
+        .upload-result { margin-top: 16px; padding: 12px; border-radius: 8px; font-size: 14px; display: none; }
+        .upload-result.success { display: block; background: #d4edda; color: #155724; }
+        .upload-result.error { display: block; background: #f8d7da; color: #721c24; }
+        .file-info { font-size: 13px; color: #666; margin-bottom: 12px; }
+        #fileInput { display: none; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Agents-Py</h1>
-        <div class="chat-box">
-            <div class="messages" id="messages"></div>
-            <div class="input-area">
-                <input type="text" id="query" placeholder="输入你的问题..." onkeydown="if(event.key==='Enter')send()">
-                <button onclick="send()" id="btn">发送</button>
+        <div class="tabs">
+            <button class="active" onclick="switchTab('chat')">Chat</button>
+            <button onclick="switchTab('upload')">Upload Document</button>
+        </div>
+
+        <!-- Chat Tab -->
+        <div id="tab-chat" class="tab-content active">
+            <div class="chat-box">
+                <div class="messages" id="messages"></div>
+                <div class="input-area">
+                    <input type="text" id="query" placeholder="输入你的问题..." onkeydown="if(event.key==='Enter')send()">
+                    <button onclick="send()" id="btn">发送</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Upload Tab -->
+        <div id="tab-upload" class="tab-content">
+            <div class="upload-box">
+                <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                    <div class="icon">📄</div>
+                    <p>点击选择文件或拖拽文件到此处</p>
+                    <p style="font-size:12px; color:#aaa; margin-top:4px;">支持 txt, md, pdf, docx</p>
+                </div>
+                <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx">
+                <div class="file-info" id="fileInfo"></div>
+                <div class="upload-options">
+                    <label>索引模式:</label>
+                    <select id="ragMode">
+                        <option value="">默认</option>
+                        <option value="traditional">Traditional RAG</option>
+                        <option value="parent">Parent Document RAG</option>
+                    </select>
+                </div>
+                <button class="upload-btn" id="uploadBtn" onclick="uploadFile()" disabled>上传并索引</button>
+                <div class="upload-result" id="uploadResult"></div>
             </div>
         </div>
     </div>
+
     <script>
+        // --- Tab switching ---
+        function switchTab(name) {
+            document.querySelectorAll('.tabs button').forEach((b, i) => {
+                b.classList.toggle('active', (name === 'chat' ? i === 0 : i === 1));
+            });
+            document.getElementById('tab-chat').classList.toggle('active', name === 'chat');
+            document.getElementById('tab-upload').classList.toggle('active', name === 'upload');
+        }
+
+        // --- Chat ---
         const messagesDiv = document.getElementById('messages');
         const queryInput = document.getElementById('query');
         const btn = document.getElementById('btn');
@@ -56,16 +134,13 @@
             queryInput.value = '';
             btn.disabled = true;
             addMessage('user', query);
-
             const bubble = addMessage('assistant', '思考中...');
-
             try {
                 const resp = await fetch('/api/rag/ask', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
-
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
@@ -75,8 +150,71 @@
             } catch (e) {
                 bubble.textContent = '请求失败: ' + e.message;
             }
-
             btn.disabled = false;
+        }
+
+        // --- Upload ---
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const uploadResult = document.getElementById('uploadResult');
+        let selectedFile = null;
+
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                onFileSelected();
+            }
+        });
+
+        fileInput.addEventListener('change', onFileSelected);
+
+        function onFileSelected() {
+            selectedFile = fileInput.files[0];
+            if (selectedFile) {
+                const size = (selectedFile.size / 1024).toFixed(1);
+                fileInfo.textContent = `已选择: ${selectedFile.name} (${size} KB)`;
+                uploadBtn.disabled = false;
+                uploadResult.className = 'upload-result';
+            }
+        }
+
+        async function uploadFile() {
+            if (!selectedFile) return;
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = '上传中...';
+            uploadResult.className = 'upload-result';
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+            const mode = document.getElementById('ragMode').value;
+            if (mode) formData.append('rag_mode', mode);
+
+            try {
+                const resp = await fetch('/api/document/insert', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    uploadResult.className = 'upload-result success';
+                    uploadResult.textContent = data.message;
+                } else {
+                    uploadResult.className = 'upload-result error';
+                    uploadResult.textContent = data.message;
+                }
+            } catch (e) {
+                uploadResult.className = 'upload-result error';
+                uploadResult.textContent = '上传失败: ' + e.message;
+            }
+
+            uploadBtn.textContent = '上传并索引';
+            uploadBtn.disabled = false;
         }
     </script>
 </body>
