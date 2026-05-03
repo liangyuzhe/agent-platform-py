@@ -13,7 +13,7 @@
         .messages { height: 500px; overflow-y: auto; padding: 20px; }
         .message { margin-bottom: 16px; display: flex; }
         .message.user { justify-content: flex-end; }
-        .message .bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; }
+        .message .bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; }
         .message.user .bubble { background: #007AFF; color: white; border-bottom-right-radius: 4px; }
         .message.assistant .bubble { background: #E9ECEF; color: #333; border-bottom-left-radius: 4px; }
         .input-area { display: flex; padding: 16px; border-top: 1px solid #eee; gap: 8px; }
@@ -47,9 +47,10 @@
             div.innerHTML = `<div class="bubble">${content}</div>`;
             messagesDiv.appendChild(div);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            return div.querySelector('.bubble');
         }
 
-        async function send() {
+        function send() {
             const query = queryInput.value.trim();
             if (!query) return;
             queryInput.value = '';
@@ -57,53 +58,38 @@
             addMessage('user', query);
 
             let assistantContent = '';
-            const assistantDiv = document.createElement('div');
-            assistantDiv.className = 'message assistant';
-            assistantDiv.innerHTML = '<div class="bubble"></div>';
-            messagesDiv.appendChild(assistantDiv);
-            const bubble = assistantDiv.querySelector('.bubble');
+            const bubble = addMessage('assistant', '...');
 
-            try {
-                const resp = await fetch('/api/rag/chat/stream', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query, session_id: sessionId}),
-                });
+            const url = `/api/rag/chat/stream?query=${encodeURIComponent(query)}&session_id=${encodeURIComponent(sessionId)}`;
+            const evtSource = new EventSource(url);
 
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
+            evtSource.onmessage = function(event) {
+                assistantContent += event.data;
+                bubble.textContent = assistantContent;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            };
 
-                while (true) {
-                    const {done, value} = await reader.read();
-                    if (done) break;
-                    buffer += decoder.decode(value, {stream: true});
+            evtSource.addEventListener('message', function(event) {
+                assistantContent += event.data;
+                bubble.textContent = assistantContent;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            });
 
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop();
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-                                if (data.event === 'data' && data.data) {
-                                    assistantContent += data.data;
-                                    bubble.textContent = assistantContent;
-                                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                                } else if (data.event === 'error') {
-                                    bubble.textContent = '服务器错误: ' + data.data;
-                                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                                }
-                            } catch {}
-                        }
-                    }
+            evtSource.addEventListener('error', function(event) {
+                if (event.data) {
+                    bubble.textContent = '服务器错误: ' + event.data;
                 }
-            } catch (e) {
-                bubble.textContent = '请求失败: ' + e.message;
-            }
+                evtSource.close();
+                btn.disabled = false;
+            });
 
-            if (!assistantContent) bubble.textContent = '(无响应)';
-            btn.disabled = false;
+            evtSource.onerror = function() {
+                evtSource.close();
+                if (!assistantContent) {
+                    bubble.textContent = '(无响应)';
+                }
+                btn.disabled = false;
+            };
         }
     </script>
 </body>

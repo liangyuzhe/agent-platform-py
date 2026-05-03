@@ -42,23 +42,40 @@ async def rag_ask(req: RAGChatRequest):
 
 @router.post("/chat/stream")
 async def rag_chat_stream(req: RAGChatRequest, request: Request):
-    """SSE 流式 RAG 对话。"""
+    """SSE 流式 RAG 对话 (POST)。"""
+    return await _stream_rag_chat(_build_input(req), request)
+
+
+@router.get("/chat/stream")
+async def rag_chat_stream_get(
+    query: str,
+    session_id: str = "default_user",
+    rag_mode: Literal["traditional", "parent"] | None = None,
+    request: Request = None,
+):
+    """SSE 流式 RAG 对话 (GET, for EventSource)."""
+    inp = {"session_id": session_id, "query": query}
+    if rag_mode is not None:
+        inp["rag_mode"] = rag_mode
+    return await _stream_rag_chat(inp, request)
+
+
+async def _stream_rag_chat(inp: dict, request: Request):
+    """Shared streaming logic."""
     graph = build_rag_chat_graph()
 
     async def generate() -> AsyncGenerator[dict, None]:
-        yield {"event": "start", "data": ""}
         try:
             async for event in graph.astream_events(
-                {"input": _build_input(req)},
+                {"input": inp},
                 version="v2",
             ):
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
                     if chunk.content:
-                        yield {"event": "data", "data": chunk.content}
+                        yield {"event": "message", "data": chunk.content}
         except Exception as e:
             logger.exception("RAG chat stream error")
             yield {"event": "error", "data": str(e)}
-        yield {"event": "end", "data": ""}
 
     return await sse_response(generate(), request)
