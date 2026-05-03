@@ -283,3 +283,7 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings()
     return _settings
+
+
+# Module-level singleton for convenient imports: ``from agents.config.settings import settings``
+settings = get_settings()
