@@ -72,6 +72,7 @@ agent-platform-py/
 │   ├── rag/                        # RAG 管线
 │   │   ├── indexing.py             # 文档索引（Loader → Splitter → Store）
 │   │   ├── retriever.py            # 混合检索（Milvus + ES BM25 + RRF）
+│   │   ├── parent_retriever.py     # Parent Document RAG
 │   │   ├── reranker.py             # Cross-Encoder 重排序
 │   │   └── query_rewrite.py        # 查询重写（指代消解）
 │   │
@@ -105,18 +106,16 @@ agent-platform-py/
 │   │   │   └── callback.py         # 追踪 Callback
 │   │   └── token_counter.py        # Token 计数器
 │   │
-│   └── algorithm/                  # 算法
-│       ├── bm25.py                 # BM25 实现
-│       └── rrf.py                  # RRF 融合
-│
-├── static/                         # 前端
-│   └── final_graph.html            # Chat UI
+│   ├── algorithm/                  # 算法
+│   │   ├── bm25.py                 # BM25 实现
+│   │   └── rrf.py                  # RRF 融合
+│   │
+│   └── static/                     # 前端
+│       └── index.html              # Chat UI
 │
 ├── tests/                          # 测试
 ├── docs/                           # 技术文档
-│   ├── technical_architecture.md   # Go 版架构解析
-│   ├── python_langchain_design.md  # Python 版设计文档
-│   └── memory_system.md            # 记忆系统详解
+│   └── python_langchain_design.md  # Python 版设计文档
 │
 └── data/                           # 数据目录
     └── sft/                        # SFT 训练数据
@@ -384,7 +383,6 @@ docker-compose logs -f milvus
 ## 技术文档
 
 - [Python 版设计文档](python_langchain_design.md)
-
 
 ## 依赖说明
 
