@@ -1,20 +1,11 @@
-"""Query rewriting with conversation context using a Qwen model."""
+"""Query rewriting with conversation context."""
 
 from __future__ import annotations
 
+from typing import Union
+
 from agents.config.settings import settings
-
-
-def _get_qwen_llm():
-    """Return a ChatOpenAI-compatible LLM instance for Qwen."""
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
-        openai_api_key=settings.qwen.key,
-        openai_api_base=settings.qwen.base_url,
-        model_name=settings.qwen.chat_model,
-        temperature=0.3,
-    )
+from agents.model.chat_model import get_chat_model
 
 
 _REWRITE_SYSTEM_PROMPT = """\
@@ -30,7 +21,23 @@ Rules:
 """
 
 
-def rewrite_query(summary: str, history: str, query: str) -> str:
+def _format_history(history: Union[str, list[dict]]) -> str:
+    """Format history into a string for the prompt."""
+    if isinstance(history, str):
+        return history
+    lines = []
+    for h in history:
+        role = h.get("role", "user")
+        content = h.get("content", "")
+        lines.append(f"[{role}]: {content}")
+    return "\n".join(lines)
+
+
+def rewrite_query(
+    summary: str,
+    history: Union[str, list[dict]],
+    query: str,
+) -> str:
     """Rewrite *query* into a standalone search query using conversation context.
 
     Parameters
@@ -38,7 +45,7 @@ def rewrite_query(summary: str, history: str, query: str) -> str:
     summary:
         A condensed summary of the entire conversation so far.
     history:
-        The most recent chat history (e.g. last N turns as formatted text).
+        The most recent chat history as a string or list of message dicts.
     query:
         The latest user query that may contain ambiguous references.
 
@@ -47,11 +54,12 @@ def rewrite_query(summary: str, history: str, query: str) -> str:
     str
         A rewritten, self-contained query suitable for retrieval.
     """
-    llm = _get_qwen_llm()
+    llm = get_chat_model(settings.chat_model_type)
 
+    history_text = _format_history(history)
     user_message = (
         f"## Conversation summary\n{summary}\n\n"
-        f"## Recent history\n{history}\n\n"
+        f"## Recent history\n{history_text}\n\n"
         f"## New query\n{query}"
     )
 
