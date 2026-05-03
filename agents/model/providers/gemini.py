@@ -17,14 +17,14 @@ def _create_chat_model():
 
         return ChatGoogleGenerativeAI(
             model=settings.gemini.chat_model,
-            google_api_key=settings.gemini.api_key,
+            google_api_key=settings.gemini.key,
         )
     except ImportError:
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
             model=settings.gemini.chat_model,
-            api_key=settings.gemini.api_key,
+            api_key=settings.gemini.key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
 

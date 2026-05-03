@@ -12,7 +12,7 @@ from agents.model.embedding_model import register_embedding_model
 def _create_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.qwen.chat_model,
-        api_key=settings.qwen.api_key,
+        api_key=settings.qwen.key,
         base_url=settings.qwen.base_url,
     )
 
@@ -22,7 +22,7 @@ def _create_embedding_model():
 
     return OpenAIEmbeddings(
         model=settings.qwen.embedding_model,
-        api_key=settings.qwen.api_key,
+        api_key=settings.qwen.key,
         base_url=settings.qwen.base_url,
     )
 

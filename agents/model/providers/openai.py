@@ -11,7 +11,7 @@ from agents.model.chat_model import register_chat_model
 def _create_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.openai.chat_model,
-        api_key=settings.openai.api_key,
+        api_key=settings.openai.key,
     )
 
 

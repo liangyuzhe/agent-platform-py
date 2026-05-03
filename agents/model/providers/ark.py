@@ -15,7 +15,7 @@ _ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 def _create_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.ark.chat_model,
-        api_key=settings.ark.api_key,
+        api_key=settings.ark.key,
         base_url=_ARK_BASE_URL,
     )
 
@@ -25,7 +25,7 @@ def _create_embedding_model():
 
     return OpenAIEmbeddings(
         model=settings.ark.embedding_model,
-        api_key=settings.ark.api_key,
+        api_key=settings.ark.key,
         base_url=_ARK_BASE_URL,
     )
 

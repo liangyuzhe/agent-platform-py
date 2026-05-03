@@ -10,7 +10,7 @@ def _get_qwen_llm():
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(
-        openai_api_key=settings.qwen.api_key,
+        openai_api_key=settings.qwen.key,
         openai_api_base=settings.qwen.base_url,
         model_name=settings.qwen.chat_model,
         temperature=0.3,

@@ -19,19 +19,19 @@ def _get_embeddings():
     if provider == "ark":
         from langchain_community.embeddings import VolcengineEmbeddings
         return VolcengineEmbeddings(
-            ark_api_key=settings.ark.api_key,
+            ark_api_key=settings.ark.key,
             model=settings.ark.embedding_model,
         )
     if provider == "openai":
         from langchain_openai import OpenAIEmbeddings
         return OpenAIEmbeddings(
-            openai_api_key=settings.openai.api_key,
+            openai_api_key=settings.openai.key,
             model=settings.openai.embedding_model,
         )
     if provider == "qwen":
         from langchain_openai import OpenAIEmbeddings
         return OpenAIEmbeddings(
-            openai_api_key=settings.qwen.api_key,
+            openai_api_key=settings.qwen.key,
             openai_api_base=settings.qwen.base_url,
             model=settings.qwen.embedding_model,
         )

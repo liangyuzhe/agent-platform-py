@@ -14,7 +14,7 @@ _DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 def _create_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.deepseek.chat_model,
-        api_key=settings.deepseek.api_key,
+        api_key=settings.deepseek.key,
         base_url=_DEEPSEEK_BASE_URL,
     )
 
