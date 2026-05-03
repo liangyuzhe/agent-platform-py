@@ -66,10 +66,27 @@ class TestCozeLoopInit:
         mock_settings.cozeloop.workspace_id = "test-workspace"
         mock_settings.cozeloop.api_base_url = ""
 
-        from agents.tool.trace.tracing import get_cozeloop_handler
-        # Should return None if cozeloop package is not installed
-        result = get_cozeloop_handler()
-        assert result is None
+        import agents.tool.trace.tracing as tracing_mod
+        saved_client = tracing_mod._cozeloop_client
+        tracing_mod._cozeloop_client = None
+
+        # Mock the import to raise ImportError
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "cozeloop" or name.startswith("cozeloop."):
+                raise ImportError("No module named 'cozeloop'")
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = mock_import
+        try:
+            from agents.tool.trace.tracing import get_cozeloop_handler
+            result = get_cozeloop_handler()
+            assert result is None
+        finally:
+            builtins.__import__ = real_import
+            tracing_mod._cozeloop_client = saved_client
 
     @patch("agents.tool.trace.tracing.settings")
     def test_cozeloop_sets_env_vars(self, mock_settings):
@@ -102,10 +119,25 @@ class TestTraceCallbacks:
     """Test get_trace_callbacks."""
 
     @patch("agents.tool.trace.tracing.settings")
-    def test_returns_empty_list_when_disabled(self, mock_settings):
+    def test_returns_empty_list_when_all_disabled(self, mock_settings):
+        mock_settings.langsmith.tracing = False
+        mock_settings.langsmith.api_key = ""
         mock_settings.cozeloop.tracing = False
         mock_settings.cozeloop.jwt_oauth_client_id = ""
 
         from agents.tool.trace.tracing import get_trace_callbacks
         callbacks = get_trace_callbacks()
         assert callbacks == []
+
+    @patch("agents.tool.trace.tracing.settings")
+    def test_returns_langsmith_handler_when_enabled(self, mock_settings):
+        mock_settings.langsmith.tracing = True
+        mock_settings.langsmith.api_key = "test-key"
+        mock_settings.langsmith.url = "https://test.langchain.com"
+        mock_settings.cozeloop.tracing = False
+        mock_settings.cozeloop.jwt_oauth_client_id = ""
+
+        from agents.tool.trace.tracing import get_trace_callbacks
+        callbacks = get_trace_callbacks()
+        assert len(callbacks) == 1
+        assert type(callbacks[0]).__name__ == "LangChainTracer"

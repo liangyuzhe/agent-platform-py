@@ -1,10 +1,7 @@
 """Tracing initialization for LangSmith and CozeLoop.
 
-Sets up environment variables for LangSmith and creates CozeLoop callback
-handlers that can be attached to LangChain/LangGraph calls.
-
-CozeLoop uses JWT OAuth authentication — the SDK reads config from env vars
-(COZELOOP_WORKSPACE_ID, COZELOOP_JWT_OAUTH_CLIENT_ID, etc.) automatically.
+Creates callback handlers that are attached to every LangChain/LangGraph
+invocation via get_trace_callbacks().
 """
 
 from __future__ import annotations
@@ -22,20 +19,30 @@ _cozeloop_client: Any = None
 
 
 def init_langsmith() -> None:
-    """Enable LangSmith tracing via environment variables.
-
-    LangChain reads LANGCHAIN_* env vars for auto-tracing.
-    """
+    """Set env vars for LangSmith (also used by LangChainTracer)."""
     if not settings.langsmith.tracing or not settings.langsmith.api_key:
         logger.info("LangSmith tracing disabled")
         return
 
-    # LangChain auto-detects these env vars
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGCHAIN_API_KEY"] = settings.langsmith.api_key
     os.environ["LANGCHAIN_ENDPOINT"] = settings.langsmith.url
 
     logger.info("LangSmith tracing enabled (endpoint: %s)", settings.langsmith.url)
+
+
+def _get_langsmith_handler() -> Any | None:
+    """Return a LangChainTracer, or None if disabled."""
+    if not settings.langsmith.tracing or not settings.langsmith.api_key:
+        return None
+
+    try:
+        from langchain_core.tracers.langchain import LangChainTracer
+        tracer = LangChainTracer()
+        return tracer
+    except Exception as e:
+        logger.warning("Failed to create LangChainTracer: %s", e)
+        return None
 
 
 def _set_cozeloop_env() -> None:
@@ -54,11 +61,7 @@ def _set_cozeloop_env() -> None:
 
 
 def get_cozeloop_handler() -> Any | None:
-    """Return a CozeLoop LangChain callback handler, or None if disabled.
-
-    Uses JWT OAuth authentication via cozeloop.new_client().
-    The SDK reads COZELOOP_JWT_OAUTH_* env vars automatically.
-    """
+    """Return a CozeLoop LangChain callback handler, or None if disabled."""
     global _cozeloop_client
 
     if not settings.cozeloop.tracing or not settings.cozeloop.jwt_oauth_client_id:
@@ -91,9 +94,15 @@ def get_trace_callbacks() -> list[Any]:
     """Return all enabled trace callback handlers."""
     callbacks = []
 
-    handler = get_cozeloop_handler()
-    if handler:
-        callbacks.append(handler)
+    # LangSmith
+    langsmith = _get_langsmith_handler()
+    if langsmith:
+        callbacks.append(langsmith)
+
+    # CozeLoop
+    cozelop = get_cozeloop_handler()
+    if cozelop:
+        callbacks.append(cozelop)
 
     return callbacks
 
@@ -112,7 +121,6 @@ def close_cozeloop() -> None:
 def init_tracing() -> None:
     """Initialize all tracing systems."""
     init_langsmith()
-    # CozeLoop is lazy-loaded per request via get_trace_callbacks()
     if settings.cozeloop.tracing and settings.cozeloop.jwt_oauth_client_id:
         logger.info("CozeLoop tracing configured (JWT OAuth, will attach per-request)")
     elif settings.cozeloop.tracing:
