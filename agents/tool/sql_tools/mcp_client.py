@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -34,11 +35,11 @@ async def _connect() -> ClientSession:
     if _session is not None:
         return _session
 
-    mysql_host = settings._env("MCP_MYSQL_HOST", "localhost")
-    mysql_port = settings._env("MCP_MYSQL_PORT", "3306")
-    mysql_user = settings._env("MCP_MYSQL_USER", "root")
-    mysql_password = settings._env("MCP_MYSQL_PASSWORD", "")
-    mysql_database = settings._env("MCP_MYSQL_DATABASE", "test")
+    mysql_host = os.environ.get("MCP_MYSQL_HOST", settings.mysql.host)
+    mysql_port = os.environ.get("MCP_MYSQL_PORT", str(settings.mysql.port))
+    mysql_user = os.environ.get("MCP_MYSQL_USER", settings.mysql.username)
+    mysql_password = os.environ.get("MCP_MYSQL_PASSWORD", settings.mysql.password)
+    mysql_database = os.environ.get("MCP_MYSQL_DATABASE", settings.mysql.database)
 
     server_params = StdioServerParameters(
         command="npx",

@@ -1,6 +1,7 @@
 """SQL React 图：自然语言 -> SQL -> 审批 -> 执行。"""
 
 import asyncio
+import logging
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,6 +12,8 @@ from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.rag.retriever import HybridRetriever
 from agents.config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 async def sql_retrieve(state: SQLReactState) -> dict:
@@ -87,7 +90,11 @@ async def safety_check(state: SQLReactState) -> dict:
 async def execute_sql(state: SQLReactState) -> dict:
     """通过 MCP 执行 SQL。"""
     from agents.tool.sql_tools.mcp_client import execute_sql as mcp_execute
-    result = await mcp_execute(state["sql"])
+    try:
+        result = await mcp_execute(state["sql"])
+    except Exception as e:
+        logger.warning("SQL execution failed: %s", e)
+        result = f"SQL 执行失败: {e}"
     return {"result": result, "answer": result}
 
 
