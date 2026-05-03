@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     from agents.tool.storage.redis_client import init_redis, close_redis
     from agents.model.chat_model import init_chat_models
     from agents.model.embedding_model import init_embedding_models
+    from agents.tool.trace.tracing import init_tracing
 
     # 初始化基础设施
     await init_redis()
@@ -25,6 +26,9 @@ async def lifespan(app: FastAPI):
     # 初始化模型
     init_chat_models()
     init_embedding_models()
+
+    # 初始化链路追踪
+    init_tracing()
 
     yield
 

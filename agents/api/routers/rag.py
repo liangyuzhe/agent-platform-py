@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Literal
 
 from agents.flow.rag_chat import build_rag_chat_graph
 from agents.api.sse import sse_response
+from agents.tool.trace.tracing import get_trace_callbacks
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -36,7 +37,9 @@ def _build_input(req: RAGChatRequest) -> dict:
 async def rag_ask(req: RAGChatRequest):
     """非流式 RAG 问答。"""
     graph = build_rag_chat_graph()
-    result = await graph.ainvoke({"input": _build_input(req)})
+    callbacks = get_trace_callbacks()
+    config = {"callbacks": callbacks} if callbacks else {}
+    result = await graph.ainvoke({"input": _build_input(req)}, config=config)
     return RAGAskResponse(answer=result.get("answer", ""), session_id=req.session_id)
 
 
@@ -63,12 +66,15 @@ async def rag_chat_stream_get(
 async def _stream_rag_chat(inp: dict, request: Request):
     """Shared streaming logic."""
     graph = build_rag_chat_graph()
+    callbacks = get_trace_callbacks()
+    config = {"callbacks": callbacks} if callbacks else {}
 
     async def generate() -> AsyncGenerator[dict, None]:
         try:
             async for event in graph.astream_events(
                 {"input": inp},
                 version="v2",
+                **config,
             ):
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]

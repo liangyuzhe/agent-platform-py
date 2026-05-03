@@ -193,6 +193,19 @@ class LangSmithSettings(BaseSettings):
     tracing: bool = Field(default=False, description="Enable LangSmith tracing")
 
 
+class CozeLoopSettings(BaseSettings):
+    """CozeLoop tracing configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="COZELOOP_")
+
+    api_key: str = Field(default="", description="CozeLoop API key")
+    endpoint: str = Field(
+        default="https://api.coze.com",
+        description="CozeLoop API endpoint",
+    )
+    tracing: bool = Field(default=False, description="Enable CozeLoop tracing")
+
+
 # ---------------------------------------------------------------------------
 # RAG & Memory parameters
 # ---------------------------------------------------------------------------
@@ -304,6 +317,7 @@ class Settings(BaseSettings):
     mysql: MySQLSettings = Field(default_factory=MySQLSettings)
 
     langsmith: LangSmithSettings = Field(default_factory=LangSmithSettings)
+    cozeloop: CozeLoopSettings = Field(default_factory=CozeLoopSettings)
     rag: RAGSettings = Field(default_factory=RAGSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
 

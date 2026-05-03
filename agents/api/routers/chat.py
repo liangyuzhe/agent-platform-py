@@ -7,6 +7,7 @@ from typing import AsyncGenerator
 from agents.model.chat_model import get_chat_model
 from agents.api.sse import sse_response
 from agents.config.settings import settings
+from agents.tool.trace.tracing import get_trace_callbacks
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
@@ -27,6 +28,7 @@ class ChatTestResponse(BaseModel):
 async def chat_generate(req: ChatTestRequest):
     """非流式 Chat 测试。"""
     model = get_chat_model(settings.chat_model_type)
+    callbacks = get_trace_callbacks()
 
     messages = [SystemMessage(content="你是一个有帮助的AI助手。")]
     for msg in req.history:
@@ -36,7 +38,7 @@ async def chat_generate(req: ChatTestRequest):
             messages.append(AIMessage(content=msg["content"]))
     messages.append(HumanMessage(content=req.question))
 
-    response = await model.ainvoke(messages)
+    response = await model.ainvoke(messages, config={"callbacks": callbacks})
     return ChatTestResponse(question=req.question, answer=response.content)
 
 
@@ -44,6 +46,7 @@ async def chat_generate(req: ChatTestRequest):
 async def chat_stream(req: ChatTestRequest, request: Request):
     """SSE 流式 Chat 测试。"""
     model = get_chat_model(settings.chat_model_type)
+    callbacks = get_trace_callbacks()
 
     messages = [SystemMessage(content="你是一个有帮助的AI助手。")]
     for msg in req.history:
@@ -55,7 +58,7 @@ async def chat_stream(req: ChatTestRequest, request: Request):
 
     async def generate() -> AsyncGenerator[dict, None]:
         yield {"event": "start", "data": ""}
-        async for chunk in model.astream(messages):
+        async for chunk in model.astream(messages, config={"callbacks": callbacks}):
             if chunk.content:
                 yield {"event": "data", "data": chunk.content}
         yield {"event": "end", "data": ""}
