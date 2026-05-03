@@ -1,9 +1,13 @@
 """应用入口。"""
 
+import logging
 import uvicorn
 
 
 def main():
+    # Ensure langsmith trace logs are visible
+    logging.getLogger("langsmith").setLevel(logging.INFO)
+
     uvicorn.run(
         "agents.api.app:app",
         host="0.0.0.0",

@@ -51,9 +51,12 @@ async def sql_generate(state: SQLReactState) -> dict:
     if response.tool_calls:
         tool_call = response.tool_calls[0]
         args = tool_call["args"]
+        answer_text = args.get("answer", "")
+        is_sql = args.get("is_sql", False)
         return {
-            "sql": args.get("answer", ""),
-            "is_sql": args.get("is_sql", False),
+            "answer": answer_text,
+            "sql": answer_text if is_sql else answer_text,
+            "is_sql": is_sql,
         }
 
     return {"answer": response.content, "sql": response.content, "is_sql": False}
