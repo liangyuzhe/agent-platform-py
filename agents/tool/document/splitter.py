@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 _DEFAULT_CHUNK_SIZE = 1000
 _DEFAULT_CHUNK_OVERLAP = 200
