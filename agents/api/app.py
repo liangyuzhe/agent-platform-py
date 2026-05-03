@@ -1,12 +1,15 @@
 """FastAPI 应用入口。"""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from agents.api.routers import chat, rag, final, document
 from agents.config.settings import settings
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 @asynccontextmanager
@@ -59,6 +62,6 @@ async def health():
 
 # 静态文件
 try:
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+    app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")
 except Exception:
     pass  # static 目录不存在时忽略
