@@ -46,3 +46,21 @@ class TestSettingsFieldAccess:
         """RAGSettings has mode field."""
         assert hasattr(settings.rag, 'mode')
         assert settings.rag.mode in ("traditional", "parent")
+
+    def test_milvus_empty_string_threshold(self):
+        """MilvusSettings handles empty string for similarity_threshold."""
+        from agents.config.settings import MilvusSettings
+        s = MilvusSettings(MILVUS_SIMILARITY_THRESHOLD="")
+        assert s.similarity_threshold == 0.7
+
+    def test_rag_empty_string_threshold(self):
+        """RAGSettings handles empty string for similarity_threshold."""
+        from agents.config.settings import RAGSettings
+        s = RAGSettings(RAG_SIMILARITY_THRESHOLD="")
+        assert s.similarity_threshold == 0.7
+
+    def test_redis_empty_string_db(self):
+        """RedisSettings handles empty string for db."""
+        from agents.config.settings import RedisSettings
+        s = RedisSettings(REDIS_DB="")
+        assert s.db == 0

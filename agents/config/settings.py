@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +82,11 @@ class DeepSeekSettings(BaseSettings):
     embedding_model: str = Field(default="", description="DeepSeek embedding model")
     timeout: int = Field(default=30, description="Request timeout in seconds")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
+
 
 class GeminiSettings(BaseSettings):
     """Google Gemini model configuration."""
@@ -110,6 +115,11 @@ class MilvusSettings(BaseSettings):
         description="Default Milvus collection",
     )
     top_k: int = Field(default=5, description="Number of results to retrieve")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
 
 
 class ElasticSearchSettings(BaseSettings):
@@ -140,6 +150,11 @@ class RedisSettings(BaseSettings):
     password: str = Field(default="", description="Redis password")
     db: int = Field(default=0, description="Redis database number")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
+
 
 class MySQLSettings(BaseSettings):
     """MySQL configuration (audit log)."""
@@ -158,6 +173,11 @@ class MySQLSettings(BaseSettings):
             f"mysql+pymysql://{self.username}:{self.password}"
             f"@{self.host}:{self.port}/{self.database}"
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
 
 
 class LangSmithSettings(BaseSettings):
@@ -208,6 +228,11 @@ class RAGSettings(BaseSettings):
         default=64, description="Overlap between child chunks"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
+
 
 class MemorySettings(BaseSettings):
     """Agent conversation memory parameters."""
@@ -222,6 +247,11 @@ class MemorySettings(BaseSettings):
         default=3000,
         description="Token count at which summarisation kicks in",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
 
 
 # ---------------------------------------------------------------------------
