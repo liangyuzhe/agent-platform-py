@@ -26,14 +26,14 @@ class TestLangSmithInit:
         from agents.tool.trace.tracing import init_langsmith
         init_langsmith()
 
-        assert os.environ.get("LANGSMITH_API_KEY") == "test-key"
-        assert os.environ.get("LANGSMITH_TRACING_V2") == "true"
-        assert os.environ.get("LANGSMITH_ENDPOINT") == "https://test.langchain.com"
+        assert os.environ.get("LANGCHAIN_API_KEY") == "test-key"
+        assert os.environ.get("LANGCHAIN_TRACING_V2") == "true"
+        assert os.environ.get("LANGCHAIN_ENDPOINT") == "https://test.langchain.com"
 
         # Cleanup
-        os.environ.pop("LANGSMITH_API_KEY", None)
-        os.environ.pop("LANGSMITH_TRACING_V2", None)
-        os.environ.pop("LANGSMITH_ENDPOINT", None)
+        os.environ.pop("LANGCHAIN_API_KEY", None)
+        os.environ.pop("LANGCHAIN_TRACING_V2", None)
+        os.environ.pop("LANGCHAIN_ENDPOINT", None)
 
 
 class TestCozeLoopInit:

@@ -24,15 +24,16 @@ _cozeloop_client: Any = None
 def init_langsmith() -> None:
     """Enable LangSmith tracing via environment variables.
 
-    LangChain automatically reads these env vars and starts tracing.
+    LangChain reads LANGCHAIN_* env vars for auto-tracing.
     """
     if not settings.langsmith.tracing or not settings.langsmith.api_key:
         logger.info("LangSmith tracing disabled")
         return
 
-    os.environ["LANGSMITH_API_KEY"] = settings.langsmith.api_key
-    os.environ["LANGSMITH_TRACING_V2"] = "true"
-    os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith.url
+    # LangChain auto-detects these env vars
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = settings.langsmith.api_key
+    os.environ["LANGCHAIN_ENDPOINT"] = settings.langsmith.url
 
     logger.info("LangSmith tracing enabled (endpoint: %s)", settings.langsmith.url)
 

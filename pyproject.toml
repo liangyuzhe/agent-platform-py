@@ -35,6 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "httpx>=0.27"]
+tracing = ["cozeloop>=0.1"]
 
 [build-system]
 requires = ["hatchling"]
