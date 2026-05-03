@@ -1,6 +1,7 @@
 """RAG Chat 图：文档检索增强对话。"""
 
 import asyncio
+import logging
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -14,11 +15,13 @@ from agents.model.chat_model import get_chat_model
 from agents.tool.token_counter import TokenCounter
 from agents.config.settings import settings
 
+logger = logging.getLogger(__name__)
+
 
 async def preprocess(state: RAGChatState) -> dict:
     """加载 Session。"""
     inp = state["input"]
-    session = await get_session(inp["session_id"])
+    session = get_session(inp["session_id"])
     return {
         "session": session.model_dump(),
         "query": inp["query"],
@@ -119,8 +122,15 @@ async def _compress_and_save(session_id: str, session: dict):
     """后台任务：压缩记忆并保存。"""
     from agents.tool.memory.session import Session
     session_obj = Session(**session)
-    await compress_session(session_obj)
-    await save_session(session_id, session_obj)
+
+    # 压缩记忆（如果历史过长）
+    try:
+        model = get_chat_model(settings.chat_model_type)
+        await compress_session(session_obj, llm=model)
+    except Exception as e:
+        logger.warning("Memory compression failed: %s", e)
+
+    save_session(session_id, session_obj)
 
 
 def build_rag_chat_graph():
