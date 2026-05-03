@@ -63,18 +63,14 @@
             const url = `/api/rag/chat/stream?query=${encodeURIComponent(query)}&session_id=${encodeURIComponent(sessionId)}`;
             const evtSource = new EventSource(url);
 
-            evtSource.onmessage = function(event) {
-                assistantContent += event.data;
-                bubble.textContent = assistantContent;
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            };
-
+            // Handle streamed message chunks
             evtSource.addEventListener('message', function(event) {
                 assistantContent += event.data;
                 bubble.textContent = assistantContent;
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
             });
 
+            // Handle server-sent error events
             evtSource.addEventListener('error', function(event) {
                 if (event.data) {
                     bubble.textContent = '服务器错误: ' + event.data;
@@ -83,8 +79,10 @@
                 btn.disabled = false;
             });
 
+            // Handle connection close (fires after stream ends)
             evtSource.onerror = function() {
                 evtSource.close();
+                // Only show error if no content was received
                 if (!assistantContent) {
                     bubble.textContent = '(无响应)';
                 }
