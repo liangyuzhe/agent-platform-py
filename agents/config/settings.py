@@ -14,6 +14,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Load .env file into environment BEFORE creating any Settings instances
+# This ensures nested sub-configs can read the values
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+except ImportError:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Sub-configs (each becomes its own section in the .env)
