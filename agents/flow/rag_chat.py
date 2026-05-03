@@ -56,13 +56,18 @@ async def retrieve(state: RAGChatState) -> dict:
     query = state.get("rewritten_query", state["query"])
     mode = state.get("rag_mode", settings.rag.mode)
 
-    if mode == "parent":
-        from agents.rag.parent_retriever import ParentDocumentRetriever
-        retriever = ParentDocumentRetriever()
-    else:
-        retriever = HybridRetriever()
+    try:
+        if mode == "parent":
+            from agents.rag.parent_retriever import ParentDocumentRetriever
+            retriever = ParentDocumentRetriever()
+        else:
+            retriever = HybridRetriever()
 
-    docs = retriever.retrieve(query)
+        docs = retriever.retrieve(query)
+    except Exception as e:
+        logger.warning("Retrieval failed, continuing with empty docs: %s", e)
+        docs = []
+
     return {"docs": docs}
 
 
