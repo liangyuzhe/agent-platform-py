@@ -28,6 +28,9 @@ def init_langsmith() -> None:
     os.environ["LANGCHAIN_API_KEY"] = settings.langsmith.api_key
     os.environ["LANGCHAIN_ENDPOINT"] = settings.langsmith.url
 
+    # Show LangSmith trace send/flush logs in server output
+    logging.getLogger("langsmith.client").setLevel(logging.INFO)
+
     logger.info("LangSmith tracing enabled (endpoint: %s)", settings.langsmith.url)
 
 
