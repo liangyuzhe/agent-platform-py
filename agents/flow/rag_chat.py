@@ -63,7 +63,11 @@ async def retrieve(state: RAGChatState) -> dict:
         else:
             retriever = HybridRetriever()
 
-        docs = retriever.retrieve(query)
+        # Run sync retrieval in thread pool with timeout
+        docs = await asyncio.wait_for(
+            asyncio.to_thread(retriever.retrieve, query),
+            timeout=15,
+        )
     except Exception as e:
         logger.warning("Retrieval failed, continuing with empty docs: %s", e)
         docs = []

@@ -137,6 +137,9 @@ class HybridRetriever:
         Default number of results to keep after reranking.
     """
 
+    # Class-level cache for reranker (heavy to load)
+    _reranker_cache: dict[str, CrossEncoderReranker] = {}
+
     def __init__(
         self,
         milvus_uri: str | None = None,
@@ -154,7 +157,12 @@ class HybridRetriever:
             es_url=es_url,
             index=es_index,
         )
-        self._reranker = CrossEncoderReranker(model_name=reranker_model)
+        # Cache the reranker to avoid reloading the model on every request
+        if reranker_model not in self._reranker_cache:
+            self._reranker_cache[reranker_model] = CrossEncoderReranker(
+                model_name=reranker_model
+            )
+        self._reranker = self._reranker_cache[reranker_model]
         self._reranker_top_k = reranker_top_k
 
     # -- internal helpers ---------------------------------------------------
@@ -194,10 +202,10 @@ class HybridRetriever:
                 pool.submit(self._retrieve_milvus, query): 0,
                 pool.submit(self._retrieve_es, query): 1,
             }
-            for future in as_completed(futures):
+            for future in as_completed(futures, timeout=10):
                 idx = futures[future]
                 try:
-                    doc_lists[idx] = future.result()
+                    doc_lists[idx] = future.result(timeout=5)
                 except Exception:
                     doc_lists[idx] = []
 
