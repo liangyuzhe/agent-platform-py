@@ -90,6 +90,9 @@
                                     assistantContent += data.data;
                                     bubble.textContent = assistantContent;
                                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                                } else if (data.event === 'error') {
+                                    bubble.textContent = '服务器错误: ' + data.data;
+                                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
                                 }
                             } catch {}
                         }

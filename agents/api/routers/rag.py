@@ -1,5 +1,7 @@
 """RAG Chat 端点。"""
 
+import logging
+
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from typing import AsyncGenerator, Literal
@@ -7,6 +9,7 @@ from typing import AsyncGenerator, Literal
 from agents.flow.rag_chat import build_rag_chat_graph
 from agents.api.sse import sse_response
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -44,14 +47,18 @@ async def rag_chat_stream(req: RAGChatRequest, request: Request):
 
     async def generate() -> AsyncGenerator[dict, None]:
         yield {"event": "start", "data": ""}
-        async for event in graph.astream_events(
-            {"input": _build_input(req)},
-            version="v2",
-        ):
-            if event["event"] == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if chunk.content:
-                    yield {"event": "data", "data": chunk.content}
+        try:
+            async for event in graph.astream_events(
+                {"input": _build_input(req)},
+                version="v2",
+            ):
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "data", "data": chunk.content}
+        except Exception as e:
+            logger.exception("RAG chat stream error")
+            yield {"event": "error", "data": str(e)}
         yield {"event": "end", "data": ""}
 
     return await sse_response(generate(), request)
