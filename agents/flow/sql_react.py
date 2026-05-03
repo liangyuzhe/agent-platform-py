@@ -56,7 +56,7 @@ async def sql_generate(state: SQLReactState) -> dict:
             "is_sql": args.get("is_sql", False),
         }
 
-    return {"answer": response.content, "is_sql": False}
+    return {"answer": response.content, "sql": response.content, "is_sql": False}
 
 
 async def safety_check(state: SQLReactState) -> dict:
