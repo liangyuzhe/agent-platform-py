@@ -8,9 +8,10 @@ from langchain_core.documents import Document
 
 class RAGChatState(TypedDict):
     """RAG Chat 图的状态。"""
-    input: dict                                  # {"session_id": str, "query": str}
+    input: dict                                  # {"session_id": str, "query": str, "rag_mode"?: str}
     session_id: str
     query: str
+    rag_mode: str                                # "traditional" or "parent"
     session: dict                                # Session 数据
     rewritten_query: str                         # 重写后的查询
     docs: list[Document]                         # 检索到的文档

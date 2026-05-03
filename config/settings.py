@@ -175,12 +175,29 @@ class RAGSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="RAG_")
 
+    mode: Literal["traditional", "parent"] = Field(
+        default="traditional",
+        description="RAG retrieval mode: traditional or parent document",
+    )
     chunk_size: int = Field(default=1024, description="Text chunk size in tokens")
     chunk_overlap: int = Field(default=128, description="Overlap between chunks")
     top_k: int = Field(default=5, description="Default number of chunks to retrieve")
     similarity_threshold: float = Field(
         default=0.7,
         description="Minimum similarity for a chunk to be kept",
+    )
+    # Parent Document RAG params
+    parent_chunk_size: int = Field(
+        default=2048, description="Parent chunk size for parent document RAG"
+    )
+    parent_chunk_overlap: int = Field(
+        default=200, description="Overlap between parent chunks"
+    )
+    child_chunk_size: int = Field(
+        default=512, description="Child chunk size for parent document RAG"
+    )
+    child_chunk_overlap: int = Field(
+        default=64, description="Overlap between child chunks"
     )
 
 

@@ -17,11 +17,13 @@ from agents.config.settings import settings
 
 async def preprocess(state: RAGChatState) -> dict:
     """加载 Session。"""
-    session = await get_session(state["input"]["session_id"])
+    inp = state["input"]
+    session = await get_session(inp["session_id"])
     return {
         "session": session.model_dump(),
-        "query": state["input"]["query"],
-        "session_id": state["input"]["session_id"],
+        "query": inp["query"],
+        "session_id": inp["session_id"],
+        "rag_mode": inp.get("rag_mode", settings.rag.mode),
     }
 
 
@@ -48,8 +50,16 @@ async def rewrite(state: RAGChatState) -> dict:
 
 async def retrieve(state: RAGChatState) -> dict:
     """双路检索 + RRF 融合 + Cross-Encoder 重排序。"""
-    retriever = HybridRetriever()
-    docs = await retriever.retrieve(state.get("rewritten_query", state["query"]))
+    query = state.get("rewritten_query", state["query"])
+    mode = state.get("rag_mode", settings.rag.mode)
+
+    if mode == "parent":
+        from agents.rag.parent_retriever import ParentDocumentRetriever
+        retriever = ParentDocumentRetriever()
+    else:
+        retriever = HybridRetriever()
+
+    docs = retriever.retrieve(query)
     return {"docs": docs}
 
 

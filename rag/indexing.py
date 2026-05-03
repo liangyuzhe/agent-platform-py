@@ -213,3 +213,126 @@ def build_indexing_graph(
         return {"doc_ids": doc_ids, "chunk_count": len(chunks)}
 
     return _index
+
+
+def build_parent_indexing_graph(
+    milvus_uri: str | None = None,
+    child_collection: str = "rag_children",
+    parent_collection: str = "rag_parents",
+    es_url: str | None = None,
+    es_index: str = "rag_children",
+    parent_chunk_size: int = 2048,
+    parent_chunk_overlap: int = 200,
+    child_chunk_size: int = 512,
+    child_chunk_overlap: int = 64,
+) -> Callable[[str], dict[str, Any]]:
+    """Return a callable that indexes a document using parent-child chunking.
+
+    Splits documents into large parent chunks first, then splits each parent
+    into small child chunks. Children are stored in Milvus + ES for retrieval
+    (with ``parent_id`` metadata). Parents are stored in a separate Milvus
+    collection for context expansion.
+
+    Parameters
+    ----------
+    milvus_uri:
+        Milvus connection URI.
+    child_collection:
+        Milvus collection for child chunks (used for retrieval).
+    parent_collection:
+        Milvus collection for parent chunks (used for context expansion).
+    es_url:
+        Elasticsearch connection URL.
+    es_index:
+        Elasticsearch index name for child chunks.
+    parent_chunk_size:
+        Size of parent chunks (large, for context).
+    parent_chunk_overlap:
+        Overlap between parent chunks.
+    child_chunk_size:
+        Size of child chunks (small, for precise retrieval).
+    child_chunk_overlap:
+        Overlap between child chunks.
+    """
+    _milvus_uri = milvus_uri or getattr(settings, "milvus_uri", None) or "http://localhost:19530"
+    _es_url = es_url or getattr(settings, "es_url", None) or "http://localhost:9200"
+    embeddings = _get_embeddings()
+
+    child_milvus = Milvus(
+        embedding_function=embeddings,
+        connection_args={"uri": _milvus_uri},
+        collection_name=child_collection,
+    )
+    parent_milvus = Milvus(
+        embedding_function=embeddings,
+        connection_args={"uri": _milvus_uri},
+        collection_name=parent_collection,
+    )
+    es_store = ElasticsearchStore(
+        es_url=_es_url,
+        index_name=es_index,
+        embedding=embeddings,
+    )
+
+    def _index(file_path: str) -> dict[str, Any]:
+        """Load, split (parent→child), and persist a document.
+
+        Returns
+        -------
+        dict
+            ``{"doc_ids": [...], "chunk_count": int, "parent_count": int}``
+        """
+        raw_docs = load_document(file_path)
+
+        # Split into parent chunks (large)
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=parent_chunk_size,
+            chunk_overlap=parent_chunk_overlap,
+            length_function=len,
+            add_start_index=True,
+        )
+        parent_chunks = parent_splitter.split_documents(raw_docs)
+
+        # Assign parent IDs
+        base_name = os.path.basename(file_path)
+        parent_ids = [f"{base_name}_parent_{i}" for i in range(len(parent_chunks))]
+        for chunk, pid in zip(parent_chunks, parent_ids):
+            chunk.metadata["doc_id"] = pid
+            chunk.metadata["source"] = file_path
+
+        # Split each parent into child chunks (small)
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=child_chunk_size,
+            chunk_overlap=child_chunk_overlap,
+            length_function=len,
+            add_start_index=True,
+        )
+
+        all_children: list[Document] = []
+        all_child_ids: list[str] = []
+        child_idx = 0
+        for parent_chunk, pid in zip(parent_chunks, parent_ids):
+            children = child_splitter.split_documents([parent_chunk])
+            for child in children:
+                child_id = f"{base_name}_child_{child_idx}"
+                child.metadata["parent_id"] = pid
+                child.metadata["doc_id"] = child_id
+                child.metadata["source"] = file_path
+                all_children.append(child)
+                all_child_ids.append(child_id)
+                child_idx += 1
+
+        # Store parents in parent collection
+        parent_milvus.add_documents(parent_chunks, ids=parent_ids)
+
+        # Store children in child collection (Milvus + ES)
+        child_milvus.add_documents(all_children, ids=all_child_ids)
+        es_store.add_documents(all_children, ids=all_child_ids)
+
+        return {
+            "doc_ids": all_child_ids,
+            "chunk_count": len(all_children),
+            "parent_count": len(parent_chunks),
+        }
+
+    return _index
