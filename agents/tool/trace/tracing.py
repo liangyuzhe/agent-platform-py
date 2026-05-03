@@ -55,7 +55,9 @@ def _set_cozeloop_env() -> None:
     if cfg.jwt_oauth_client_id:
         os.environ["COZELOOP_JWT_OAUTH_CLIENT_ID"] = cfg.jwt_oauth_client_id
     if cfg.jwt_oauth_private_key:
-        os.environ["COZELOOP_JWT_OAUTH_PRIVATE_KEY"] = cfg.jwt_oauth_private_key
+        # Fix PEM: collapse double newlines that break cryptography parser
+        key = cfg.jwt_oauth_private_key.replace("\n\n", "\n")
+        os.environ["COZELOOP_JWT_OAUTH_PRIVATE_KEY"] = key
     if cfg.jwt_oauth_public_key_id:
         os.environ["COZELOOP_JWT_OAUTH_PUBLIC_KEY_ID"] = cfg.jwt_oauth_public_key_id
 
