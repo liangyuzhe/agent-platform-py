@@ -383,9 +383,8 @@ docker-compose logs -f milvus
 
 ## 技术文档
 
-- [Go 版架构解析](docs/technical_architecture.md)
-- [Python 版设计文档](docs/python_langchain_design.md)
-- [记忆系统详解](docs/memory_system.md)
+- [Python 版设计文档](python_langchain_design.md)
+
 
 ## 依赖说明
 
