@@ -77,5 +77,7 @@ async def _stream_rag_chat(inp: dict, request: Request):
         except Exception as e:
             logger.exception("RAG chat stream error")
             yield {"event": "error", "data": str(e)}
+        finally:
+            yield {"event": "done", "data": "[DONE]"}
 
     return await sse_response(generate(), request)

@@ -59,6 +59,7 @@
 
             let assistantContent = '';
             const bubble = addMessage('assistant', '...');
+            let finished = false;
 
             const url = `/api/rag/chat/stream?query=${encodeURIComponent(query)}&session_id=${encodeURIComponent(sessionId)}`;
             const evtSource = new EventSource(url);
@@ -70,23 +71,35 @@
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
             });
 
-            // Handle server-sent error events
-            evtSource.addEventListener('error', function(event) {
-                if (event.data) {
-                    bubble.textContent = '服务器错误: ' + event.data;
-                }
+            // Handle [DONE] signal - clean close
+            evtSource.addEventListener('done', function() {
+                finished = true;
                 evtSource.close();
-                btn.disabled = false;
-            });
-
-            // Handle connection close (fires after stream ends)
-            evtSource.onerror = function() {
-                evtSource.close();
-                // Only show error if no content was received
                 if (!assistantContent) {
                     bubble.textContent = '(无响应)';
                 }
                 btn.disabled = false;
+            });
+
+            // Handle server-sent error events
+            evtSource.addEventListener('error', function(event) {
+                if (event.data) {
+                    bubble.textContent = '服务器错误: ' + event.data;
+                    finished = true;
+                    evtSource.close();
+                    btn.disabled = false;
+                }
+            });
+
+            // Handle connection errors (network issues, server crash)
+            evtSource.onerror = function() {
+                if (!finished) {
+                    evtSource.close();
+                    if (!assistantContent) {
+                        bubble.textContent = '(无响应)';
+                    }
+                    btn.disabled = false;
+                }
             };
         }
     </script>
