@@ -33,7 +33,7 @@ def _format_history(history: Union[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-def rewrite_query(
+async def rewrite_query(
     summary: str,
     history: Union[str, list[dict]],
     query: str,
@@ -68,5 +68,5 @@ def rewrite_query(
         ("human", user_message),
     ]
 
-    response = llm.invoke(messages)
+    response = await llm.ainvoke(messages)
     return response.content.strip()

@@ -1,7 +1,7 @@
 """Tests for query rewrite module."""
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 from agents.rag.query_rewrite import _format_history, rewrite_query
 
@@ -42,61 +42,65 @@ class TestFormatHistory:
 class TestRewriteQuery:
     """Test rewrite_query with mocked LLM."""
 
+    @pytest.mark.asyncio
     @patch("agents.rag.query_rewrite.get_chat_model")
-    def test_rewrite_calls_llm(self, mock_get_model):
-        mock_llm = MagicMock()
+    async def test_rewrite_calls_llm(self, mock_get_model):
+        mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = "rewritten query"
-        mock_llm.invoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
         mock_get_model.return_value = mock_llm
 
-        result = rewrite_query(
+        result = await rewrite_query(
             summary="user likes Python",
             history=[{"role": "user", "content": "what is list comprehension?"}],
             query="its advantages?",
         )
 
         assert result == "rewritten query"
-        mock_llm.invoke.assert_called_once()
-        messages = mock_llm.invoke.call_args[0][0]
+        mock_llm.ainvoke.assert_called_once()
+        messages = mock_llm.ainvoke.call_args[0][0]
         assert len(messages) == 2
         assert messages[0][0] == "system"
         assert messages[1][0] == "human"
         assert "user likes Python" in messages[1][1]
         assert "its advantages?" in messages[1][1]
 
+    @pytest.mark.asyncio
     @patch("agents.rag.query_rewrite.get_chat_model")
-    def test_rewrite_with_string_history(self, mock_get_model):
-        mock_llm = MagicMock()
+    async def test_rewrite_with_string_history(self, mock_get_model):
+        mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = "standalone query"
-        mock_llm.invoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
         mock_get_model.return_value = mock_llm
 
-        result = rewrite_query(summary="", history="[user]: hi", query="test")
+        result = await rewrite_query(summary="", history="[user]: hi", query="test")
         assert result == "standalone query"
 
+    @pytest.mark.asyncio
     @patch("agents.rag.query_rewrite.get_chat_model")
-    def test_rewrite_strips_whitespace(self, mock_get_model):
-        mock_llm = MagicMock()
+    async def test_rewrite_strips_whitespace(self, mock_get_model):
+        mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = "  cleaned query  "
-        mock_llm.invoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
         mock_get_model.return_value = mock_llm
 
-        result = rewrite_query(summary="", history="", query="test")
+        result = await rewrite_query(summary="", history="", query="test")
         assert result == "cleaned query"
 
+    @pytest.mark.asyncio
     @patch("agents.rag.query_rewrite.get_chat_model")
-    def test_rewrite_uses_configured_model(self, mock_get_model):
+    async def test_rewrite_uses_configured_model(self, mock_get_model):
         """Verify it uses get_chat_model, not hardcoded Qwen."""
-        mock_llm = MagicMock()
+        mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = "result"
-        mock_llm.invoke.return_value = mock_response
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
         mock_get_model.return_value = mock_llm
 
-        rewrite_query(summary="", history="", query="test")
+        await rewrite_query(summary="", history="", query="test")
 
         from agents.config.settings import settings
         mock_get_model.assert_called_with(settings.chat_model_type)
