@@ -194,16 +194,24 @@ class LangSmithSettings(BaseSettings):
 
 
 class CozeLoopSettings(BaseSettings):
-    """CozeLoop tracing configuration."""
+    """CozeLoop tracing configuration (JWT OAuth)."""
 
     model_config = SettingsConfigDict(env_prefix="COZELOOP_")
 
-    api_key: str = Field(default="", description="CozeLoop API key")
-    endpoint: str = Field(
-        default="https://api.coze.com",
-        description="CozeLoop API endpoint",
+    workspace_id: str = Field(default="", description="CozeLoop workspace ID")
+    api_base_url: str = Field(
+        default="",
+        description="CozeLoop API base URL (leave empty for default)",
     )
+    jwt_oauth_client_id: str = Field(default="", description="JWT OAuth client ID")
+    jwt_oauth_private_key: str = Field(default="", description="JWT OAuth private key (PEM)")
+    jwt_oauth_public_key_id: str = Field(default="", description="JWT OAuth public key ID")
     tracing: bool = Field(default=False, description="Enable CozeLoop tracing")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_empty_strings(cls, data: dict) -> dict:
+        return {k: v for k, v in data.items() if v != ""}
 
 
 # ---------------------------------------------------------------------------

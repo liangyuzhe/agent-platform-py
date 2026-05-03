@@ -37,12 +37,21 @@ class TestLangSmithInit:
 
 
 class TestCozeLoopInit:
-    """Test CozeLoop tracing initialization."""
+    """Test CozeLoop tracing initialization with JWT OAuth."""
 
     @patch("agents.tool.trace.tracing.settings")
     def test_cozeloop_disabled_by_default(self, mock_settings):
         mock_settings.cozeloop.tracing = False
-        mock_settings.cozeloop.api_key = ""
+        mock_settings.cozeloop.jwt_oauth_client_id = ""
+
+        from agents.tool.trace.tracing import get_cozeloop_handler
+        result = get_cozeloop_handler()
+        assert result is None
+
+    @patch("agents.tool.trace.tracing.settings")
+    def test_cozeloop_returns_none_without_client_id(self, mock_settings):
+        mock_settings.cozeloop.tracing = True
+        mock_settings.cozeloop.jwt_oauth_client_id = ""
 
         from agents.tool.trace.tracing import get_cozeloop_handler
         result = get_cozeloop_handler()
@@ -51,14 +60,42 @@ class TestCozeLoopInit:
     @patch("agents.tool.trace.tracing.settings")
     def test_cozeloop_returns_none_without_package(self, mock_settings):
         mock_settings.cozeloop.tracing = True
-        mock_settings.cozeloop.api_key = "test-key"
-        mock_settings.cozeloop.endpoint = "https://api.coze.com"
+        mock_settings.cozeloop.jwt_oauth_client_id = "test-client-id"
+        mock_settings.cozeloop.jwt_oauth_private_key = "test-key"
+        mock_settings.cozeloop.jwt_oauth_public_key_id = "test-key-id"
+        mock_settings.cozeloop.workspace_id = "test-workspace"
+        mock_settings.cozeloop.api_base_url = ""
 
         from agents.tool.trace.tracing import get_cozeloop_handler
         # Should return None if cozeloop package is not installed
         result = get_cozeloop_handler()
-        # Either returns a handler or None (if package not installed)
-        assert result is None or hasattr(result, 'on_llm_start')
+        assert result is None
+
+    @patch("agents.tool.trace.tracing.settings")
+    def test_cozeloop_sets_env_vars(self, mock_settings):
+        import os
+        mock_settings.cozeloop.tracing = True
+        mock_settings.cozeloop.jwt_oauth_client_id = "test-client-id"
+        mock_settings.cozeloop.jwt_oauth_private_key = "test-private-key"
+        mock_settings.cozeloop.jwt_oauth_public_key_id = "test-public-id"
+        mock_settings.cozeloop.workspace_id = "test-workspace"
+        mock_settings.cozeloop.api_base_url = ""
+
+        from agents.tool.trace.tracing import _set_cozeloop_env
+        _set_cozeloop_env()
+
+        assert os.environ.get("COZELOOP_WORKSPACE_ID") == "test-workspace"
+        assert os.environ.get("COZELOOP_JWT_OAUTH_CLIENT_ID") == "test-client-id"
+        assert os.environ.get("COZELOOP_JWT_OAUTH_PRIVATE_KEY") == "test-private-key"
+        assert os.environ.get("COZELOOP_JWT_OAUTH_PUBLIC_KEY_ID") == "test-public-id"
+
+        # Cleanup
+        for key in [
+            "COZELOOP_WORKSPACE_ID", "COZELOOP_JWT_OAUTH_CLIENT_ID",
+            "COZELOOP_JWT_OAUTH_PRIVATE_KEY", "COZELOOP_JWT_OAUTH_PUBLIC_KEY_ID",
+            "COZELOOP_API_BASE_URL",
+        ]:
+            os.environ.pop(key, None)
 
 
 class TestTraceCallbacks:
@@ -67,7 +104,7 @@ class TestTraceCallbacks:
     @patch("agents.tool.trace.tracing.settings")
     def test_returns_empty_list_when_disabled(self, mock_settings):
         mock_settings.cozeloop.tracing = False
-        mock_settings.cozeloop.api_key = ""
+        mock_settings.cozeloop.jwt_oauth_client_id = ""
 
         from agents.tool.trace.tracing import get_trace_callbacks
         callbacks = get_trace_callbacks()
