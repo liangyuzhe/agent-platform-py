@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 from agents.tool.document.loader import get_loader
 from agents.tool.document.splitter import get_splitter

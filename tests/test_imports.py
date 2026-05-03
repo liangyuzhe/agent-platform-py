@@ -113,7 +113,7 @@ class TestToolImports:
         from agents.tool.storage.checkpoint import get_checkpointer
 
     def test_document_imports(self):
-        from agents.tool.document.loader import load_file
+        from agents.tool.document.loader import get_loader
         from agents.tool.document.parser import parse_document
         from agents.tool.document.splitter import get_splitter
 
@@ -123,7 +123,7 @@ class TestToolImports:
     def test_analyst_tools_imports(self):
         from agents.tool.analyst_tools.parser import parse_sql_result
         from agents.tool.analyst_tools.statistics import compute_statistics
-        from agents.tool.analyst_tools.chart import generate_chart
+        from agents.tool.analyst_tools.chart import generate_chart_config
 
     def test_token_counter_import(self):
         from agents.tool.token_counter import TokenCounter
