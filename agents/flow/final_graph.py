@@ -14,10 +14,18 @@ async def classify_intent(state: FinalGraphState) -> dict:
     model = get_chat_model(settings.chat_model_type)
 
     response = await model.ainvoke([
-        HumanMessage(content=f"""请判断以下用户问题的意图类型，只回答 "SQL" 或 "Chat"：
+        HumanMessage(content=f"""请判断以下用户问题的意图类型，只回答 "SQL" 或 "Chat"。
 
-- SQL：需要查询数据库、统计数据、生成报表
-- Chat：普通对话、知识问答、闲聊
+数据库中包含以下表：
+- t_user: 用户信息（username, real_name, email, phone, gender, status）
+- t_department: 部门信息（name, manager, parent_id, phone）
+- t_role: 角色信息（name, code, description）
+- t_user_role: 用户-角色关联
+- t_user_department: 用户-部门关联
+
+判断规则：
+- SQL：涉及查询数据库中存储的信息，包括但不限于：用户信息、部门结构、角色权限、人员统计、关联关系等。例如："zhangsan是谁"、"有哪些部门"、"技术部有多少人"、"谁是管理员"
+- Chat：与数据库无关的对话，如：天气、闲聊、通用知识问答
 
 用户问题: {state['query']}
 """)
