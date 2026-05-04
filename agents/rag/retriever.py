@@ -225,16 +225,34 @@ class HybridRetriever:
     # -- internal helpers ---------------------------------------------------
 
     def _retrieve_milvus(self, query: str) -> list[Document]:
-        docs = self._milvus.invoke(query)
-        for d in docs:
-            d.metadata["retriever_source"] = "milvus"
-        return docs
+        import time
+        t0 = time.monotonic()
+        try:
+            docs = self._milvus.invoke(query)
+            for d in docs:
+                d.metadata["retriever_source"] = "milvus"
+            elapsed = time.monotonic() - t0
+            logger.info("Milvus retrieve: %d docs in %.2fs", len(docs), elapsed)
+            return docs
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            logger.warning("Milvus retrieve failed after %.2fs: %s", elapsed, e)
+            return []
 
     def _retrieve_es(self, query: str) -> list[Document]:
-        docs = self._es.invoke(query)
-        for d in docs:
-            d.metadata["retriever_source"] = "es"
-        return docs
+        import time
+        t0 = time.monotonic()
+        try:
+            docs = self._es.invoke(query)
+            for d in docs:
+                d.metadata["retriever_source"] = "es"
+            elapsed = time.monotonic() - t0
+            logger.info("ES retrieve: %d docs in %.2fs", len(docs), elapsed)
+            return docs
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            logger.warning("ES retrieve failed after %.2fs: %s", elapsed, e)
+            return []
 
     # -- public API ---------------------------------------------------------
 
@@ -258,6 +276,8 @@ class HybridRetriever:
         k = top_k or self._reranker_top_k
 
         # 1. Parallel retrieval
+        import time as _time
+        t0 = _time.monotonic()
         doc_lists: list[list[Document]] = [None, None]  # type: ignore[list-item]
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -269,8 +289,18 @@ class HybridRetriever:
                 idx = futures[future]
                 try:
                     doc_lists[idx] = future.result(timeout=5)
-                except Exception:
+                except Exception as e:
+                    logger.warning("Retriever[%d] exception: %s", idx, e)
                     doc_lists[idx] = []
+
+        # Handle any futures that didn't complete
+        for idx, docs in enumerate(doc_lists):
+            if docs is None:
+                logger.warning("Retriever[%d] did not complete (timeout)", idx)
+                doc_lists[idx] = []
+
+        elapsed_total = _time.monotonic() - t0
+        logger.info("Hybrid retrieve total: %.2fs", elapsed_total)
 
         # 2. RRF fusion
         milvus_count = len(doc_lists[0]) if doc_lists[0] else 0
