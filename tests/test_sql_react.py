@@ -37,9 +37,12 @@ class TestCheckDocs:
     """Test check_docs node."""
 
     @pytest.mark.asyncio
-    async def test_no_docs_returns_message(self):
-        """When no docs retrieved, should return 'no table structure' message."""
+    @patch("agents.flow.sql_react.Elasticsearch")
+    async def test_no_docs_returns_message(self, MockES):
+        """When no docs retrieved and ES fallback is empty, should return error."""
         from agents.flow.sql_react import check_docs
+
+        MockES.return_value.search.return_value = {"hits": {"hits": []}}
 
         result = await check_docs({"query": "查询用户", "docs": []})
 
@@ -57,14 +60,35 @@ class TestCheckDocs:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_missing_docs_key_returns_message(self):
-        """When 'docs' key is missing from state, treat as empty."""
+    @patch("agents.flow.sql_react.Elasticsearch")
+    async def test_missing_docs_key_returns_message(self, MockES):
+        """When 'docs' key is missing from state and ES fallback is empty."""
         from agents.flow.sql_react import check_docs
+
+        MockES.return_value.search.return_value = {"hits": {"hits": []}}
 
         result = await check_docs({"query": "查询用户"})
 
         assert result["is_sql"] is False
         assert "未找到" in result["answer"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.Elasticsearch")
+    async def test_no_docs_fallback_to_es_schemas(self, MockES):
+        """When retriever returns nothing, fallback to all schemas from ES."""
+        from agents.flow.sql_react import check_docs
+
+        MockES.return_value.search.return_value = {
+            "hits": {"hits": [
+                {"_source": {"text": "表名: t_user\n字段:\n  id int", "table_name": "t_user", "source": "mysql_schema"}},
+            ]}
+        }
+
+        result = await check_docs({"query": "zhangsan 是谁", "docs": []})
+
+        assert "docs" in result
+        assert len(result["docs"]) == 1
+        assert "t_user" in result["docs"][0].page_content
 
 
 # ---------------------------------------------------------------------------

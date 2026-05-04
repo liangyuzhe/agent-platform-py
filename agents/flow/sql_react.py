@@ -15,6 +15,11 @@ from agents.rag.retriever import get_hybrid_retriever
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
+try:
+    from elasticsearch import Elasticsearch
+except ImportError:
+    Elasticsearch = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,9 +31,38 @@ async def sql_retrieve(state: SQLReactState) -> dict:
 
 
 async def check_docs(state: SQLReactState) -> dict:
-    """检查是否检索到相关表结构。"""
+    """检查是否检索到相关表结构。
+
+    如果精确检索没有命中（如查询人名等非表结构关键词），回退到
+    获取全部已索引的 schema，让 LLM 自行判断使用哪个表。
+    """
     docs = state.get("docs", [])
     if not docs:
+        # 回退：直接从 ES 拉取所有 schema 文档（不做相似度过滤）
+        try:
+            from agents.rag.schema_indexer import _SCHEMA_SOURCE
+
+            es_url = settings.es.address
+            es = Elasticsearch(es_url)
+            resp = es.search(
+                index=settings.es.index,
+                query={"term": {"source": _SCHEMA_SOURCE}},
+                size=50,
+            )
+            from langchain_core.documents import Document
+            docs = [
+                Document(
+                    page_content=hit["_source"]["text"],
+                    metadata={"source": _SCHEMA_SOURCE, "table_name": hit["_source"].get("table_name", "")},
+                )
+                for hit in resp["hits"]["hits"]
+            ]
+            if docs:
+                logger.info("check_docs: fallback retrieved %d schema docs", len(docs))
+                return {"docs": docs}
+        except Exception as e:
+            logger.warning("check_docs fallback failed: %s", e)
+
         return {
             "answer": "未找到相关的数据库表结构信息，无法生成 SQL。请先上传数据库表结构文档。",
             "is_sql": False,

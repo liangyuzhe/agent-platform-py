@@ -195,6 +195,7 @@ class HybridRetriever:
         retrieve_k: int = 5,
         reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
         reranker_top_k: int = 5,
+        rerank_threshold: float = 0.1,
     ) -> None:
         search_kwargs = {"search_type": "similarity", "k": retrieve_k}
         self._milvus = build_milvus_retriever(
@@ -216,6 +217,7 @@ class HybridRetriever:
                 )
             self._reranker = self._reranker_cache[reranker_model]
         self._reranker_top_k = reranker_top_k
+        self._rerank_threshold = rerank_threshold
 
     # -- internal helpers ---------------------------------------------------
 
@@ -264,9 +266,13 @@ class HybridRetriever:
         # 2. RRF fusion
         fused = reciprocal_rank_fusion(doc_lists, k=60)
 
-        # 3. Cross-Encoder rerank (optional)
+        # 3. Cross-Encoder rerank (optional) + threshold filter
         if self._reranker:
-            return self._reranker.rerank(query, fused, top_k=k)
+            reranked = self._reranker.rerank(query, fused, top_k=k)
+            return [
+                d for d in reranked
+                if d.metadata.get("rerank_score", 0) >= self._rerank_threshold
+            ]
 
         return fused[:k]
 
@@ -281,6 +287,7 @@ def get_hybrid_retriever(
     retrieve_k: int = 5,
     reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
     reranker_top_k: int = 5,
+    rerank_threshold: float = 0.1,
 ) -> HybridRetriever:
     """Return a cached HybridRetriever singleton."""
     global _retriever_instance
@@ -291,5 +298,6 @@ def get_hybrid_retriever(
             retrieve_k=retrieve_k,
             reranker_model=reranker_model,
             reranker_top_k=reranker_top_k,
+            rerank_threshold=rerank_threshold,
         )
     return _retriever_instance
