@@ -79,6 +79,16 @@
         }
         .intent-tag.sql { background: #fff3cd; color: #856404; }
         .intent-tag.chat { background: #d1ecf1; color: #0c5460; }
+        .approval-actions { margin-top: 12px; display: flex; gap: 8px; }
+        .approval-actions button {
+            padding: 8px 20px; border: none; border-radius: 6px;
+            cursor: pointer; font-size: 13px; font-weight: 500;
+        }
+        .btn-approve { background: #28a745; color: white; }
+        .btn-approve:hover { background: #218838; }
+        .btn-reject { background: #dc3545; color: white; }
+        .btn-reject:hover { background: #c82333; }
+        .btn-approve:disabled, .btn-reject:disabled { background: #ccc; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -220,18 +230,71 @@
                     div.querySelector('.bubble').textContent = '请求失败: HTTP ' + resp.status;
                 } else {
                     const data = await resp.json();
-                    let html = '';
-                    // Intent tag
-                    const isSql = data.status === 'completed' && data.query;
-                    // Try to detect SQL from answer or use intent info
-                    html += `<span class="intent-tag ${data.answer && data.answer.includes('SELECT') ? 'sql' : 'chat'}">${data.answer && data.answer.includes('SELECT') ? 'SQL' : 'Chat'}</span><br>`;
-                    html += escHtml(data.answer || '(无响应)');
-                    div.querySelector('.bubble').innerHTML = html;
+                    renderAgentResponse(div, data);
                 }
             } catch (e) {
                 div.querySelector('.bubble').textContent = '请求失败: ' + e.message;
             }
             agentBtn.disabled = false;
+        }
+
+        function renderAgentResponse(div, data) {
+            const bubble = div.querySelector('.bubble');
+            let html = '';
+
+            if (data.pending_approval && data.sql) {
+                // SQL approval flow
+                html += '<span class="intent-tag sql">SQL</span><br>';
+                html += escHtml(data.answer || '请确认是否执行该 SQL') + '<br>';
+                html += '<details class="sql-detail"><summary>查看 SQL</summary>';
+                html += '<pre>' + escHtml(data.sql) + '</pre></details>';
+                html += '<div class="approval-actions">';
+                html += '<button class="btn-approve" onclick="approveSql(this, true)">执行</button>';
+                html += '<button class="btn-reject" onclick="approveSql(this, false)">拒绝</button>';
+                html += '</div>';
+            } else {
+                // Normal response
+                const isSql = data.answer && data.answer.includes('SELECT');
+                html += `<span class="intent-tag ${isSql ? 'sql' : 'chat'}">${isSql ? 'SQL' : 'Chat'}</span><br>`;
+                html += escHtml(data.answer || '(无响应)');
+            }
+
+            bubble.innerHTML = html;
+        }
+
+        async function approveSql(btn, approved) {
+            const actions = btn.closest('.approval-actions');
+            const buttons = actions.querySelectorAll('button');
+            buttons.forEach(b => b.disabled = true);
+            btn.textContent = approved ? '执行中...' : '拒绝中...';
+
+            // Add a new assistant message for the result
+            const resultDiv = addAgentMessage('assistant', '处理中...');
+
+            try {
+                const resp = await fetch('/api/final/approve', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        approved: approved,
+                        feedback: '',
+                    }),
+                });
+                if (!resp.ok) {
+                    resultDiv.querySelector('.bubble').textContent = '请求失败: HTTP ' + resp.status;
+                } else {
+                    const data = await resp.json();
+                    renderAgentResponse(resultDiv, data);
+                }
+            } catch (e) {
+                resultDiv.querySelector('.bubble').textContent = '请求失败: ' + e.message;
+            }
+
+            // Update the original buttons
+            actions.innerHTML = approved
+                ? '<span style="color:#28a745;font-size:12px;">已批准执行</span>'
+                : '<span style="color:#dc3545;font-size:12px;">已拒绝</span>';
         }
 
         function escHtml(s) {
