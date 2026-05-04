@@ -52,7 +52,7 @@ def _get_embeddings():
 
 def build_milvus_retriever(
     milvus_uri: str | None = None,
-    collection: str = "rag_chunks",
+    collection: str | None = None,
     search_kwargs: dict | None = None,
 ) -> BaseRetriever:
     """Build a dense vector retriever backed by Milvus.
@@ -60,20 +60,21 @@ def build_milvus_retriever(
     Parameters
     ----------
     milvus_uri:
-        Milvus connection URI.  Falls back to ``settings.milvus_uri`` or
+        Milvus connection URI.  Falls back to ``settings.milvus.addr`` or
         ``"http://localhost:19530"``.
     collection:
-        Milvus collection name.
+        Milvus collection name.  Defaults to ``settings.milvus.collection_name``.
     search_kwargs:
         Extra keyword arguments forwarded to ``as_retriever``.
     """
-    uri = milvus_uri or getattr(settings, "milvus_uri", None) or "http://localhost:19530"
+    uri = milvus_uri or f"http://{settings.milvus.addr}"
+    coll = collection or settings.milvus.collection_name
     embeddings = _get_embeddings()
 
     store = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": uri},
-        collection_name=collection,
+        collection_name=coll,
     )
     kwargs = search_kwargs or {"search_type": "similarity", "k": 20}
     return store.as_retriever(**kwargs)
@@ -81,7 +82,7 @@ def build_milvus_retriever(
 
 def build_es_retriever(
     es_url: str | None = None,
-    index: str = "rag_chunks",
+    index: str | None = None,
     search_kwargs: dict | None = None,
 ) -> BaseRetriever:
     """Build a sparse (BM25) retriever backed by Elasticsearch.
@@ -92,21 +93,21 @@ def build_es_retriever(
     Parameters
     ----------
     es_url:
-        Elasticsearch connection URL.  Falls back to ``settings.es_url`` or
-        ``"http://localhost:9200"``.
+        Elasticsearch connection URL.  Falls back to ``settings.es.address``.
     index:
-        Elasticsearch index name.
+        Elasticsearch index name.  Defaults to ``settings.es.index``.
     search_kwargs:
         Extra keyword arguments forwarded to ``as_retriever``.
     """
     from langchain_elasticsearch import BM25Strategy
 
-    url = es_url or getattr(settings, "es_url", None) or "http://localhost:9200"
+    url = es_url or settings.es.address
+    idx = index or settings.es.index
     embeddings = _get_embeddings()
 
     store = ElasticsearchStore(
         es_url=url,
-        index_name=index,
+        index_name=idx,
         embedding=embeddings,
         strategy=BM25Strategy(),
     )
@@ -120,21 +121,24 @@ def build_es_retriever(
 
 class HybridRetriever:
     """Retrieve from Milvus (dense) and Elasticsearch BM25 (sparse) in
-    parallel, fuse results with Reciprocal Rank Fusion, then rerank with a
-    Cross-Encoder model.
+    parallel, fuse results with Reciprocal Rank Fusion, then optionally
+    rerank with a Cross-Encoder model.
 
     Parameters
     ----------
     milvus_uri:
         Milvus connection URI.
     milvus_collection:
-        Milvus collection name.
+        Milvus collection name.  Defaults to ``settings.milvus.collection_name``.
     es_url:
         Elasticsearch connection URL.
     es_index:
-        Elasticsearch index name.
+        Elasticsearch index name.  Defaults to ``settings.es.index``.
+    retrieve_k:
+        Number of candidates to fetch from each retriever (Milvus / ES).
     reranker_model:
         Sentence-Transformers Cross-Encoder model name for reranking.
+        Set to *None* to skip reranking entirely (faster).
     reranker_top_k:
         Default number of results to keep after reranking.
     """
@@ -145,26 +149,32 @@ class HybridRetriever:
     def __init__(
         self,
         milvus_uri: str | None = None,
-        milvus_collection: str = "rag_chunks",
+        milvus_collection: str | None = None,
         es_url: str | None = None,
-        es_index: str = "rag_chunks",
-        reranker_model: str = "BAAI/bge-reranker-v2-m3",
+        es_index: str | None = None,
+        retrieve_k: int = 5,
+        reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
         reranker_top_k: int = 5,
     ) -> None:
+        search_kwargs = {"search_type": "similarity", "k": retrieve_k}
         self._milvus = build_milvus_retriever(
             milvus_uri=milvus_uri,
             collection=milvus_collection,
+            search_kwargs=search_kwargs,
         )
         self._es = build_es_retriever(
             es_url=es_url,
             index=es_index,
+            search_kwargs=search_kwargs,
         )
         # Cache the reranker to avoid reloading the model on every request
-        if reranker_model not in self._reranker_cache:
-            self._reranker_cache[reranker_model] = CrossEncoderReranker(
-                model_name=reranker_model
-            )
-        self._reranker = self._reranker_cache[reranker_model]
+        self._reranker = None
+        if reranker_model:
+            if reranker_model not in self._reranker_cache:
+                self._reranker_cache[reranker_model] = CrossEncoderReranker(
+                    model_name=reranker_model
+                )
+            self._reranker = self._reranker_cache[reranker_model]
         self._reranker_top_k = reranker_top_k
 
     # -- internal helpers ---------------------------------------------------
@@ -183,7 +193,7 @@ class HybridRetriever:
         Steps:
         1. Retrieve from Milvus (dense) and ES BM25 (sparse) **in parallel**.
         2. Fuse the two ranked lists with Reciprocal Rank Fusion (RRF).
-        3. Rerank the fused list with a Cross-Encoder.
+        3. (Optional) Rerank the fused list with a Cross-Encoder.
         4. Return the top *top_k* results.
 
         Parameters
@@ -214,7 +224,32 @@ class HybridRetriever:
         # 2. RRF fusion
         fused = reciprocal_rank_fusion(doc_lists, k=60)
 
-        # 3. Cross-Encoder rerank
-        reranked = self._reranker.rerank(query, fused, top_k=k)
+        # 3. Cross-Encoder rerank (optional)
+        if self._reranker:
+            return self._reranker.rerank(query, fused, top_k=k)
 
-        return reranked
+        return fused[:k]
+
+
+# Module-level singleton to avoid reconnecting Milvus/ES on every request
+_retriever_instance: HybridRetriever | None = None
+
+
+def get_hybrid_retriever(
+    milvus_collection: str | None = None,
+    es_index: str | None = None,
+    retrieve_k: int = 5,
+    reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
+    reranker_top_k: int = 5,
+) -> HybridRetriever:
+    """Return a cached HybridRetriever singleton."""
+    global _retriever_instance
+    if _retriever_instance is None:
+        _retriever_instance = HybridRetriever(
+            milvus_collection=milvus_collection,
+            es_index=es_index,
+            retrieve_k=retrieve_k,
+            reranker_model=reranker_model,
+            reranker_top_k=reranker_top_k,
+        )
+    return _retriever_instance

@@ -11,7 +11,7 @@ from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
-from agents.rag.retriever import HybridRetriever
+from agents.rag.retriever import get_hybrid_retriever
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 async def sql_retrieve(state: SQLReactState) -> dict:
     """检索表结构信息。"""
-    retriever = HybridRetriever()
+    retriever = get_hybrid_retriever()
     docs = await asyncio.to_thread(retriever.retrieve, state["query"])
     return {"docs": docs}
 

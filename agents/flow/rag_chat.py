@@ -10,7 +10,7 @@ from agents.flow.state import RAGChatState
 from agents.tool.memory.store import get_session, save_session
 from agents.tool.memory.compressor import compress_session
 from agents.rag.query_rewrite import rewrite_query
-from agents.rag.retriever import HybridRetriever
+from agents.rag.retriever import get_hybrid_retriever
 from agents.model.chat_model import get_chat_model
 from agents.tool.token_counter import TokenCounter
 from agents.config.settings import settings
@@ -61,7 +61,7 @@ async def retrieve(state: RAGChatState) -> dict:
             from agents.rag.parent_retriever import ParentDocumentRetriever
             retriever = ParentDocumentRetriever()
         else:
-            retriever = HybridRetriever()
+            retriever = get_hybrid_retriever()
 
         # Run sync retrieval in thread pool with timeout
         docs = await asyncio.wait_for(

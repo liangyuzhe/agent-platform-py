@@ -49,7 +49,7 @@ class TestRAGChatGraphE2E:
     @patch("agents.flow.rag_chat.get_chat_model")
     @patch("agents.flow.rag_chat.get_session")
     @patch("agents.flow.rag_chat.save_session")
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_full_graph_produces_answer(
         self, mock_retriever_cls, mock_save, mock_get_session, mock_get_model,
         mock_rewrite_model,
@@ -82,7 +82,7 @@ class TestRAGChatGraphE2E:
     @patch("agents.flow.rag_chat.get_chat_model")
     @patch("agents.flow.rag_chat.get_session")
     @patch("agents.flow.rag_chat.save_session")
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_graph_with_empty_retrieval(
         self, mock_retriever_cls, mock_save, mock_get_session, mock_get_model,
         mock_rewrite_model,
@@ -113,7 +113,7 @@ class TestRAGChatGraphE2E:
     @patch("agents.flow.rag_chat.get_chat_model")
     @patch("agents.flow.rag_chat.get_session")
     @patch("agents.flow.rag_chat.save_session")
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_graph_with_history(
         self, mock_retriever_cls, mock_save, mock_get_session, mock_get_model,
         mock_rewrite_model,
@@ -156,7 +156,7 @@ class TestRAGChatGraphE2E:
     @patch("agents.flow.rag_chat.get_chat_model")
     @patch("agents.flow.rag_chat.get_session")
     @patch("agents.flow.rag_chat.save_session")
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_graph_llm_error_propagates(
         self, mock_retriever_cls, mock_save, mock_get_session, mock_get_model,
         mock_rewrite_model,
@@ -185,7 +185,7 @@ class TestRAGChatGraphE2E:
     @patch("agents.flow.rag_chat.get_chat_model")
     @patch("agents.flow.rag_chat.get_session")
     @patch("agents.flow.rag_chat.save_session")
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_graph_rag_mode_parent(
         self, mock_retriever_cls, mock_save, mock_get_session, mock_get_model,
         mock_rewrite_model,
@@ -334,7 +334,7 @@ class TestRetrieveNode:
     """Test retrieve node."""
 
     @pytest.mark.asyncio
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_retrieve_traditional(self, mock_retriever_cls):
         from agents.flow.rag_chat import retrieve
 
@@ -350,7 +350,7 @@ class TestRetrieveNode:
         mock_retriever.retrieve.assert_called_with("test query")
 
     @pytest.mark.asyncio
-    @patch("agents.flow.rag_chat.HybridRetriever")
+    @patch("agents.flow.rag_chat.get_hybrid_retriever")
     async def test_retrieve_falls_back_to_original_query(self, mock_retriever_cls):
         """If no rewritten_query, should use original query."""
         from agents.flow.rag_chat import retrieve

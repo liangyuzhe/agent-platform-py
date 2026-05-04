@@ -80,7 +80,7 @@ class TestRAGChatRetrieve:
         """Test retrieve uses HybridRetriever in traditional mode."""
         from agents.flow.rag_chat import retrieve
 
-        with patch("agents.flow.rag_chat.HybridRetriever") as mock_retriever:
+        with patch("agents.flow.rag_chat.get_hybrid_retriever") as mock_retriever:
             mock_instance = MagicMock()
             mock_instance.retrieve.return_value = []
             mock_retriever.return_value = mock_instance
