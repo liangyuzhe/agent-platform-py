@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from langchain_core.documents import Document
 
 
@@ -24,11 +26,21 @@ class CrossEncoderReranker:
     ) -> None:
         from sentence_transformers import CrossEncoder
 
-        self._model = CrossEncoder(
-            model_name,
-            max_length=512,
-            **({"device": device} if device else {}),
-        )
+        # Skip HuggingFace Hub network checks if model is already cached locally.
+        # Avoids repeated GET requests to huggingface.co on every cold start.
+        prev = os.environ.get("HF_HUB_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            self._model = CrossEncoder(
+                model_name,
+                max_length=512,
+                **({"device": device} if device else {}),
+            )
+        finally:
+            if prev is None:
+                del os.environ["HF_HUB_OFFLINE"]
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev
 
     def rerank(
         self,
