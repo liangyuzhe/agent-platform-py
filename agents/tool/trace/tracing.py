@@ -27,12 +27,18 @@ def init_langsmith() -> None:
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGCHAIN_API_KEY"] = settings.langsmith.api_key
     os.environ["LANGCHAIN_ENDPOINT"] = settings.langsmith.url
+    if settings.langsmith.project:
+        os.environ["LANGCHAIN_PROJECT"] = settings.langsmith.project
 
     # Show LangSmith trace send/flush logs in server output
     for name in ("langsmith", "langsmith.client", "langsmith._internal"):
         logging.getLogger(name).setLevel(logging.INFO)
 
-    logger.info("LangSmith tracing enabled (endpoint: %s)", settings.langsmith.url)
+    logger.info(
+        "LangSmith tracing enabled (endpoint: %s, project: %s)",
+        settings.langsmith.url,
+        settings.langsmith.project or "(default)",
+    )
 
 
 def _get_langsmith_handler() -> Any | None:
@@ -42,7 +48,7 @@ def _get_langsmith_handler() -> Any | None:
 
     try:
         from langchain_core.tracers.langchain import LangChainTracer
-        tracer = LangChainTracer()
+        tracer = LangChainTracer(project_name=settings.langsmith.project or None)
         return tracer
     except Exception as e:
         logger.warning("Failed to create LangChainTracer: %s", e)

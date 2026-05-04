@@ -22,6 +22,7 @@ class TestLangSmithInit:
         mock_settings.langsmith.tracing = True
         mock_settings.langsmith.api_key = "test-key"
         mock_settings.langsmith.url = "https://test.langchain.com"
+        mock_settings.langsmith.project = "test-project"
 
         from agents.tool.trace.tracing import init_langsmith
         init_langsmith()
@@ -29,11 +30,14 @@ class TestLangSmithInit:
         assert os.environ.get("LANGCHAIN_API_KEY") == "test-key"
         assert os.environ.get("LANGCHAIN_TRACING_V2") == "true"
         assert os.environ.get("LANGCHAIN_ENDPOINT") == "https://test.langchain.com"
+        assert os.environ.get("LANGCHAIN_PROJECT") == "test-project"
 
         # Cleanup
-        os.environ.pop("LANGCHAIN_API_KEY", None)
-        os.environ.pop("LANGCHAIN_TRACING_V2", None)
-        os.environ.pop("LANGCHAIN_ENDPOINT", None)
+        for key in [
+            "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2",
+            "LANGCHAIN_ENDPOINT", "LANGCHAIN_PROJECT",
+        ]:
+            os.environ.pop(key, None)
 
 
 class TestCozeLoopInit:
@@ -134,6 +138,7 @@ class TestTraceCallbacks:
         mock_settings.langsmith.tracing = True
         mock_settings.langsmith.api_key = "test-key"
         mock_settings.langsmith.url = "https://test.langchain.com"
+        mock_settings.langsmith.project = "test-project"
         mock_settings.cozeloop.tracing = False
         mock_settings.cozeloop.jwt_oauth_client_id = ""
 

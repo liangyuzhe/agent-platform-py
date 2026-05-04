@@ -190,6 +190,7 @@ class LangSmithSettings(BaseSettings):
         default="https://api.smith.langchain.com",
         description="LangSmith API URL",
     )
+    project: str = Field(default="", description="LangSmith project name")
     tracing: bool = Field(default=False, description="Enable LangSmith tracing")
 
 
