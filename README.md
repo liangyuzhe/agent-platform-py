@@ -248,6 +248,11 @@ curl -X POST http://localhost:8080/api/rag/chat/stream \
 curl -X POST http://localhost:8080/api/final/invoke \
   -H "Content-Type: application/json" \
   -d '{"query": "查询最近 7 天的订单数量", "session_id": "user1"}'
+
+# 流式（前端默认，含 SQL 审批事件）
+curl -X POST http://localhost:8080/api/final/invoke/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "查询最近 7 天的订单数量", "session_id": "user1"}'
 ```
 
 ### 文档上传
@@ -333,15 +338,24 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 
 检测模式：DROP TABLE、DELETE without WHERE、TRUNCATE、UPDATE with always-true WHERE 等。
 
-### 5. SQL ReAct 自纠错
+### 5. SQL ReAct 自纠错 + 自动补表
 
-SQL 执行失败时，LLM 自动分析错误并重新生成 SQL，最多重试 3 次：
+**执行错误重试**：SQL 执行失败时，LLM 自动分析错误并重新生成 SQL，最多重试 3 次：
 
 ```
 generate_sql → execute_sql → FAIL → error_analysis → generate_sql (retry)
                                      ↑                          |
                                      └──────────────────────────┘
 ```
+
+**自动补表发现**：当 LLM 发现缺少关键表时，自动 re-retrieve 补充缺失表的 schema：
+
+```
+generate_sql → needs_more_tables? → re-retrieve missing tables → generate_sql
+                 (最多 3 轮，直到 LLM 没有疑问)
+```
+
+LLM 通过 `sql_format_response` 工具声明缺少的表名，系统自动检索并合并 schema 后重新生成。
 
 ### 6. 多场景意图路由
 

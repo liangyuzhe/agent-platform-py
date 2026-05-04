@@ -225,16 +225,24 @@ graph.add_edge("construct_messages", "chat")
 graph.add_edge("chat", END)
 ```
 
-### 5.2 SQL React 图（ReAct 自纠错 + Human-in-the-Loop）
+### 5.2 SQL React 图（ReAct 自纠错 + 自动补表 + Human-in-the-Loop）
 
-SQL React 支持自动纠错重试：执行失败时 LLM 分析错误并重新生成 SQL，最多重试 3 次。
+SQL React 支持三层自纠错：
+
+1. **执行错误重试**：SQL 执行失败 → LLM 分析错误 → 重新生成（最多 3 次）
+2. **自动补表发现**：LLM 缺少关键表 → 自动 re-retrieve → 合并 schema → 重新生成（最多 3 轮）
+3. **人工审批**：SQL 通过安全检查后 interrupt 等待用户确认
 
 ```python
 # 流程：retrieve → check_docs → generate → safety → approve → execute
-#                                                  ↑               |
-#                                                  |  ← error_analysis ← FAIL
-#                                                  |       retry (max 3)
-#                                                  ↓
+#                            ↑    ↓                       |
+#                            | needs_more_tables?         |
+#                            |  → re-retrieve missing     |
+#                            |  → merge docs              |
+#                            ←──┘                         |
+#                                                  ↑      |
+#                                                  error_analysis ← FAIL
+#                                                  ↓       retry (max 3)
 #                                                 END (success)
 
 # State 新增字段
@@ -242,6 +250,23 @@ class SQLReactState(TypedDict):
     error: str | None          # SQL 执行错误信息
     retry_count: int           # 重试次数
     execution_history: list    # [{sql, result, error}]
+```
+
+**自动补表机制**（`sql_format_response` 工具）：
+
+LLM 可通过工具参数声明缺少表，触发自动 re-retrieve：
+
+```python
+# LLM 调用 sql_format_response 时设置：
+{
+    "answer": "",
+    "is_sql": False,
+    "needs_more_tables": True,       # 声明缺少表
+    "missing_tables": ["t_user"],    # 需要的表名
+}
+
+# 系统自动 re-retrieve → 合并 schema → 重新调 LLM
+# 最多 3 轮，避免无限循环
 ```
 
 人工审批使用 LangGraph interrupt 机制：
@@ -464,16 +489,19 @@ app.include_router(document.router, prefix="/api/document")
 
 ### 10.2 SSE 流式响应
 
+前端默认使用流式模式，LLM 输出逐字显示：
+
 ```python
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     async def generate():
-        async for event in graph.astream_events(...):
+        async for event in graph.astream_events(..., config=config):
             if event["event"] == "on_chat_model_stream":
                 yield {"event": "data", "data": chunk.content}
-
     return await sse_response(generate(), request)
 ```
+
+SQL Agent 流式端点额外支持审批事件：流结束后检测 interrupt，emit `approval` 事件。
 
 ### 10.3 API 端点
 
@@ -481,10 +509,11 @@ async def chat_stream(req: ChatRequest, request: Request):
 |------|------|------|
 | `/api/chat/test` | POST | Chat 测试 |
 | `/api/chat/test/stream` | POST | Chat 流式测试 |
-| `/api/rag/ask` | POST | RAG 问答 |
-| `/api/rag/chat/stream` | POST | RAG 流式对话 |
+| `/api/rag/ask` | POST | RAG 问答（非流式） |
+| `/api/rag/chat/stream` | POST | RAG 流式对话（前端默认） |
 | `/api/document/insert` | POST | 文档上传索引 |
-| `/api/final/invoke` | POST | 主调度（多场景意图路由） |
+| `/api/final/invoke` | POST | 主调度（非流式） |
+| `/api/final/invoke/stream` | POST | 主调度流式（前端默认，含审批事件） |
 | `/api/final/approve` | POST | 审批恢复（SQL/工单） |
 | `/api/admin/refresh-schemas` | POST | 全量刷新 Schema + 领域摘要 |
 | `/health` | GET | 健康检查 |
