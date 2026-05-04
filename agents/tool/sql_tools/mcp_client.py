@@ -35,23 +35,19 @@ async def _connect() -> ClientSession:
     if _session is not None:
         return _session
 
-    mysql_host = os.environ.get("MCP_MYSQL_HOST", settings.mysql.host)
-    mysql_port = os.environ.get("MCP_MYSQL_PORT", str(settings.mysql.port))
-    mysql_user = os.environ.get("MCP_MYSQL_USER", settings.mysql.username)
-    mysql_password = os.environ.get("MCP_MYSQL_PASSWORD", settings.mysql.password)
-    mysql_database = os.environ.get("MCP_MYSQL_DATABASE", settings.mysql.database)
+    # mcp-server-mysql reads config from env vars, not CLI args
+    mcp_env = {
+        "MYSQL_HOST": os.environ.get("MCP_MYSQL_HOST", settings.mysql.host),
+        "MYSQL_PORT": os.environ.get("MCP_MYSQL_PORT", str(settings.mysql.port)),
+        "MYSQL_USER": os.environ.get("MCP_MYSQL_USER", settings.mysql.username),
+        "MYSQL_PASS": os.environ.get("MCP_MYSQL_PASSWORD", settings.mysql.password),
+        "MYSQL_DB": os.environ.get("MCP_MYSQL_DATABASE", settings.mysql.database),
+    }
 
     server_params = StdioServerParameters(
         command="npx",
-        args=[
-            "-y",
-            "mcp-server-mysql",
-            f"--host={mysql_host}",
-            f"--port={mysql_port}",
-            f"--user={mysql_user}",
-            f"--password={mysql_password}",
-            f"--database={mysql_database}",
-        ],
+        args=["-y", "mcp-server-mysql"],
+        env={**os.environ, **mcp_env},
     )
 
     _cm = stdio_client(server_params)
