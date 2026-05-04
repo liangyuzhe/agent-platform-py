@@ -204,21 +204,33 @@
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const text = await resp.text();
-                    const events = text.split('\n\n').filter(Boolean);
-                    for (const evt of events) {
-                        const typeMatch = evt.match(/^event: (.+)$/m);
-                        const dataMatch = evt.match(/^data: (.+)$/m);
-                        if (!typeMatch || !dataMatch) continue;
-                        const type = typeMatch[1].trim();
-                        const data = dataMatch[1].trim();
-                        if (type === 'message') {
-                            fullText += data;
-                        } else if (type === 'error') {
-                            bubble.textContent = '服务端错误: ' + data;
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        // Process complete SSE events (separated by \n\n)
+                        const parts = buffer.split('\n\n');
+                        buffer = parts.pop(); // incomplete tail
+                        for (const part of parts) {
+                            if (!part.trim()) continue;
+                            const evtMatch = part.match(/^event: (.+)$/m);
+                            const dataMatch = part.match(/^data: (.+)$/m);
+                            if (!evtMatch || !dataMatch) continue;
+                            const evtType = evtMatch[1].trim();
+                            const data = dataMatch[1].trim();
+                            if (evtType === 'message') {
+                                fullText += data;
+                                bubble.textContent = fullText;
+                                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                            } else if (evtType === 'error') {
+                                bubble.textContent = '服务端错误: ' + data;
+                            }
                         }
                     }
-                    bubble.textContent = fullText || '(无响应)';
+                    if (!fullText) bubble.textContent = '(无响应)';
                 }
             } catch (e) {
                 if (!fullText) bubble.textContent = '请求失败: ' + e.message;
@@ -259,26 +271,37 @@
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const text = await resp.text();
-                    const events = text.split('\n\n').filter(Boolean);
-                    for (const evt of events) {
-                        const typeMatch = evt.match(/^event: (.+)$/m);
-                        const dataMatch = evt.match(/^data: (.+)$/m);
-                        if (!typeMatch || !dataMatch) continue;
-                        const type = typeMatch[1].trim();
-                        const data = dataMatch[1].trim();
-                        if (type === 'data') {
-                            fullText += data;
-                        } else if (type === 'approval') {
-                            try { approvalData = JSON.parse(data); } catch {}
-                        } else if (type === 'error') {
-                            bubble.textContent = '服务端错误: ' + data;
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        const parts = buffer.split('\n\n');
+                        buffer = parts.pop();
+                        for (const part of parts) {
+                            if (!part.trim()) continue;
+                            const evtMatch = part.match(/^event: (.+)$/m);
+                            const dataMatch = part.match(/^data: (.+)$/m);
+                            if (!evtMatch || !dataMatch) continue;
+                            const evtType = evtMatch[1].trim();
+                            const data = dataMatch[1].trim();
+                            if (evtType === 'data') {
+                                fullText += data;
+                                bubble.textContent = fullText;
+                                sqlMessages.scrollTop = sqlMessages.scrollHeight;
+                            } else if (evtType === 'approval') {
+                                try { approvalData = JSON.parse(data); } catch {}
+                            } else if (evtType === 'error') {
+                                bubble.textContent = '服务端错误: ' + data;
+                            }
                         }
                     }
                     if (approvalData) {
                         renderAgentResponse(div, {pending_approval: true, ...approvalData});
-                    } else {
-                        bubble.textContent = fullText || '(无响应)';
+                    } else if (!fullText) {
+                        bubble.textContent = '(无响应)';
                     }
                 }
             } catch (e) {
