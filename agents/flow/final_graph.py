@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage
 
 from agents.flow.state import FinalGraphState
 from agents.model.chat_model import get_chat_model
+from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
 
@@ -26,13 +27,14 @@ async def classify_intent(state: FinalGraphState) -> dict:
     return {"intent": "SQL" if "SQL" in intent else "Chat"}
 
 
-async def sql_react(state: FinalGraphState) -> dict:
+async def sql_react(state: FinalGraphState, config=None) -> dict:
     """SQL React 子图。"""
     from agents.flow.sql_react import build_sql_react_graph
     sql_graph = build_sql_react_graph()
-    result = await sql_graph.ainvoke({
-        "query": state["query"],
-    })
+    result = await sql_graph.ainvoke(
+        {"query": state["query"]},
+        config=config,
+    )
     return {
         "sql": result.get("sql", ""),
         "result": result.get("result", ""),
@@ -74,4 +76,5 @@ def build_final_graph():
     graph.add_edge("sql_react", END)
     graph.add_edge("chat_direct", END)
 
-    return graph.compile()
+    checkpointer = get_checkpointer()
+    return graph.compile(checkpointer=checkpointer)

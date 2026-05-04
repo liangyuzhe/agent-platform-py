@@ -15,10 +15,15 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """启动时初始化所有组件，关闭时清理。"""
+    import asyncio
+    import logging
+
     from agents.tool.storage.redis_client import init_redis, close_redis
     from agents.model.chat_model import init_chat_models
     from agents.model.embedding_model import init_embedding_models
     from agents.tool.trace.tracing import init_tracing, close_cozeloop
+
+    logger = logging.getLogger(__name__)
 
     # 初始化基础设施
     await init_redis()
@@ -30,11 +35,24 @@ async def lifespan(app: FastAPI):
     # 初始化链路追踪
     init_tracing()
 
+    # 后台异步索引 MySQL 表结构（不阻塞服务启动）
+    asyncio.create_task(_index_schemas_background(logger))
+
     yield
 
     # 清理
     close_cozeloop()
     await close_redis()
+
+
+async def _index_schemas_background(logger):
+    """后台任务：连接 MySQL 并将表结构向量化到 Milvus + ES。"""
+    try:
+        from agents.rag.schema_indexer import index_mysql_schemas
+        result = await index_mysql_schemas()
+        logger.info("Schema auto-indexing done: %s", result)
+    except Exception as e:
+        logger.warning("Schema auto-indexing failed: %s", e)
 
 
 app = FastAPI(

@@ -34,6 +34,8 @@ def _get_embeddings():
             openai_api_key=settings.qwen.key,
             openai_api_base=settings.qwen.base_url,
             model=settings.qwen.embedding_model,
+            tiktoken_enabled=False,
+            check_embedding_ctx_length=False,
         )
     raise ValueError(f"Unsupported embedding_model_type: {provider!r}")
 
