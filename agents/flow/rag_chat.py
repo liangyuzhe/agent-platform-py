@@ -51,10 +51,11 @@ async def rewrite(state: RAGChatState) -> dict:
     return {"rewritten_query": rewritten}
 
 
-async def retrieve(state: RAGChatState) -> dict:
+async def retrieve(state: RAGChatState, config=None) -> dict:
     """双路检索 + RRF 融合 + Cross-Encoder 重排序。"""
     query = state.get("rewritten_query", state["query"])
     mode = state.get("rag_mode", settings.rag.mode)
+    callbacks = (config or {}).get("callbacks", [])
 
     try:
         if mode == "parent":
@@ -65,7 +66,7 @@ async def retrieve(state: RAGChatState) -> dict:
 
         # Run sync retrieval in thread pool with timeout
         docs = await asyncio.wait_for(
-            asyncio.to_thread(retriever.retrieve, query),
+            asyncio.to_thread(retriever.retrieve, query, callbacks=callbacks),
             timeout=15,
         )
     except Exception as e:

@@ -25,10 +25,11 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 
 
-async def sql_retrieve(state: SQLReactState) -> dict:
+async def sql_retrieve(state: SQLReactState, config=None) -> dict:
     """检索表结构信息。"""
     retriever = get_hybrid_retriever()
-    docs = await asyncio.to_thread(retriever.retrieve, state["query"])
+    callbacks = (config or {}).get("callbacks", [])
+    docs = await asyncio.to_thread(retriever.retrieve, state["query"], callbacks=callbacks)
     return {"docs": docs}
 
 

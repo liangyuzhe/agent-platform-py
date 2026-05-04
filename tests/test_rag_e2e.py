@@ -347,7 +347,8 @@ class TestRetrieveNode:
         result = await retrieve(state)
 
         assert len(result["docs"]) == 2
-        mock_retriever.retrieve.assert_called_with("test query")
+        mock_retriever.retrieve.assert_called()
+        assert mock_retriever.retrieve.call_args[0][0] == "test query"
 
     @pytest.mark.asyncio
     @patch("agents.flow.rag_chat.get_hybrid_retriever")
@@ -363,7 +364,8 @@ class TestRetrieveNode:
 
         result = await retrieve(state)
 
-        mock_retriever.retrieve.assert_called_with("original")
+        mock_retriever.retrieve.assert_called()
+        assert mock_retriever.retrieve.call_args[0][0] == "original"
 
 
 class TestPreprocessNode:

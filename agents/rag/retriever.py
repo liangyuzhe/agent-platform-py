@@ -224,11 +224,11 @@ class HybridRetriever:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _retrieve_milvus(self, query: str) -> list[Document]:
+    def _retrieve_milvus(self, query: str, callbacks=None) -> list[Document]:
         import time
         t0 = time.monotonic()
         try:
-            docs = self._milvus.invoke(query)
+            docs = self._milvus.invoke(query, config={"callbacks": callbacks or []})
             for d in docs:
                 d.metadata["retriever_source"] = "milvus"
             elapsed = time.monotonic() - t0
@@ -239,11 +239,11 @@ class HybridRetriever:
             logger.warning("Milvus retrieve failed after %.2fs: %s", elapsed, e)
             return []
 
-    def _retrieve_es(self, query: str) -> list[Document]:
+    def _retrieve_es(self, query: str, callbacks=None) -> list[Document]:
         import time
         t0 = time.monotonic()
         try:
-            docs = self._es.invoke(query)
+            docs = self._es.invoke(query, config={"callbacks": callbacks or []})
             for d in docs:
                 d.metadata["retriever_source"] = "es"
             elapsed = time.monotonic() - t0
@@ -256,11 +256,11 @@ class HybridRetriever:
 
     # -- public API ---------------------------------------------------------
 
-    def retrieve(self, query: str, top_k: int | None = None) -> list[Document]:
+    def retrieve(self, query: str, top_k: int | None = None, callbacks=None) -> list[Document]:
         """Run hybrid retrieval and return the top *top_k* documents.
 
         Steps:
-        1. Retrieve from Milvus (dense) and ES BM25 (sparse) **in parallel**.
+        1. Retrieve from Milvus (dense) and ES BM25 (sparse) sequentially.
         2. Fuse the two ranked lists with Reciprocal Rank Fusion (RRF).
         3. (Optional) Rerank the fused list with a Cross-Encoder.
         4. Return the top *top_k* results.
@@ -272,20 +272,24 @@ class HybridRetriever:
         top_k:
             Number of final results to return.  Defaults to the value passed
             at construction time (``reranker_top_k``).
+        callbacks:
+            LangChain callback handlers. Propagated to child retriever calls
+            so each step appears as a separate span in LangSmith.
         """
         k = top_k or self._reranker_top_k
 
-        # 1. Parallel retrieval
+        # 1. Parallel retrieval — pass callbacks explicitly so worker threads
+        #    create child spans in LangSmith (contextvars don't cross threads).
         import time as _time
         t0 = _time.monotonic()
         doc_lists: list[list[Document]] = [None, None]  # type: ignore[list-item]
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {
-                pool.submit(self._retrieve_milvus, query): 0,
-                pool.submit(self._retrieve_es, query): 1,
+                pool.submit(self._retrieve_milvus, query, callbacks=callbacks): 0,
+                pool.submit(self._retrieve_es, query, callbacks=callbacks): 1,
             }
-            for future in as_completed(futures, timeout=10):
+            for future in as_completed(futures, timeout=30):
                 idx = futures[future]
                 try:
                     doc_lists[idx] = future.result(timeout=5)
@@ -293,7 +297,6 @@ class HybridRetriever:
                     logger.warning("Retriever[%d] exception: %s", idx, e)
                     doc_lists[idx] = []
 
-        # Handle any futures that didn't complete
         for idx, docs in enumerate(doc_lists):
             if docs is None:
                 logger.warning("Retriever[%d] did not complete (timeout)", idx)
