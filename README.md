@@ -409,6 +409,11 @@ EMBEDDING_MODEL_TYPE=qwen    # ark / openai / qwen / gemini
 CHUNK_SIZE=1000              # 分块大小（字符数）
 CHUNK_OVERLAP=200            # 分块重叠
 TOP_K=5                      # 检索返回文档数
+
+# Reranker（Cross-Encoder 重排序）
+RAG_RERANKER_MODEL=BAAI/bge-reranker-v2-m3   # 空字符串禁用
+RAG_RERANKER_TOP_K=5                          # 重排序后保留文档数
+RAG_RERANK_THRESHOLD=0.1                      # 最低分数阈值
 ```
 
 ### 记忆参数

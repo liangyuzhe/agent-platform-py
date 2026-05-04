@@ -322,6 +322,22 @@ rewritten = await rewrite_query(
 )
 ```
 
+### 6.4 Reranker 配置与可观测性
+
+**配置项**（`.env` 或环境变量）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-Encoder 模型名，空字符串禁用 rerank |
+| `RAG_RERANKER_TOP_K` | `5` | Rerank 后保留的文档数 |
+| `RAG_RERANK_THRESHOLD` | `0.1` | 最低 rerank 分数，低于此值的文档被过滤 |
+
+**LangSmith 可观测性**：
+
+- Milvus / ES 各自独立的 trace span（通过 callback 传播）
+- Cross-Encoder Rerank 独立 span（`@traceable` 装饰器）
+- 检索阶段日志记录耗时和文档数量，便于定位瓶颈
+
 ---
 
 ## 7. 记忆系统设计
@@ -488,6 +504,9 @@ EMBEDDING_MODEL_TYPE=qwen    # ark / openai / qwen
 RAG_MODE=traditional         # traditional / parent
 RAG_CHUNK_SIZE=1024
 RAG_TOP_K=5
+RAG_RERANKER_MODEL=BAAI/bge-reranker-v2-m3   # 空字符串禁用 rerank
+RAG_RERANKER_TOP_K=5
+RAG_RERANK_THRESHOLD=0.1
 
 # 基础设施
 MILVUS_ADDR=localhost:19530
