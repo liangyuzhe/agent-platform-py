@@ -192,21 +192,46 @@
             queryInput.value = '';
             btn.disabled = true;
             addMessage(messagesDiv, 'user', query);
-            const div = addMessage(messagesDiv, 'assistant', '思考中...');
+            const div = addMessage(messagesDiv, 'assistant', '');
+            const bubble = div.querySelector('.bubble');
+            let fullText = '';
             try {
-                const resp = await fetch('/api/rag/ask', {
+                const resp = await fetch('/api/rag/chat/stream', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
                 if (!resp.ok) {
-                    div.querySelector('.bubble').textContent = '请求失败: HTTP ' + resp.status;
+                    bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const data = await resp.json();
-                    div.querySelector('.bubble').textContent = data.answer || '(无响应)';
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop();
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6).trim();
+                                if (data === '[DONE]') continue;
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    if (parsed.event === 'message') {
+                                        fullText += parsed.data;
+                                        bubble.textContent = fullText;
+                                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                                    }
+                                } catch {}
+                            }
+                        }
+                    }
+                    if (!fullText) bubble.textContent = '(无响应)';
                 }
             } catch (e) {
-                div.querySelector('.bubble').textContent = '请求失败: ' + e.message;
+                if (!fullText) bubble.textContent = '请求失败: ' + e.message;
             }
             btn.disabled = false;
         }
@@ -231,22 +256,52 @@
             sqlQuery.value = '';
             agentBtn.disabled = true;
             addAgentMessage('user', escHtml(query));
-            const div = addAgentMessage('assistant', '思考中...');
+            const div = addAgentMessage('assistant', '');
+            const bubble = div.querySelector('.bubble');
+            let fullText = '';
+            let approvalData = null;
 
             try {
-                const resp = await fetch('/api/final/invoke', {
+                const resp = await fetch('/api/final/invoke/stream', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
                 if (!resp.ok) {
-                    div.querySelector('.bubble').textContent = '请求失败: HTTP ' + resp.status;
+                    bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const data = await resp.json();
-                    renderAgentResponse(div, data);
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop();
+                        for (const line of lines) {
+                            if (line.startsWith('event: ')) {
+                                var currentEvent = line.slice(7).trim();
+                            } else if (line.startsWith('data: ')) {
+                                const data = line.slice(6).trim();
+                                if (currentEvent === 'data') {
+                                    fullText += data;
+                                    bubble.textContent = fullText;
+                                    sqlMessages.scrollTop = sqlMessages.scrollHeight;
+                                } else if (currentEvent === 'approval') {
+                                    try { approvalData = JSON.parse(data); } catch {}
+                                }
+                            }
+                        }
+                    }
+                    if (approvalData) {
+                        renderAgentResponse(div, {pending_approval: true, ...approvalData});
+                    } else if (!fullText) {
+                        bubble.textContent = '(无响应)';
+                    }
                 }
             } catch (e) {
-                div.querySelector('.bubble').textContent = '请求失败: ' + e.message;
+                if (!fullText) bubble.textContent = '请求失败: ' + e.message;
             }
             agentBtn.disabled = false;
         }

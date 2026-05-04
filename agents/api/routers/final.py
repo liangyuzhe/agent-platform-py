@@ -129,6 +129,7 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
 
     async def generate() -> AsyncGenerator[dict, None]:
         yield {"event": "start", "data": ""}
+        final_result = None
         async for event in graph.astream_events(
             {"query": req.query, "session_id": req.session_id},
             version="v2",
@@ -138,6 +139,19 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
                 chunk = event["data"]["chunk"]
                 if chunk.content:
                     yield {"event": "data", "data": chunk.content}
+            elif event["event"] == "on_chain_end" and event.get("name") == "LangGraph":
+                final_result = event["data"].get("output")
+
+        # Check if graph paused for SQL approval (interrupt)
+        if final_result:
+            interrupt_val = _extract_interrupt(final_result)
+            if interrupt_val:
+                import json
+                yield {"event": "approval", "data": json.dumps({
+                    "sql": interrupt_val.get("sql", ""),
+                    "message": interrupt_val.get("message", "请确认是否执行该 SQL"),
+                })}
+
         yield {"event": "end", "data": ""}
 
     return await sse_response(generate(), request)
