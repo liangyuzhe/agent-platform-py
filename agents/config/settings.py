@@ -236,6 +236,13 @@ class RAGSettings(BaseSettings):
         default=0.7,
         description="Minimum similarity for a chunk to be kept",
     )
+    # Reranker params
+    reranker_model: str = Field(
+        default="BAAI/bge-reranker-v2-m3",
+        description="Cross-Encoder reranker model name, empty string to disable",
+    )
+    reranker_top_k: int = Field(default=5, description="Number of results after reranking")
+    rerank_threshold: float = Field(default=0.1, description="Minimum rerank score to keep")
     # Parent Document RAG params
     parent_chunk_size: int = Field(
         default=2048, description="Parent chunk size for parent document RAG"

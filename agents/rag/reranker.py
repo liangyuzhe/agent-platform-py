@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from langchain_core.documents import Document
+from langsmith import traceable
 
 
 class CrossEncoderReranker:
@@ -42,6 +43,7 @@ class CrossEncoderReranker:
             else:
                 os.environ["HF_HUB_OFFLINE"] = prev
 
+    @traceable(name="CrossEncoder Rerank")
     def rerank(
         self,
         query: str,

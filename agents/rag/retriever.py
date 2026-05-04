@@ -316,7 +316,11 @@ class HybridRetriever:
 
         # 3. Cross-Encoder rerank (optional) + threshold filter
         if self._reranker:
+            import time as _t
+            _rt0 = _t.monotonic()
             reranked = self._reranker.rerank(query, fused, top_k=k)
+            _rt = _t.monotonic() - _rt0
+            logger.info("Rerank: %d → %d docs in %.2fs", len(fused), len(reranked), _rt)
             results = [
                 d for d in reranked
                 if d.metadata.get("rerank_score", 0) >= self._rerank_threshold
@@ -345,13 +349,25 @@ def get_hybrid_retriever(
     milvus_collection: str | None = None,
     es_index: str | None = None,
     retrieve_k: int = 5,
-    reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
-    reranker_top_k: int = 5,
-    rerank_threshold: float = 0.1,
+    reranker_model: str | None = None,
+    reranker_top_k: int | None = None,
+    rerank_threshold: float | None = None,
 ) -> HybridRetriever:
-    """Return a cached HybridRetriever singleton."""
+    """Return a cached HybridRetriever singleton.
+
+    Parameters default to ``settings.rag.*`` values.  Pass explicit values
+    to override per-call.
+    """
     global _retriever_instance
     if _retriever_instance is None:
+        # Resolve from settings when not explicitly provided
+        if reranker_model is None:
+            rm = settings.rag.reranker_model
+            reranker_model = rm if rm else None
+        if reranker_top_k is None:
+            reranker_top_k = settings.rag.reranker_top_k
+        if rerank_threshold is None:
+            rerank_threshold = settings.rag.rerank_threshold
         _retriever_instance = HybridRetriever(
             milvus_collection=milvus_collection,
             es_index=es_index,
