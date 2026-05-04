@@ -175,3 +175,56 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
         yield {"event": "end", "data": ""}
 
     return await sse_response(generate(), request)
+
+
+@router.get("/invoke/stream")
+async def final_invoke_stream_get(
+    query: str,
+    session_id: str = "default_user",
+    request: Request = None,
+):
+    """SSE 流式 Final Graph 调用 (GET, for EventSource)."""
+    graph = build_final_graph()
+    config = _make_config(session_id)
+
+    async def generate() -> AsyncGenerator[dict, None]:
+        yield {"event": "start", "data": ""}
+        final_result = None
+        in_intermediate_node = False
+
+        try:
+            async for event in graph.astream_events(
+                {"query": query, "session_id": session_id},
+                version="v2",
+                config=config,
+            ):
+                evt_type = event["event"]
+                evt_name = event.get("name", "")
+
+                if evt_type == "on_chain_start" and evt_name == "classify_intent":
+                    in_intermediate_node = True
+                elif evt_type == "on_chain_end" and evt_name == "classify_intent":
+                    in_intermediate_node = False
+
+                if evt_type == "on_chat_model_stream" and not in_intermediate_node:
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "data", "data": chunk.content}
+                elif evt_type == "on_chain_end" and evt_name == "LangGraph":
+                    final_result = event["data"].get("output")
+        except Exception as e:
+            logger.exception("Final graph stream error")
+            yield {"event": "error", "data": str(e)}
+
+        if final_result:
+            interrupt_val = _extract_interrupt(final_result)
+            if interrupt_val:
+                import json
+                yield {"event": "approval", "data": json.dumps({
+                    "sql": interrupt_val.get("sql", ""),
+                    "message": interrupt_val.get("message", "请确认是否执行该 SQL"),
+                })}
+
+        yield {"event": "end", "data": ""}
+
+    return await sse_response(generate(), request)

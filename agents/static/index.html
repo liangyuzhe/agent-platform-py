@@ -195,45 +195,35 @@
             const div = addMessage(messagesDiv, 'assistant', '');
             const bubble = div.querySelector('.bubble');
             let fullText = '';
-            try {
-                const resp = await fetch('/api/rag/chat/stream', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query, session_id: sessionId}),
-                });
-                if (!resp.ok) {
-                    bubble.textContent = '请求失败: HTTP ' + resp.status;
-                } else {
-                    const reader = resp.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, {stream: true});
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop();
-                        for (const line of lines) {
-                            if (line.startsWith('event: ')) {
-                                var ragEvent = line.slice(7).trim();
-                            } else if (line.startsWith('data: ')) {
-                                const data = line.slice(6).trim();
-                                if (ragEvent === 'message') {
-                                    fullText += data;
-                                    bubble.textContent = fullText;
-                                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                                } else if (ragEvent === 'error') {
-                                    bubble.textContent = '服务端错误: ' + data;
-                                }
-                            }
-                        }
-                    }
-                    if (!fullText) bubble.textContent = '(无响应)';
+
+            const params = new URLSearchParams({query, session_id: sessionId});
+            const es = new EventSource('/api/rag/chat/stream?' + params);
+
+            es.addEventListener('message', (e) => {
+                fullText += e.data;
+                bubble.textContent = fullText;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            });
+
+            es.addEventListener('error', (e) => {
+                if (e.data) {
+                    bubble.textContent = '服务端错误: ' + e.data;
+                    es.close();
+                    btn.disabled = false;
                 }
-            } catch (e) {
-                if (!fullText) bubble.textContent = '请求失败: ' + e.message;
-            }
-            btn.disabled = false;
+            });
+
+            es.addEventListener('done', () => {
+                es.close();
+                if (!fullText) bubble.textContent = '(无响应)';
+                btn.disabled = false;
+            });
+
+            es.onerror = () => {
+                es.close();
+                if (!fullText) bubble.textContent = '连接中断';
+                btn.disabled = false;
+            };
         }
 
         // --- SQL Agent ---
@@ -261,51 +251,43 @@
             let fullText = '';
             let approvalData = null;
 
-            try {
-                const resp = await fetch('/api/final/invoke/stream', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query, session_id: sessionId}),
-                });
-                if (!resp.ok) {
-                    bubble.textContent = '请求失败: HTTP ' + resp.status;
-                } else {
-                    const reader = resp.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, {stream: true});
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop();
-                        for (const line of lines) {
-                            if (line.startsWith('event: ')) {
-                                var currentEvent = line.slice(7).trim();
-                            } else if (line.startsWith('data: ')) {
-                                const data = line.slice(6).trim();
-                                if (currentEvent === 'data') {
-                                    fullText += data;
-                                    bubble.textContent = fullText;
-                                    sqlMessages.scrollTop = sqlMessages.scrollHeight;
-                                } else if (currentEvent === 'approval') {
-                                    try { approvalData = JSON.parse(data); } catch {}
-                                } else if (currentEvent === 'error') {
-                                    bubble.textContent = '服务端错误: ' + data;
-                                }
-                            }
-                        }
-                    }
-                    if (approvalData) {
-                        renderAgentResponse(div, {pending_approval: true, ...approvalData});
-                    } else if (!fullText) {
-                        bubble.textContent = '(无响应)';
-                    }
+            const params = new URLSearchParams({query, session_id: sessionId});
+            const es = new EventSource('/api/final/invoke/stream?' + params);
+
+            es.addEventListener('data', (e) => {
+                fullText += e.data;
+                bubble.textContent = fullText;
+                sqlMessages.scrollTop = sqlMessages.scrollHeight;
+            });
+
+            es.addEventListener('approval', (e) => {
+                try { approvalData = JSON.parse(e.data); } catch {}
+            });
+
+            es.addEventListener('error', (e) => {
+                if (e.data) {
+                    bubble.textContent = '服务端错误: ' + e.data;
+                    es.close();
                 }
-            } catch (e) {
-                if (!fullText) bubble.textContent = '请求失败: ' + e.message;
-            }
-            agentBtn.disabled = false;
+            });
+
+            es.addEventListener('end', () => {
+                es.close();
+                if (approvalData) {
+                    renderAgentResponse(div, {pending_approval: true, ...approvalData});
+                } else if (!fullText) {
+                    bubble.textContent = '(无响应)';
+                }
+                agentBtn.disabled = false;
+            });
+
+            es.onerror = () => {
+                if (!fullText && !approvalData) {
+                    bubble.textContent = '连接中断';
+                }
+                es.close();
+                agentBtn.disabled = false;
+            };
         }
 
         function renderAgentResponse(div, data) {
