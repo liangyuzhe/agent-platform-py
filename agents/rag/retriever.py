@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -13,6 +14,8 @@ from langchain_milvus import Milvus
 from agents.config.settings import settings
 from agents.algorithm.rrf import reciprocal_rank_fusion
 from agents.rag.reranker import CrossEncoderReranker
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +225,16 @@ class HybridRetriever:
     # -- internal helpers ---------------------------------------------------
 
     def _retrieve_milvus(self, query: str) -> list[Document]:
-        return self._milvus.invoke(query)
+        docs = self._milvus.invoke(query)
+        for d in docs:
+            d.metadata["retriever_source"] = "milvus"
+        return docs
 
     def _retrieve_es(self, query: str) -> list[Document]:
-        return self._es.invoke(query)
+        docs = self._es.invoke(query)
+        for d in docs:
+            d.metadata["retriever_source"] = "es"
+        return docs
 
     # -- public API ---------------------------------------------------------
 
@@ -264,15 +273,33 @@ class HybridRetriever:
                     doc_lists[idx] = []
 
         # 2. RRF fusion
+        milvus_count = len(doc_lists[0]) if doc_lists[0] else 0
+        es_count = len(doc_lists[1]) if doc_lists[1] else 0
+        logger.info(
+            "Hybrid retrieve: milvus=%d, es=%d docs",
+            milvus_count, es_count,
+        )
         fused = reciprocal_rank_fusion(doc_lists, k=60)
 
         # 3. Cross-Encoder rerank (optional) + threshold filter
         if self._reranker:
             reranked = self._reranker.rerank(query, fused, top_k=k)
-            return [
+            results = [
                 d for d in reranked
                 if d.metadata.get("rerank_score", 0) >= self._rerank_threshold
             ]
+            logger.info(
+                "After rerank (threshold=%.2f): %d docs kept — %s",
+                self._rerank_threshold,
+                len(results),
+                [
+                    (d.metadata.get("table_name", "?"),
+                     d.metadata.get("retriever_source", "?"),
+                     round(d.metadata.get("rerank_score", 0), 4))
+                    for d in results
+                ],
+            )
+            return results
 
         return fused[:k]
 
