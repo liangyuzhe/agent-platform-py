@@ -260,7 +260,11 @@ class RAGSettings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, data: dict) -> dict:
-        return {k: v for k, v in data.items() if v != ""}
+        # Keep RAG_RERANKER_MODEL as-is (empty string = disable reranker)
+        return {
+            k: v for k, v in data.items()
+            if v != "" or k == "reranker_model"
+        }
 
 
 class MemorySettings(BaseSettings):

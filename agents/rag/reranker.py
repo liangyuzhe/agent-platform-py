@@ -26,15 +26,22 @@ class CrossEncoderReranker:
         device: str | None = None,
     ) -> None:
         from sentence_transformers import CrossEncoder
+        import torch
 
         # Skip HuggingFace Hub network checks if model is already cached locally.
         # Avoids repeated GET requests to huggingface.co on every cold start.
         prev = os.environ.get("HF_HUB_OFFLINE")
         os.environ["HF_HUB_OFFLINE"] = "1"
         try:
+            automodel_args = {}
+            # Enable FP16 on CUDA for ~30-50% speedup with minimal precision loss
+            if torch.cuda.is_available() and (device is None or "cuda" in str(device)):
+                automodel_args["torch_dtype"] = torch.float16
+
             self._model = CrossEncoder(
                 model_name,
                 max_length=512,
+                automodel_args=automodel_args,
                 **({"device": device} if device else {}),
             )
         finally:
