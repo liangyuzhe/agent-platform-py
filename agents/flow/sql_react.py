@@ -73,20 +73,49 @@ async def check_docs(state: SQLReactState) -> dict:
     return {}
 
 
+_MAX_TABLE_SEARCH_ROUNDS = 3
+
+
+async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: list) -> list:
+    """Re-retrieve schema docs for missing table names."""
+    from langchain_core.documents import Document
+    retriever = get_hybrid_retriever()
+    new_docs = []
+    for table_name in missing_tables:
+        try:
+            docs = await asyncio.to_thread(retriever.retrieve, f"表结构 {table_name}")
+            new_docs.extend(docs)
+        except Exception as e:
+            logger.warning("Re-retrieve for table '%s' failed: %s", table_name, e)
+    # Deduplicate by table_name
+    existing_names = {d.metadata.get("table_name", "") for d in existing_docs}
+    unique_new = [d for d in new_docs if d.metadata.get("table_name", "") not in existing_names]
+    return unique_new
+
+
+def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str) -> list:
+    """Build messages for sql_generate LLM call."""
+    return [
+        SystemMessage(content=f"""你是一个 SQL 专家。根据用户的问题和数据库表结构信息，生成正确的 SQL 查询。
+
+表结构信息:
+        {docs_text}{refine_context}{history_context}
+
+要求：
+1. 使用 MySQL 语法
+2. 只生成 SELECT 查询（禁止 DROP/DELETE/TRUNCATE 等危险操作）
+3. 如果有执行历史和错误信息，请分析错误原因并生成修正后的 SQL
+4. 如果现有表结构不足以生成正确的 SQL（例如缺少关联表、缺少字段所在的表），
+   请设置 needs_more_tables=true 并在 missing_tables 中列出你需要的表名
+5. 使用 format_response 工具输出结果"""),
+        HumanMessage(content=query),
+    ]
+
+
 async def sql_generate(state: SQLReactState) -> dict:
-    """LLM 生成 SQL。"""
+    """LLM 生成 SQL，支持自动补表（最多重试 3 次）。"""
     model = get_chat_model(settings.chat_model_type)
     model_with_tools = model.bind_tools([create_format_tool()])
-
-    # Filter by rerank threshold then keep top-3 to reduce token count
-    threshold = settings.rag.rerank_threshold
-    all_docs = state.get("docs", [])
-    scored_docs = [d for d in all_docs if d.metadata.get("rerank_score", 0) >= threshold]
-    docs = sorted(scored_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:3]
-    # If threshold filtered everything, fall back to top-3 unfiltered
-    if not docs:
-        docs = sorted(all_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:3]
-    docs_text = "\n".join([d.page_content for d in docs])
 
     # 如果有修改意见，加入上下文
     refine_context = ""
@@ -107,36 +136,66 @@ async def sql_generate(state: SQLReactState) -> dict:
             history_lines.append(entry)
         history_context = f"\n执行历史:\n" + "\n".join(history_lines)
 
-    messages = [
-        SystemMessage(content=f"""你是一个 SQL 专家。根据用户的问题和数据库表结构信息，生成正确的 SQL 查询。
+    # Accumulate docs across re-retrieval rounds
+    all_docs = list(state.get("docs", []))
 
-表结构信息:
-        {docs_text}{refine_context}{history_context}
+    for round_idx in range(_MAX_TABLE_SEARCH_ROUNDS):
+        # Filter by rerank threshold then keep top-N
+        threshold = settings.rag.rerank_threshold
+        scored_docs = [d for d in all_docs if d.metadata.get("rerank_score", 0) >= threshold]
+        docs = sorted(scored_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:5]
+        if not docs:
+            docs = sorted(all_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:5]
+        docs_text = "\n\n".join([d.page_content for d in docs])
 
-要求：
-1. 使用 MySQL 语法
-2. 只生成 SELECT 查询（禁止 DROP/DELETE/TRUNCATE 等危险操作）
-3. 如果有执行历史和错误信息，请分析错误原因并生成修正后的 SQL
-4. 使用 format_response 工具输出结果"""),
-        HumanMessage(content=state["query"]),
-    ]
+        messages = _build_sql_messages(state["query"], docs_text, refine_context, history_context)
+        response = await model_with_tools.ainvoke(messages)
 
-    response = await model_with_tools.ainvoke(messages)
+        if not response.tool_calls:
+            return {"answer": response.content, "sql": response.content, "is_sql": False, "error": None}
 
-    # 解析结构化输出
-    if response.tool_calls:
         tool_call = response.tool_calls[0]
         args = tool_call["args"]
-        answer_text = args.get("answer", "")
-        is_sql = args.get("is_sql", False)
-        return {
-            "answer": answer_text,
-            "sql": answer_text if is_sql else answer_text,
-            "is_sql": is_sql,
-            "error": None,  # 清除之前的错误
-        }
+        needs_more = args.get("needs_more_tables", False)
+        missing = args.get("missing_tables", [])
 
-    return {"answer": response.content, "sql": response.content, "is_sql": False, "error": None}
+        # If LLM says it has enough tables, return the result
+        if not needs_more or not missing:
+            answer_text = args.get("answer", "")
+            is_sql = args.get("is_sql", False)
+            logger.info("sql_generate: produced SQL after %d round(s)", round_idx + 1)
+            return {
+                "answer": answer_text,
+                "sql": answer_text if is_sql else answer_text,
+                "is_sql": is_sql,
+                "error": None,
+            }
+
+        # LLM needs more tables — re-retrieve
+        logger.info("sql_generate: round %d, LLM needs tables: %s", round_idx + 1, missing)
+        new_docs = await _retrieve_missing_tables(missing, all_docs)
+        if not new_docs:
+            logger.info("sql_generate: no new docs found for %s, using what we have", missing)
+            answer_text = args.get("answer", "")
+            is_sql = args.get("is_sql", False)
+            return {
+                "answer": answer_text,
+                "sql": answer_text if is_sql else answer_text,
+                "is_sql": is_sql,
+                "error": None,
+            }
+        all_docs.extend(new_docs)
+        logger.info("sql_generate: added %d new docs, total %d", len(new_docs), len(all_docs))
+
+    # Exhausted retries — return what we have
+    answer_text = args.get("answer", "")
+    is_sql = args.get("is_sql", False)
+    return {
+        "answer": answer_text,
+        "sql": answer_text if is_sql else answer_text,
+        "is_sql": is_sql,
+        "error": None,
+    }
 
 
 async def safety_check(state: SQLReactState) -> dict:

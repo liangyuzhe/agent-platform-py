@@ -349,6 +349,73 @@ class TestSqlGenerate:
         assert "t_role" not in system_msg
         assert result["is_sql"] is True
 
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_hybrid_retriever")
+    @patch("agents.flow.sql_react.settings")
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_retrieves_missing_tables(
+        self, mock_get_model, mock_format, mock_settings, mock_retriever_cls
+    ):
+        """When LLM says tables are missing, should re-retrieve and retry."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_settings.rag.rerank_threshold = 0.3
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = [
+            Document(
+                page_content="t_user: id, username, real_name",
+                metadata={"rerank_score": 0.9, "table_name": "t_user"},
+            ),
+        ]
+        mock_retriever_cls.return_value = mock_retriever
+
+        # First call: needs more tables; second call: has enough
+        first_resp = MagicMock()
+        first_resp.tool_calls = [{
+            "args": {
+                "answer": "",
+                "is_sql": False,
+                "needs_more_tables": True,
+                "missing_tables": ["t_user"],
+            }
+        }]
+
+        second_resp = MagicMock()
+        second_resp.tool_calls = [{
+            "args": {
+                "answer": "SELECT d.name, u.real_name FROM t_department d JOIN t_user u ON d.manager = u.username;",
+                "is_sql": True,
+                "needs_more_tables": False,
+                "missing_tables": [],
+            }
+        }]
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(side_effect=[first_resp, second_resp])
+        mock_get_model.return_value = mock_model
+
+        docs = [
+            Document(
+                page_content="t_department: id, name, manager",
+                metadata={"rerank_score": 0.85, "table_name": "t_department"},
+            ),
+        ]
+        state = {"query": "每个部门的负责人姓名", "docs": docs}
+        result = await sql_generate(state)
+
+        # Should have made 2 LLM calls
+        assert mock_model.ainvoke.call_count == 2
+        # Second call should include t_user schema
+        second_call_args = mock_model.ainvoke.call_args_list[1][0][0]
+        system_msg = second_call_args[0].content
+        assert "t_user" in system_msg
+        assert "t_department" in system_msg
+        assert result["is_sql"] is True
+        assert "JOIN" in result["sql"]
+
 
 # ---------------------------------------------------------------------------
 # execute_sql node
