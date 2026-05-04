@@ -133,7 +133,7 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
         async for event in graph.astream_events(
             {"query": req.query, "session_id": req.session_id},
             version="v2",
-            **config,
+            config=config,
         ):
             if event["event"] == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]

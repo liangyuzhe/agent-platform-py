@@ -74,7 +74,7 @@ async def _stream_rag_chat(inp: dict, request: Request):
             async for event in graph.astream_events(
                 {"input": inp},
                 version="v2",
-                **config,
+                config=config,
             ):
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
