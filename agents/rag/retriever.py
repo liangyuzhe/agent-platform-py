@@ -16,6 +16,40 @@ from agents.rag.reranker import CrossEncoderReranker
 
 
 # ---------------------------------------------------------------------------
+# pymilvus compatibility patch
+# ---------------------------------------------------------------------------
+
+_milvus_patched = False
+
+
+def _patch_milvus_connections() -> None:
+    """Register MilvusClient connections in the global pymilvus registry.
+
+    langchain-milvus 0.3.x creates a MilvusClient internally, but pymilvus
+    2.6.x's MilvusClient no longer registers its connection in the global
+    ``pymilvus.connections`` registry.  ``Collection(alias=...)`` then fails
+    with *ConnectionNotExistException*.  This one-time patch wraps
+    ``MilvusClient.__init__`` to auto-register the handler.
+    """
+    global _milvus_patched
+    if _milvus_patched:
+        return
+
+    from pymilvus import MilvusClient, connections
+
+    _orig_init = MilvusClient.__init__
+
+    def _wrapped_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        alias = self._using
+        if not connections.has_connection(alias):
+            connections._alias_handlers[alias] = self._handler
+
+    MilvusClient.__init__ = _wrapped_init
+    _milvus_patched = True
+
+
+# ---------------------------------------------------------------------------
 # Embedding helper (shared with indexing)
 # ---------------------------------------------------------------------------
 
@@ -70,6 +104,12 @@ def build_milvus_retriever(
     uri = milvus_uri or f"http://{settings.milvus.addr}"
     coll = collection or settings.milvus.collection_name
     embeddings = _get_embeddings()
+
+    # Workaround: langchain-milvus 0.3.x + pymilvus 2.6.x has a bug where
+    # MilvusClient's internal connection is not registered in the global
+    # pymilvus connections registry, causing Collection() to fail.
+    # Monkey-patch MilvusClient to auto-register its handler on init.
+    _patch_milvus_connections()
 
     store = Milvus(
         embedding_function=embeddings,
