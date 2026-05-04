@@ -235,6 +235,37 @@ def _store_schema_docs(docs: list[Document]) -> dict:
     return {"chunk_count": len(docs)}
 
 
+async def generate_domain_summary(docs: list[Document]) -> str:
+    """Use LLM to generate a compact domain summary from all schema docs.
+
+    The summary is a short text describing what tables exist and their
+    purpose, used by the intent classifier instead of a hardcoded prompt.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from agents.model.chat_model import get_chat_model
+    from agents.tool.storage.domain_summary import save_domain_summary
+
+    schemas_text = "\n\n".join(d.page_content for d in docs)
+
+    model = get_chat_model(settings.chat_model_type)
+    response = await model.ainvoke([
+        SystemMessage(content=(
+            "你是一个数据库架构分析专家。请根据以下所有表结构信息，生成一段简洁的领域摘要。"
+            "摘要需要说明：\n"
+            "1. 这个数据库管理的是什么业务领域\n"
+            "2. 包含哪些核心实体（表）及它们的关系\n"
+            "3. 可以回答哪些类型的问题\n\n"
+            "要求：控制在 500 字以内，使用中文，语言简洁专业。"
+        )),
+        HumanMessage(content=f"以下是所有表结构：\n\n{schemas_text}"),
+    ])
+
+    summary = response.content.strip()
+    await save_domain_summary(summary)
+    logger.info("Domain summary generated (%d chars)", len(summary))
+    return summary
+
+
 async def index_mysql_schemas() -> dict:
     """Main entry point: fetch MySQL table schemas and index them.
 
@@ -256,6 +287,13 @@ async def index_mysql_schemas() -> dict:
 
         result = _store_schema_docs(docs)
         logger.info("MySQL schema indexing complete: %s", result)
+
+        # Generate domain summary from all schemas
+        try:
+            await generate_domain_summary(docs)
+        except Exception as e:
+            logger.warning("Domain summary generation failed: %s", e)
+
         return result
     except Exception as e:
         logger.warning("MySQL schema auto-indexing failed: %s", e)

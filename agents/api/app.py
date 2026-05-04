@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from agents.api.routers import chat, rag, final, document
+from agents.api.routers import chat, rag, final, document, admin
 from agents.config.settings import settings
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     # 初始化链路追踪
     init_tracing()
 
-    # 后台异步索引 MySQL 表结构（不阻塞服务启动）
+    # 后台异步：检查领域摘要，按需索引 MySQL 表结构（不阻塞服务启动）
     asyncio.create_task(_index_schemas_background(logger))
 
     yield
@@ -46,9 +46,24 @@ async def lifespan(app: FastAPI):
 
 
 async def _index_schemas_background(logger):
-    """后台任务：连接 MySQL 并将表结构向量化到 Milvus + ES。"""
+    """后台任务：连接 MySQL 并将表结构向量化到 Milvus + ES。
+
+    如果 domain_summary 表中已有摘要，跳过全量索引，直接加载摘要。
+    """
     try:
+        from agents.tool.storage.domain_summary import (
+            ensure_domain_summary_table,
+            get_domain_summary,
+        )
         from agents.rag.schema_indexer import index_mysql_schemas
+
+        await ensure_domain_summary_table()
+
+        existing = await get_domain_summary()
+        if existing:
+            logger.info("Domain summary found in cache/DB (%d chars), skipping schema re-index", len(existing))
+            return
+
         result = await index_mysql_schemas()
         logger.info("Schema auto-indexing done: %s", result)
     except Exception as e:
@@ -76,6 +91,7 @@ app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
 app.include_router(final.router, prefix="/api/final", tags=["final"])
 app.include_router(document.router, prefix="/api/document", tags=["document"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 
 @app.get("/health")

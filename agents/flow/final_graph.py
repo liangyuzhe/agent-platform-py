@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage
 from agents.flow.state import FinalGraphState
 from agents.model.chat_model import get_chat_model
 from agents.tool.storage.checkpoint import get_checkpointer
+from agents.tool.storage.domain_summary import get_domain_summary
 from agents.config.settings import settings
 
 
@@ -13,18 +14,16 @@ async def classify_intent(state: FinalGraphState) -> dict:
     """意图分类：SQL 还是 Chat？用小模型省成本。"""
     model = get_chat_model(settings.chat_model_type)
 
+    domain = await get_domain_summary()
+
     response = await model.ainvoke([
         HumanMessage(content=f"""请判断以下用户问题的意图类型，只回答 "SQL" 或 "Chat"。
 
-数据库中包含以下表：
-- t_user: 用户信息（username, real_name, email, phone, gender, status）
-- t_department: 部门信息（name, manager, parent_id, phone）
-- t_role: 角色信息（name, code, description）
-- t_user_role: 用户-角色关联
-- t_user_department: 用户-部门关联
+数据库领域摘要：
+{domain if domain else "（暂无领域摘要，请根据问题判断是否涉及数据库查询）"}
 
 判断规则：
-- SQL：涉及查询数据库中存储的信息，包括但不限于：用户信息、部门结构、角色权限、人员统计、关联关系等。例如："zhangsan是谁"、"有哪些部门"、"技术部有多少人"、"谁是管理员"
+- SQL：涉及查询数据库中存储的信息，例如用户信息、部门结构、角色权限、人员统计、关联关系等
 - Chat：与数据库无关的对话，如：天气、闲聊、通用知识问答
 
 用户问题: {state['query']}

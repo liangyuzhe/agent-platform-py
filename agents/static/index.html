@@ -98,6 +98,7 @@
             <button class="active" onclick="switchTab('chat')">Chat</button>
             <button onclick="switchTab('agent')">SQL Agent</button>
             <button onclick="switchTab('upload')">Upload Document</button>
+            <button onclick="switchTab('admin')">Admin</button>
         </div>
 
         <!-- Chat Tab -->
@@ -144,12 +145,24 @@
                 <div class="upload-result" id="uploadResult"></div>
             </div>
         </div>
+
+        <!-- Admin Tab -->
+        <div id="tab-admin" class="tab-content">
+            <div class="upload-box">
+                <h3 style="margin-bottom:16px; color:#333;">Schema 管理</h3>
+                <p style="font-size:14px; color:#666; margin-bottom:16px;">
+                    全量刷新数据库表结构索引并重新生成领域摘要。通常在数据库表结构变更后使用。
+                </p>
+                <button class="upload-btn" id="refreshBtn" onclick="refreshSchemas()">刷新 Schema</button>
+                <div class="upload-result" id="refreshResult"></div>
+            </div>
+        </div>
     </div>
 
     <script>
         // --- Tab switching ---
         function switchTab(name) {
-            const tabs = ['chat', 'agent', 'upload'];
+            const tabs = ['chat', 'agent', 'upload', 'admin'];
             document.querySelectorAll('.tabs button').forEach((b, i) => {
                 b.classList.toggle('active', tabs[i] === name);
             });
@@ -332,6 +345,33 @@
                 uploadBtn.disabled = false;
                 uploadResult.className = 'upload-result';
             }
+        }
+
+        // --- Admin ---
+        async function refreshSchemas() {
+            const btn = document.getElementById('refreshBtn');
+            const result = document.getElementById('refreshResult');
+            btn.disabled = true;
+            btn.textContent = '刷新中...';
+            result.className = 'upload-result';
+
+            try {
+                const resp = await fetch('/api/admin/refresh-schemas', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    result.className = 'upload-result success';
+                    result.textContent = data.message;
+                } else {
+                    result.className = 'upload-result error';
+                    result.textContent = data.message;
+                }
+            } catch (e) {
+                result.className = 'upload-result error';
+                result.textContent = '刷新失败: ' + e.message;
+            }
+
+            btn.textContent = '刷新 Schema';
+            btn.disabled = false;
         }
 
         async function uploadFile() {
