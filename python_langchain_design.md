@@ -117,6 +117,7 @@ agents/
 │   └── query_rewrite.py        # 查询重写
 │
 ├── tool/                       # 工具层
+│   ├── registry.py             # 统一 Tool Registry（按分类注册 @tool）
 │   ├── memory/                 # 三级记忆系统
 │   │   ├── session.py          # Session 数据模型
 │   │   ├── store.py            # Session 存储
@@ -124,13 +125,17 @@ agents/
 │   │   └── knowledge.py        # 知识记忆提取
 │   ├── storage/                # 存储层
 │   │   ├── redis_client.py     # Redis 连接
-│   │   └── checkpoint.py       # LangGraph Checkpointer
+│   │   ├── checkpoint.py       # LangGraph Checkpointer
+│   │   ├── domain_summary.py   # 领域摘要持久化（MySQL + Redis）
+│   │   └── retrieval_cache.py  # 检索结果缓存
 │   ├── document/               # 文档处理
 │   │   ├── loader.py           # 文件加载器
 │   │   ├── parser.py           # 文档解析
 │   │   └── splitter.py         # 文本分块
 │   ├── sql_tools/              # SQL 工具
 │   │   ├── mcp_client.py       # MCP 客户端
+│   │   ├── execute_tool.py     # @tool: execute_query
+│   │   ├── schema_tool.py      # @tool: list_tables, describe_table
 │   │   └── safety.py           # SQL 安全分析
 │   ├── analyst_tools/          # 数据分析
 │   │   ├── parser.py           # SQL 结果解析
@@ -220,10 +225,28 @@ graph.add_edge("construct_messages", "chat")
 graph.add_edge("chat", END)
 ```
 
-### 5.2 SQL React 图（Human-in-the-Loop）
+### 5.2 SQL React 图（ReAct 自纠错 + Human-in-the-Loop）
+
+SQL React 支持自动纠错重试：执行失败时 LLM 分析错误并重新生成 SQL，最多重试 3 次。
 
 ```python
-# LangGraph interrupt 机制
+# 流程：retrieve → check_docs → generate → safety → approve → execute
+#                                                  ↑               |
+#                                                  |  ← error_analysis ← FAIL
+#                                                  |       retry (max 3)
+#                                                  ↓
+#                                                 END (success)
+
+# State 新增字段
+class SQLReactState(TypedDict):
+    error: str | None          # SQL 执行错误信息
+    retry_count: int           # 重试次数
+    execution_history: list    # [{sql, result, error}]
+```
+
+人工审批使用 LangGraph interrupt 机制：
+
+```python
 user_decision = interrupt({
     "sql": "SELECT * FROM orders",
     "message": "请审批此 SQL",
@@ -235,23 +258,31 @@ else:
     return Command(goto="sql_generate", update={"refine_feedback": user_decision})
 ```
 
-### 5.3 主调度图
+### 5.3 主调度图（多场景意图路由）
 
-根据意图自动路由到 RAG Chat 或 SQL React：
+支持 7 种意图自动路由：
+
+| 意图 | 路由目标 | 说明 |
+|------|---------|------|
+| `sql_query` | SQL React | 数据库查询 |
+| `anomaly_detect` | Chat (暂代) | 异常归因 |
+| `reconciliation` | Chat (暂代) | 资金核对 |
+| `report` | Chat (暂代) | 报告生成 |
+| `audit` | Chat (暂代) | 审计追踪 |
+| `knowledge` | RAG Chat | 知识库问答 |
+| `chat` | RAG Chat | 闲聊 |
 
 ```python
 graph = StateGraph(FinalGraphState)
-graph.add_node("intent_detect", detect_intent)
-graph.add_node("rag_chat", rag_chat_subgraph)
-graph.add_node("sql_react", sql_react_subgraph)
+graph.add_node("classify_intent", classify_intent)
+graph.add_node("sql_react", sql_react)
+graph.add_node("chat_direct", chat_direct)
 
-# 条件路由
-graph.add_conditional_edges(
-    "intent_detect",
-    lambda state: "sql" if state["intent"] == "SQL" else "chat",
-    {"sql": "sql_react", "chat": "rag_chat"},
-)
+graph.add_conditional_edges("classify_intent", route_intent)
+# route_intent 根据 intent 字段分发到对应子图
 ```
+
+意图分类使用 LLM + 动态领域摘要（从 MySQL/Redis 加载，非硬编码）。
 
 ---
 
@@ -345,7 +376,31 @@ vector = embeddings.embed_query("Hello World")
 
 ## 9. 工具层设计
 
-### 9.1 SQL 安全分析
+### 9.1 统一 Tool Registry
+
+所有 LLM 可调用的工具通过 `ToolRegistry` 统一注册和管理，按分类组织：
+
+```python
+from agents.tool.registry import register, get_tools
+
+# 注册工具到分类
+@register("sql")
+@tool
+def execute_query(sql: str) -> str:
+    """Execute a SQL query."""
+    ...
+
+# 按分类获取工具
+sql_tools = get_tools("sql")        # [execute_query, list_tables, describe_table]
+all_tools = get_tools()              # 所有已注册工具
+```
+
+工具分类：
+- `sql`: execute_query, list_tables, describe_table
+- `finance`（扩展）: get_balance, get_exchange_rate, get_kyc_info
+- `knowledge`（扩展）: search_regulations, search_accounting_standards
+
+### 9.2 SQL 安全分析
 
 ```python
 checker = SQLSafetyChecker()
@@ -412,8 +467,10 @@ async def chat_stream(req: ChatRequest, request: Request):
 | `/api/chat/test/stream` | POST | Chat 流式测试 |
 | `/api/rag/ask` | POST | RAG 问答 |
 | `/api/rag/chat/stream` | POST | RAG 流式对话 |
-| `/api/rag/insert` | POST | 文档上传索引 |
-| `/api/final/invoke` | POST | 主调度（意图路由） |
+| `/api/document/insert` | POST | 文档上传索引 |
+| `/api/final/invoke` | POST | 主调度（多场景意图路由） |
+| `/api/final/approve` | POST | 审批恢复（SQL/工单） |
+| `/api/admin/refresh-schemas` | POST | 全量刷新 Schema + 领域摘要 |
 | `/health` | GET | 健康检查 |
 
 ---
@@ -455,6 +512,43 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+---
+
+## 12. 财务 Copilot 演进路线
+
+### 12.1 目标场景
+
+| 场景 | 意图 | 子图 | 状态 |
+|------|------|------|------|
+| SQL 自动生成与纠错 | `sql_query` | SQL React (ReAct) | ✅ 已实现 |
+| 财务异常波动归因 | `anomaly_detect` | Anomaly Graph | Phase 2 |
+| 多表资金明细核对 | `reconciliation` | Reconciliation Graph | Phase 2 |
+| 自动生成日报/周报/月报 | `report` | Report Graph | Phase 2 |
+| 审计问答与凭证追踪 | `audit` | Audit Graph | Phase 2 |
+| 财务制度/会计准则查询 | `knowledge` | RAG Chat | Phase 2 |
+| 跨系统自动执行 | `agent_task` | Agent Graph | Phase 3 |
+
+### 12.2 Phase 1 已完成
+
+1. **统一 Tool Registry** — `agents/tool/registry.py`，工具按分类注册，LLM 动态选择
+2. **SQL ReAct 自纠错** — 执行失败时 LLM 分析错误并重试（最多 3 次）
+3. **多场景意图路由** — 7 种意图分类，Phase 2 逐步替换为专用子图
+
+### 12.3 Phase 2 计划
+
+- 异常归因子图：检测 → 上下文查询 → 原因分析 → 报告
+- 资金核对子图：多源拉取 → 逐条比对 → 差异解释 → 报告
+- 报告生成子图：指标聚合 → 趋势分析 → LLM 生成 → 图表
+- 审计追踪子图：目标识别 → 凭证链查询 → 摘要
+
+### 12.4 Phase 3 计划
+
+- 链上余额查询（Moralis/Alchemy/TronGrid）
+- KYC/用户标签拉取
+- USDT/USD 汇率换算
+- 结算单自动生成
+- 异常工单自动发起
 
 ---
 

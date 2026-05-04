@@ -5,7 +5,9 @@
 ## 核心特性
 
 - **RAG 对话**：文档索引 + 混合检索（向量 + BM25）+ RRF 融合 + Cross-Encoder 重排序
-- **SQL 生成与执行**：自然语言 → SQL → 人工审批 → MCP 执行，含 SQL 安全分析
+- **SQL 生成与执行**：自然语言 → SQL → 人工审批 → MCP 执行，含 SQL 安全分析 + **自动纠错重试**
+- **多场景意图路由**：7 种意图自动分类（SQL 查询/异常归因/资金核对/报告/审计/知识库/闲聊）
+- **统一 Tool Registry**：工具按分类注册，LLM 动态发现和调用
 - **数据分析**：SQL 结果 → 统计分析 → 图表生成（ECharts）+ 文字报告
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
 - **SFT 数据管线**：自动采集训练数据 + 教师模型标注 + JSONL 导出
@@ -77,6 +79,7 @@ agent-platform-py/
 │   │   └── query_rewrite.py        # 查询重写（指代消解）
 │   │
 │   ├── tool/                       # 工具层
+│   │   ├── registry.py             # 统一 Tool Registry
 │   │   ├── memory/                 # 三级记忆系统
 │   │   │   ├── session.py          # Session 数据模型
 │   │   │   ├── store.py            # Session 存储（Redis + 内存）
@@ -85,6 +88,7 @@ agent-platform-py/
 │   │   ├── storage/                # 存储层
 │   │   │   ├── redis_client.py     # Redis 连接
 │   │   │   ├── checkpoint.py       # LangGraph Checkpointer
+│   │   │   ├── domain_summary.py   # 领域摘要持久化
 │   │   │   └── retrieval_cache.py  # 检索结果缓存
 │   │   ├── document/               # 文档处理
 │   │   │   ├── loader.py           # 文件加载器
@@ -93,6 +97,8 @@ agent-platform-py/
 │   │   ├── sql_tools/              # SQL 工具
 │   │   │   ├── mcp_client.py       # MCP 客户端
 │   │   │   ├── executor.py         # SQL 执行器
+│   │   │   ├── execute_tool.py     # @tool: execute_query
+│   │   │   ├── schema_tool.py      # @tool: list_tables, describe_table
 │   │   │   └── safety.py           # SQL 安全分析
 │   │   ├── analyst_tools/          # 数据分析
 │   │   │   ├── parser.py           # SQL 结果解析
@@ -195,8 +201,9 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 | 页面 | 路径 | 说明 |
 |------|------|------|
 | Chat UI | http://localhost:8080/ | RAG 对话（Tab 1） |
-| SQL Agent | http://localhost:8080/ | 意图自动路由：SQL 查询 / 普通对话（Tab 2） |
+| SQL Agent | http://localhost:8080/ | 多场景意图路由（Tab 2） |
 | 文档上传 | http://localhost:8080/ | 上传文档并索引到 RAG（Tab 3） |
+| Admin | http://localhost:8080/ | Schema 刷新、缓存管理（Tab 4） |
 | API 文档 | http://localhost:8080/docs | Swagger UI |
 | 健康检查 | http://localhost:8080/health | 服务状态 |
 
@@ -326,7 +333,29 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 
 检测模式：DROP TABLE、DELETE without WHERE、TRUNCATE、UPDATE with always-true WHERE 等。
 
-### 5. Human-in-the-Loop 审批
+### 5. SQL ReAct 自纠错
+
+SQL 执行失败时，LLM 自动分析错误并重新生成 SQL，最多重试 3 次：
+
+```
+generate_sql → execute_sql → FAIL → error_analysis → generate_sql (retry)
+                                     ↑                          |
+                                     └──────────────────────────┘
+```
+
+### 6. 多场景意图路由
+
+支持 7 种意图自动分类，路由到对应子图：
+
+```
+用户问题 → classify_intent → sql_query    → SQL React
+                           → anomaly_detect → (Phase 2)
+                           → report        → (Phase 2)
+                           → knowledge     → RAG Chat
+                           → chat          → RAG Chat
+```
+
+### 7. Human-in-the-Loop 审批
 
 ```python
 # LangGraph interrupt 机制

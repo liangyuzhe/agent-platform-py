@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.documents import Document
+from langchain_core.tools import tool
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +298,27 @@ class TestExecuteSql:
 
         mock_mcp_execute.side_effect = Exception("Table not found")
 
-        result = await exec_node({"sql": "SELECT * FROM nonexistent"})
+        result = await exec_node({"sql": "SELECT * FROM nonexistent", "execution_history": []})
 
         assert "失败" in result["result"]
         assert "Table not found" in result["result"]
+        assert result["error"] == "Table not found"
+        assert len(result["execution_history"]) == 1
+        assert result["execution_history"][0]["error"] == "Table not found"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_execute_success_clears_error(self, mock_mcp_execute):
+        """Successful execution should set error=None."""
+        from agents.flow.sql_react import execute_sql as exec_node
+
+        mock_mcp_execute.return_value = '[{"id": 1}]'
+
+        result = await exec_node({"sql": "SELECT 1", "execution_history": []})
+
+        assert result["error"] is None
+        assert len(result["execution_history"]) == 1
+        assert result["execution_history"][0]["error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +344,7 @@ class TestBuildSqlReactGraph:
         assert "safety_check" in node_names
         assert "approve" in node_names
         assert "execute_sql" in node_names
+        assert "error_analysis" in node_names
 
     @patch("agents.flow.sql_react.get_checkpointer")
     def test_graph_compiles(self, mock_cp):
@@ -377,3 +396,127 @@ class TestRouting:
         mock_cp.return_value = MemorySaver()
         graph = build_sql_react_graph()
         assert graph is not None
+
+
+# ---------------------------------------------------------------------------
+# error_analysis node
+# ---------------------------------------------------------------------------
+
+class TestErrorAnalysis:
+    """Test error_analysis node."""
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_error_analysis_generates_feedback(self, mock_get_model):
+        """error_analysis should generate refine_feedback and increment retry_count."""
+        from agents.flow.sql_react import error_analysis
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="表名应为 t_user 而不是 users"))
+        mock_get_model.return_value = mock_model
+
+        state = {
+            "query": "查询用户",
+            "sql": "SELECT * FROM users",
+            "error": "Table 'go_agent_audit.users' doesn't exist",
+            "docs": [_mock_doc()],
+            "retry_count": 0,
+        }
+        result = await error_analysis(state)
+
+        assert "t_user" in result["refine_feedback"]
+        assert result["retry_count"] == 1
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_error_analysis_increments_count(self, mock_get_model):
+        """retry_count should increment from any starting value."""
+        from agents.flow.sql_react import error_analysis
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="修正建议"))
+        mock_get_model.return_value = mock_model
+
+        state = {
+            "query": "查询",
+            "sql": "SELECT 1",
+            "error": "syntax error",
+            "docs": [],
+            "retry_count": 2,
+        }
+        result = await error_analysis(state)
+
+        assert result["retry_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Tool Registry
+# ---------------------------------------------------------------------------
+
+class TestToolRegistry:
+    """Test the tool registry system."""
+
+    def test_register_and_get_tools(self):
+        """Registered tools should be retrievable by category."""
+        from agents.tool.registry import register, get_tools, clear
+
+        clear()
+        try:
+            @register("test_cat")
+            @tool
+            def my_test_tool(x: str) -> str:
+                """A test tool."""
+                return x
+
+            tools = get_tools("test_cat")
+            assert len(tools) == 1
+            assert tools[0].name == "my_test_tool"
+        finally:
+            clear()
+
+    def test_get_tools_empty_category(self):
+        """Getting tools for a non-existent category should return empty list."""
+        from agents.tool.registry import get_tools
+
+        result = get_tools("nonexistent_category_xyz")
+        assert result == []
+
+    def test_get_all_tools(self):
+        """Getting tools with no categories should return all."""
+        from agents.tool.registry import register, get_tools, clear
+
+        clear()
+        try:
+            @register("cat_a")
+            @tool
+            def tool_a(x: str) -> str:
+                """Tool A."""
+                return x
+
+            @register("cat_b")
+            @tool
+            def tool_b(x: str) -> str:
+                """Tool B."""
+                return x
+
+            all_tools = get_tools()
+            assert len(all_tools) >= 2
+        finally:
+            clear()
+
+    def test_sql_tools_registered(self):
+        """SQL tools should be registered when sql_tools package is imported."""
+        from agents.tool.registry import get_tools, register_tool
+        from agents.tool.sql_tools.execute_tool import execute_query
+        from agents.tool.sql_tools.schema_tool import list_tables, describe_table
+
+        # Re-register since clear() in earlier tests may have removed them
+        register_tool("sql", execute_query)
+        register_tool("sql", list_tables)
+        register_tool("sql", describe_table)
+
+        sql_tools = get_tools("sql")
+        tool_names = [t.name for t in sql_tools]
+        assert "execute_query" in tool_names
+        assert "list_tables" in tool_names
+        assert "describe_table" in tool_names

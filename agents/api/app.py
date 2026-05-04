@@ -32,6 +32,9 @@ async def lifespan(app: FastAPI):
     init_chat_models()
     init_embedding_models()
 
+    # 注册工具（import 触发 @register）
+    import agents.tool.sql_tools  # noqa: F401
+
     # 初始化链路追踪
     init_tracing()
 

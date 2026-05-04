@@ -27,9 +27,12 @@ class SQLReactState(TypedDict):
     is_sql: bool                                 # 是否为 SQL 输出
     answer: str                                  # 非 SQL 回答
     approved: bool                               # 是否已审批
-    refine_feedback: str                         # 修改意见
+    refine_feedback: str                         # 修改意见（用户拒绝或错误分析生成）
     result: str                                  # SQL 执行结果
     safety_report: dict | None                   # 安全分析报告
+    error: str | None                            # SQL 执行错误信息
+    retry_count: int                             # 重试次数
+    execution_history: list[dict]                # 执行历史 [{sql, result, error}]
 
 
 class AnalystState(TypedDict):
@@ -46,7 +49,7 @@ class FinalGraphState(TypedDict):
     """主调度图的状态。"""
     query: str
     session_id: str
-    intent: str                                  # "SQL" or "Chat"
+    intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat
     sql: str
     result: str
     answer: str
