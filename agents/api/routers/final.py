@@ -1,5 +1,6 @@
 """Final Graph 端点：支持中断/恢复的主调度。"""
 
+import logging
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from typing import AsyncGenerator
@@ -9,6 +10,8 @@ from langgraph.types import Command
 from agents.flow.final_graph import build_final_graph
 from agents.api.sse import sse_response
 from agents.tool.trace.tracing import get_trace_callbacks
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -133,27 +136,31 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
         # Skip LLM output from intermediate nodes (e.g. classify_intent)
         in_intermediate_node = False
 
-        async for event in graph.astream_events(
-            {"query": req.query, "session_id": req.session_id},
-            version="v2",
-            config=config,
-        ):
-            evt_type = event["event"]
-            evt_name = event.get("name", "")
+        try:
+            async for event in graph.astream_events(
+                {"query": req.query, "session_id": req.session_id},
+                version="v2",
+                config=config,
+            ):
+                evt_type = event["event"]
+                evt_name = event.get("name", "")
 
-            # Track intermediate graph nodes to filter their LLM output
-            if evt_type == "on_chain_start" and evt_name == "classify_intent":
-                in_intermediate_node = True
-            elif evt_type == "on_chain_end" and evt_name == "classify_intent":
-                in_intermediate_node = False
+                # Track intermediate graph nodes to filter their LLM output
+                if evt_type == "on_chain_start" and evt_name == "classify_intent":
+                    in_intermediate_node = True
+                elif evt_type == "on_chain_end" and evt_name == "classify_intent":
+                    in_intermediate_node = False
 
-            # Only emit LLM chunks from final nodes (sql_react / chat_direct)
-            if evt_type == "on_chat_model_stream" and not in_intermediate_node:
-                chunk = event["data"]["chunk"]
-                if chunk.content:
-                    yield {"event": "data", "data": chunk.content}
-            elif evt_type == "on_chain_end" and evt_name == "LangGraph":
-                final_result = event["data"].get("output")
+                # Only emit LLM chunks from final nodes (sql_react / chat_direct)
+                if evt_type == "on_chat_model_stream" and not in_intermediate_node:
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "data", "data": chunk.content}
+                elif evt_type == "on_chain_end" and evt_name == "LangGraph":
+                    final_result = event["data"].get("output")
+        except Exception as e:
+            logger.exception("Final graph stream error")
+            yield {"event": "error", "data": str(e)}
 
         # Check if graph paused for SQL approval (interrupt)
         if final_result:

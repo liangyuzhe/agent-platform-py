@@ -214,17 +214,17 @@
                         const lines = buffer.split('\n');
                         buffer = lines.pop();
                         for (const line of lines) {
-                            if (line.startsWith('data: ')) {
+                            if (line.startsWith('event: ')) {
+                                var ragEvent = line.slice(7).trim();
+                            } else if (line.startsWith('data: ')) {
                                 const data = line.slice(6).trim();
-                                if (data === '[DONE]') continue;
-                                try {
-                                    const parsed = JSON.parse(data);
-                                    if (parsed.event === 'message') {
-                                        fullText += parsed.data;
-                                        bubble.textContent = fullText;
-                                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                                    }
-                                } catch {}
+                                if (ragEvent === 'message') {
+                                    fullText += data;
+                                    bubble.textContent = fullText;
+                                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                                } else if (ragEvent === 'error') {
+                                    bubble.textContent = '服务端错误: ' + data;
+                                }
                             }
                         }
                     }
@@ -290,6 +290,8 @@
                                     sqlMessages.scrollTop = sqlMessages.scrollHeight;
                                 } else if (currentEvent === 'approval') {
                                     try { approvalData = JSON.parse(data); } catch {}
+                                } else if (currentEvent === 'error') {
+                                    bubble.textContent = '服务端错误: ' + data;
                                 }
                             }
                         }
