@@ -78,7 +78,15 @@ async def sql_generate(state: SQLReactState) -> dict:
     model = get_chat_model(settings.chat_model_type)
     model_with_tools = model.bind_tools([create_format_tool()])
 
-    docs_text = "\n".join([d.page_content for d in state.get("docs", [])])
+    # Filter by rerank threshold then keep top-3 to reduce token count
+    threshold = settings.rag.rerank_threshold
+    all_docs = state.get("docs", [])
+    scored_docs = [d for d in all_docs if d.metadata.get("rerank_score", 0) >= threshold]
+    docs = sorted(scored_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:3]
+    # If threshold filtered everything, fall back to top-3 unfiltered
+    if not docs:
+        docs = sorted(all_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:3]
+    docs_text = "\n".join([d.page_content for d in docs])
 
     # 如果有修改意见，加入上下文
     refine_context = ""

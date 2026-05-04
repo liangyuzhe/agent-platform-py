@@ -269,6 +269,86 @@ class TestSqlGenerate:
         system_msg = call_args[0].content
         assert "只查询ID字段" in system_msg
 
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.settings")
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_limits_docs_to_top3(self, mock_get_model, mock_format, mock_settings):
+        """sql_generate should only pass top-3 docs by rerank_score to LLM."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_settings.rag.rerank_threshold = 0.3
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response("SELECT 1;", True))
+        mock_get_model.return_value = mock_model
+
+        # 5 docs with different rerank scores
+        docs = [
+            Document(page_content="t_user schema", metadata={"rerank_score": 0.9, "table_name": "t_user"}),
+            Document(page_content="t_department schema", metadata={"rerank_score": 0.8, "table_name": "t_department"}),
+            Document(page_content="t_role schema", metadata={"rerank_score": 0.7, "table_name": "t_role"}),
+            Document(page_content="t_user_department schema", metadata={"rerank_score": 0.2, "table_name": "t_user_department"}),
+            Document(page_content="t_log schema", metadata={"rerank_score": 0.1, "table_name": "t_log"}),
+        ]
+
+        state = {"query": "查询用户", "docs": docs}
+        await sql_generate(state)
+
+        # System message should contain top-3 docs (above threshold 0.3)
+        call_args = mock_model.ainvoke.call_args[0][0]
+        system_msg = call_args[0].content
+        assert "t_user schema" in system_msg
+        assert "t_department schema" in system_msg
+        assert "t_role schema" in system_msg
+        assert "t_user_department schema" not in system_msg
+        assert "t_log schema" not in system_msg
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.settings")
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_join_scenario_keeps_both_tables(self, mock_get_model, mock_format, mock_settings):
+        """JOIN scenario: both related tables should be kept if scores are high enough."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_settings.rag.rerank_threshold = 0.3
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response(
+            "SELECT d.name, u.real_name FROM t_department d JOIN t_user u ON d.manager = u.username;", True
+        ))
+        mock_get_model.return_value = mock_model
+
+        # JOIN query: t_department and t_user both relevant, t_role irrelevant
+        docs = [
+            Document(
+                page_content="t_department: id, name, parent_id, manager, phone, status, created_at",
+                metadata={"rerank_score": 0.85, "table_name": "t_department"},
+            ),
+            Document(
+                page_content="t_user: id, username, password, real_name, gender, email, phone, register_time, status",
+                metadata={"rerank_score": 0.80, "table_name": "t_user"},
+            ),
+            Document(
+                page_content="t_role: id, name, code, description, status, created_at",
+                metadata={"rerank_score": 0.15, "table_name": "t_role"},
+            ),
+        ]
+
+        state = {"query": "每个部门的负责人姓名", "docs": docs}
+        result = await sql_generate(state)
+
+        # Both JOIN tables should be in the prompt (above threshold)
+        call_args = mock_model.ainvoke.call_args[0][0]
+        system_msg = call_args[0].content
+        assert "t_department" in system_msg
+        assert "t_user" in system_msg
+        assert "t_role" not in system_msg
+        assert result["is_sql"] is True
+
 
 # ---------------------------------------------------------------------------
 # execute_sql node
