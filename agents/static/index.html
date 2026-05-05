@@ -236,6 +236,7 @@
                         for (const part of parts) {
                             if (!part.trim()) continue;
                             const ev = parseSSEBlock(part);
+                            console.log('[send parsed]', ev.event, JSON.stringify(ev.data), 'part:', JSON.stringify(part));
                             if (ev.event !== 'done' && ev.data) fullContent += ev.data;
                         }
                         if (fullContent) bubble.textContent = fullContent;
