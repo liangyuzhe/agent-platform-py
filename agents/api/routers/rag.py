@@ -46,7 +46,28 @@ async def rag_ask(req: RAGChatRequest):
 @router.post("/chat/stream")
 async def rag_chat_stream(req: RAGChatRequest, request: Request):
     """SSE 流式 RAG 对话 (POST)。"""
-    return await _stream_rag_chat(_build_input(req), request)
+    graph = build_rag_chat_graph()
+    callbacks = get_trace_callbacks()
+    config = {"callbacks": callbacks} if callbacks else {}
+
+    async def generate():
+        try:
+            async for event in graph.astream_events(
+                {"input": _build_input(req)},
+                version="v2",
+                config=config,
+            ):
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "message", "data": chunk.content}
+        except Exception as e:
+            logger.exception("RAG chat stream error")
+            yield {"event": "error", "data": str(e)}
+        finally:
+            yield {"event": "done", "data": "[DONE]"}
+
+    return await sse_response(generate(), request)
 
 
 @router.get("/chat/stream")
