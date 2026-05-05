@@ -153,9 +153,11 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
                     in_intermediate_node = False
                     logger.info("Stream: leaving classify_intent")
 
+                # Log all events for debugging
+                if evt_type not in ("on_llm_start", "on_llm_end"):
+                    logger.info("Stream evt: %s name=%s", evt_type, evt_name)
+
                 # Only emit LLM chunks from final nodes (sql_react / chat_direct)
-                if evt_type == "on_chat_model_stream":
-                    logger.info("Stream: LLM chunk, intermediate=%s, content=%r", in_intermediate_node, event["data"]["chunk"].content[:20] if event["data"]["chunk"].content else "")
                 if evt_type == "on_chat_model_stream" and not in_intermediate_node:
                     chunk = event["data"]["chunk"]
                     if chunk.content:
