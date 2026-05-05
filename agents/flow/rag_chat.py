@@ -106,7 +106,13 @@ async def construct_messages(state: RAGChatState) -> dict:
     fitted = counter.fit_to_budget(parts, budget)
     context = "\n\n".join(fitted)
 
-    messages = [HumanMessage(content=context)]
+    system = SystemMessage(content=(
+        "你是一个智能助手。根据参考知识回答用户问题。"
+        "只使用与问题相关的信息，忽略无关内容。"
+        "直接回答问题，不要复述参考知识原文。"
+        "如果参考知识中没有相关信息，根据你的知识回答。"
+    ))
+    messages = [system, HumanMessage(content=context)]
     return {"messages": messages}
 
 

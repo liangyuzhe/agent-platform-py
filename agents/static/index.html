@@ -175,28 +175,17 @@
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
-            let chunkIdx = 0;
             while (true) {
                 const {done, value} = await reader.read();
                 if (done) break;
-                chunkIdx++;
                 buffer += decoder.decode(value, {stream: true});
-                console.log('[SSE chunk #' + chunkIdx + ']', JSON.stringify(buffer));
                 let parts = buffer.split('\n\n');
                 buffer = parts.pop();
                 for (const part of parts) {
-                    if (part.trim()) {
-                        const parsed = parseSSEBlock(part);
-                        console.log('[SSE event]', parsed.event, JSON.stringify(parsed.data));
-                        onEvent(parsed);
-                    }
+                    if (part.trim()) onEvent(parseSSEBlock(part));
                 }
             }
-            if (buffer.trim()) {
-                const parsed = parseSSEBlock(buffer);
-                console.log('[SSE remaining]', parsed.event, JSON.stringify(parsed.data));
-                onEvent(parsed);
-            }
+            if (buffer.trim()) onEvent(parseSSEBlock(buffer));
         }
 
         // --- Tab switching ---
