@@ -986,3 +986,493 @@ python -m agents.main
 | LLM 怎么调用的 | `agents/model/chat_model.py` |
 | 前端怎么展示的 | `agents/static/index.html` |
 | 测试怎么写的 | `tests/test_rag_flow.py` |
+
+---
+
+## 9. Agent 设计常见问题与解决方案
+
+### 9.1 Checkpoint 设计：怎么让对话"暂停-恢复"？
+
+**场景**：AI 生成了一条 SQL，但执行前需要人工确认。用户点了"确认"后，系统要从上次暂停的地方继续执行。
+
+**LangGraph 的解决方案**：`interrupt()` + `Command(resume=...)`
+
+```python
+# agents/flow/sql_react.py — approve 节点
+async def approve(state: SQLReactState) -> dict:
+    # 暂停执行，把控制权交还给用户
+    user_decision = interrupt({
+        "sql": state["sql"],
+        "message": "请确认是否执行此 SQL",
+    })
+    # 用户回复后，从这里继续
+    if user_decision["approved"]:
+        return {"approved": True}
+    else:
+        return {"approved": False, "refine_feedback": user_decision["feedback"]}
+```
+
+```
+时间线:
+  T1: 用户发请求 → 执行到 approve → interrupt() → 暂停
+  T2: 用户看到 SQL，思考中...
+  T3: 用户点"确认" → Command(resume={approved: true}) → 从暂停处继续
+  T4: 执行 SQL → 返回结果
+```
+
+**Checkpoint 怎么存状态？**
+
+暂停时，LangGraph 把当前 State 序列化存起来。恢复时，反序列化 State，继续执行。
+
+```python
+# agents/tool/storage/checkpoint.py
+from langgraph.checkpoint.memory import MemorySaver
+
+def get_checkpointer():
+    # 内存版 — 进程重启后丢失
+    return MemorySaver()
+
+def get_redis_checkpointer():
+    # Redis 版 — 持久化，进程重启后仍可恢复
+    from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+    return AsyncRedisSaver(redis_client=redis_client)
+```
+
+**两种 Checkpointer 对比**：
+
+| | MemorySaver | AsyncRedisSaver |
+|---|---|---|
+| 存储位置 | Python 进程内存 | Redis (RedisJSON) |
+| 进程重启后 | 状态丢失 | 状态保留 |
+| 适用场景 | 开发/测试 | 生产环境 |
+| 依赖 | 无 | redis-stack-server |
+
+### 9.2 用户数据隔离：怎么保证用户 A 看不到用户 B 的数据？
+
+**问题**：多个用户同时使用系统，每个人有自己的对话历史和中断状态。怎么隔离？
+
+**解决方案**：用 `session_id` 作为命名空间。
+
+```python
+# agents/api/routers/final.py
+def _make_config(session_id: str) -> dict:
+    return {
+        "configurable": {"thread_id": session_id},  # session_id → thread_id
+    }
+
+# 用户 A 的请求
+config_a = _make_config("user_alice")
+result = await graph.ainvoke({...}, config=config_a)  # 状态存在 "user_alice" 命名空间下
+
+# 用户 B 的请求
+config_b = _make_config("user_bob")
+result = await graph.ainvoke({...}, config=config_b)  # 状态存在 "user_bob" 命名空间下
+```
+
+**两层隔离**：
+
+```
+┌─────────────────────────────────────────┐
+│  Layer 1: LangGraph Checkpoint          │
+│  thread_id = session_id                 │
+│  每个用户的 interrupt/resume 状态独立     │
+│  key: (thread_id, checkpoint_ns, ...)   │
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│  Layer 2: Session Memory (Redis)        │
+│  key = "session:memory:{session_id}"    │
+│  每个用户的对话历史、摘要独立              │
+│  TTL = 24 小时自动过期                    │
+└─────────────────────────────────────────┘
+```
+
+**类比**：Checkpoint 像银行的保险柜，每个客户有自己的柜子（thread_id）。Session Memory 像银行的客户档案，每个客户有自己的档案袋（session_id）。
+
+### 9.3 状态序列化：怎么保证数据不丢？
+
+**问题**：Python 对象（如 `Document`、`BaseMessage`）不能直接存到 Redis。需要序列化成 JSON。
+
+**项目中的两种序列化方式**：
+
+**方式 1：LangGraph 内部处理**（Checkpoint 层）
+
+LangGraph 的 State 定义为 `TypedDict`，LangGraph 内部自动处理序列化。你不需要手动序列化：
+
+```python
+class SQLReactState(TypedDict):
+    query: str
+    docs: list[Document]     # LangGraph 自动处理 Document 的序列化
+    messages: Annotated[list[BaseMessage], add_messages]  # 自动处理
+```
+
+**方式 2：Pydantic 手动序列化**（Session Memory 层）
+
+Session 记忆用 Pydantic 模型，需要手动调用序列化方法：
+
+```python
+# agents/tool/memory/store.py
+
+# 存：Python 对象 → JSON 字符串 → Redis
+data = session.model_dump_json()           # Session → JSON
+client.set(f"session:memory:{session_id}", data, ex=86400)
+
+# 取：Redis → JSON 字符串 → Python 对象
+data = client.get(f"session:memory:{session_id}")
+session = Session.model_validate_json(data)  # JSON → Session
+```
+
+**防丢策略**：
+
+1. **TTL 过期**：Session 数据设置 24 小时 TTL，过期自动清理，防止 Redis 内存溢出
+2. **内存降级**：Redis 不可用时自动切换到内存存储，保证服务不中断
+3. **异常恢复**：压缩历史时如果 LLM 调用失败，回滚到压缩前的状态
+
+```python
+# agents/tool/memory/compressor.py
+async def compress_session(session, llm):
+    to_compress = session.history[:-6]
+    session.history = session.history[-6:]  # 先裁剪
+
+    try:
+        response = await llm.ainvoke([...])
+        session.summary = response.content
+    except Exception:
+        session.history = to_compress + session.history  # 失败则回滚
+        raise
+```
+
+### 9.4 记忆压缩：怎么防止历史越来越长？
+
+**问题**：用户聊了 100 轮，历史消息占了大量 Token，导致：
+1. Prompt 太长，超出 LLM 上下文窗口
+2. Token 费用飙升
+3. 检索噪音增大
+
+**解决方案**：LLM 摘要压缩
+
+```
+压缩前:
+  history = [msg1, msg2, ..., msg20, msg21, msg22, msg23, msg24, msg25]
+  summary = ""
+
+压缩后:
+  history = [msg20, msg21, msg22, msg23, msg24, msg25]  (只保留最近 6 轮)
+  summary = "用户询问了 Python 列表推导式的用法，讨论了性能优化..."  (LLM 生成的摘要)
+```
+
+```python
+# agents/tool/memory/compressor.py
+DEFAULT_MAX_HISTORY_LEN = 20  # 超过 20 条消息触发压缩
+KEEP_RECENT = 6               # 压缩后保留最近 6 条
+
+async def compress_session(session, llm):
+    if len(session.history) <= DEFAULT_MAX_HISTORY_LEN:
+        return  # 不够长，不压缩
+
+    to_compress = session.history[:-KEEP_RECENT]  # 要压缩的旧消息
+    session.history = session.history[-KEEP_RECENT:]  # 保留的新消息
+
+    # 让 LLM 把旧消息 + 已有摘要 合并成新摘要
+    prompt = f"旧摘要: {session.summary}\n旧消息: {to_compress}\n请合并为新摘要"
+    session.summary = await llm.ainvoke(prompt)
+```
+
+### 9.5 Redis 降级：Redis 挂了怎么办？
+
+**问题**：Redis 是外部依赖，可能宕机。如果代码直接依赖 Redis，Redis 挂了整个服务就挂了。
+
+**解决方案**：每一层 Redis 使用都有内存降级策略。
+
+```python
+# agents/tool/memory/store.py — SessionStore
+class SessionStore:
+    def __init__(self):
+        self._fallback = {}        # 内存降级存储
+        self._use_fallback = True  # 默认先用降级模式
+
+    def get(self, session_id):
+        if self._use_fallback:
+            return self._fallback.get(session_id, Session(id=session_id))
+        try:
+            data = self._redis.get(key)
+            return Session.model_validate_json(data)
+        except Exception:
+            self._use_fallback = True  # Redis 出错，切换到降级模式
+            return self.get(session_id)  # 重试（这次走降级分支）
+```
+
+**三层降级**：
+
+| 组件 | 正常模式 | 降级模式 | 影响 |
+|------|---------|---------|------|
+| Session Store | Redis | 内存 dict | 进程重启后历史丢失 |
+| Retrieval Cache | Redis | 内存 dict | 缓存不跨进程 |
+| LangGraph Checkpoint | Redis | MemorySaver | interrupt/resume 不跨重启 |
+
+---
+
+## 10. 我们踩过的坑：真实 Bug 与修复
+
+### 10.1 SSE 流式输出不显示（最高频 Bug）
+
+**现象**：Chat 对话框显示"思考中..."，但 LLM 的回答始终不出现。后端日志显示数据已发送，浏览器 Network 面板也能看到数据流，但前端就是不显示。
+
+**排查过程**：
+
+1. 先怀疑是前端 `fetch` 的问题，改用 `ReadableStream` 手动读取 — 没解决
+2. 添加 `console.log` 调试，发现 `parts` 数组长度始终为 1 — 说明 `split('\n\n')` 没切开
+3. 在浏览器控制台手动测试：
+
+```javascript
+var b = "event: message\r\ndata: hello\r\n\r\n";
+b.split('\n\n');  // 返回 ["event: message\r\ndata: hello\r\n\r\n"]  ← 没切开！
+b.split('\r\n\r\n');  // 返回 ["event: message\r\ndata: hello", ""]  ← 切开了！
+```
+
+**根因**：SSE 协议规定行分隔符是 `\r\n`（CRLF），块分隔符是 `\r\n\r\n`。但 JavaScript 的 `split('\n\n')` 找不到 `\n\n`，因为两个 `\n` 之间隔了一个 `\r`！
+
+```
+\r\n\r\n 的字节:  \r  \n  \r  \n
+                    ↑     ↑
+                    这两个 \n 之间有 \r，不连续！
+```
+
+**修复**：
+
+```javascript
+// 之前（错误）
+let parts = buffer.split('\n\n');    // 永远切不开
+
+// 之后（正确）
+let parts = buffer.split('\r\n\r\n');  // 正确切分 SSE 块
+```
+
+**教训**：协议规范很重要！SSE 规范（RFC 8895）明确要求 CRLF 行结尾。浏览器的 `EventSource` API 会自动处理，但手动解析时必须遵守规范。
+
+### 10.2 LLM 把检索到的文档原封不动输出
+
+**现象**：用户问 "各部门经理是谁"，LLM 回答的不是 "张三是研发部经理..."，而是把数据库表结构原样输出：
+
+```
+表名: t_user
+字段:
+  id int PRIMARY KEY NOT NULL
+  username varchar(50) UNIQUE
+  real_name varchar(50) COMMENT '真实姓名'
+  department_id int COMMENT '部门ID'
+```
+
+**根因**：Prompt 中没有告诉 LLM "不要复述原文"。LLM 看到参考文档后，以为用户想看文档内容，就直接输出了。
+
+**修复**：添加 SystemMessage 指导 LLM 行为：
+
+```python
+# agents/flow/rag_chat.py
+system = SystemMessage(content=(
+    "你是一个智能助手。根据参考知识回答用户问题。"
+    "只使用与问题相关的信息，忽略无关内容。"
+    "直接回答问题，不要复述参考知识原文。"         # ← 关键指令
+    "如果参考知识中没有相关信息，根据你的知识回答。"
+))
+```
+
+**教训**：LLM 会"照字面意思理解"。你不告诉它"不要复述"，它就可能复述。Prompt Engineering 的核心是"把你的期望说清楚"。
+
+### 10.3 SQL Agent Tab 流式输出无显示
+
+**现象**：Chat Tab 流式输出正常，但 SQL Agent Tab 完全没有输出。
+
+**排查过程**：
+
+1. SQL Agent 使用 `astream_events(version="v2")` 捕获子图的 LLM 输出
+2. 添加日志发现：955 个事件中只有 2 个 LLM 事件（来自 `classify_intent`），SQL 子图的事件为 0
+
+**根因**：`astream_events` 只能捕获**直接子节点**的 LLM 事件。SQL React 子图内部用 `ainvoke` 调用，不产生流式事件。
+
+```
+final_graph (astream_events 能捕获)
+  ├── classify_intent  → 有 LLM 事件 ✅
+  └── sql_react (ainvoke)  → 内部的 LLM 事件丢失 ❌
+       └── sql_generate (LLM)  → 外层看不到
+```
+
+**修复方案**：采用"先分类再路由"模式：
+
+```javascript
+// 1. 先调用非流式分类接口
+const classify = await fetch('/api/final/classify', {body: query});
+const {intent} = await classify.json();
+
+// 2. 根据意图选择不同端点
+if (intent === 'sql_query') {
+    // SQL 路径：用非流式（因为无法流式捕获子图事件）
+    const resp = await fetch('/api/final/invoke', {body: query});
+    // 处理审批流程...
+} else {
+    // Chat 路径：用流式
+    const resp = await fetch('/api/rag/chat/stream', {body: query});
+    // 流式显示...
+}
+```
+
+**教训**：LangGraph 的 `astream_events` 有作用域限制。嵌套子图如果用 `ainvoke` 调用，外层捕获不到其内部事件。设计流式架构时要考虑这个约束。
+
+### 10.4 `request.is_disconnected()` 导致 SSE 中断
+
+**现象**：SSE 测试端点（简单发送 5 条消息）在浏览器中正常，但真实 RAG 端点有时会中途断开。
+
+**根因**：SSE 响应函数中加了 `request.is_disconnected()` 检查：
+
+```python
+async def sse_response(generator, request):
+    async for event in generator:
+        if await request.is_disconnected():  # ← 这行导致问题
+            break
+        yield event
+```
+
+`is_disconnected()` 在使用 `fetch` + `ReadableStream` 时行为不稳定，可能误判为"已断开"。
+
+**修复**：删除手动断连检查，让 `EventSourceResponse` 自己处理：
+
+```python
+async def sse_response(generator, request):
+    return EventSourceResponse(generator)  # 内部已有 _listen_for_disconnect
+```
+
+**教训**：框架已经处理了的事情，不要自己重复处理。`sse-starlette` 的 `EventSourceResponse` 内部已经有断连检测机制。
+
+### 10.5 astream_events 过滤了意图分类输出
+
+**现象**：SQL Agent 流式输出时，先显示了意图分类的结果（"sql_query"），然后才显示真正的 SQL 内容。
+
+**根因**：`classify_intent` 节点的 LLM 输出也通过 `astream_events` 流出来了，前端没有过滤。
+
+**修复**：在流式生成器中过滤掉非目标节点的输出：
+
+```python
+async for event in graph.astream_events(..., version="v2"):
+    if event["event"] == "on_chat_model_stream":
+        # 只处理目标节点的输出
+        if event.get("name") == "chat":  # 只要 chat 节点的输出
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                yield {"event": "message", "data": chunk.content}
+```
+
+**教训**：`astream_events` 会捕获图中**所有**节点的事件。必须通过 `event["name"]` 过滤，只处理你关心的节点。
+
+### 10.6 最后一个 SSE 块丢失
+
+**现象**：LLM 回答的最后一两个字总是不显示。
+
+**根因**：SSE 解析逻辑中，`buffer.split('\r\n\r\n')` 的最后一个元素留在 buffer 里，但循环结束后没有处理它：
+
+```javascript
+while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream: true});
+    let parts = buffer.split('\r\n\r\n');
+    buffer = parts.pop();  // 最后一个不完整的块留在 buffer
+    for (const part of parts) { ... }
+}
+// 循环结束后，buffer 里还有最后一个完整的块没处理！
+```
+
+**修复**：循环结束后处理剩余 buffer：
+
+```javascript
+while (true) { ... }
+
+// 处理最后的 buffer
+if (buffer.trim()) {
+    const ev = parseSSEBlock(buffer);
+    if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+}
+bubble.textContent = fullContent || '(无响应)';
+```
+
+**教训**：流式处理中，"最后一个"数据块是常见的遗漏点。写循环时要考虑：循环结束后还有没有剩余数据？
+
+### 10.7 Embedding API 批量大小限制
+
+**现象**：Schema 索引时，15 张表的文档一次性发给 Embedding API，报错 `batch size is invalid, it should not be larger than 10`。
+
+**根因**：Embedding API（豆包）限制单次最多处理 10 条文本，但代码一次发了 15 条。
+
+**修复**：分批调用：
+
+```python
+# 之前（错误）
+vectors = embeddings.embed_documents(texts)  # 15 条一次性发
+
+# 之后（正确）
+vectors = []
+batch_size = 10
+for i in range(0, len(texts), batch_size):
+    vectors.extend(embeddings.embed_documents(texts[i:i + batch_size]))
+```
+
+**教训**：第三方 API 往往有批量限制。调用前要查文档，或者默认做分批处理。
+
+### 10.8 ES 检索返回空 metadata
+
+**现象**：ES BM25 检索返回的文档 `metadata` 为空字典 `{}`，导致评估时 `doc_id` 匹配失败。
+
+**根因**：Schema 文档存入 ES 时直接用 `es.index()` API，字段是扁平的：
+
+```python
+# 存入时
+es.index(index=..., id=doc_id, document={
+    "text": "...",
+    "source": "mysql_schema",
+    "table_name": "t_user",
+    "doc_id": "schema_t_user",
+})
+```
+
+但 langchain 的 `ElasticsearchStore` 读取时，期望 metadata 在一个嵌套的 `metadata` 字段下。直接存的扁平字段不会被映射到 `Document.metadata`。
+
+**教训**：存储和读取要用同一套协议。如果用 langchain 的 `ElasticsearchStore` 读，就应该用它的 `add_documents()` 方法存，而不是直接调 ES client。
+
+---
+
+## 附录 A：Bug 排查方法论
+
+这个项目中我们用了"二分法排查"来定位 SSE 问题：
+
+```
+第 1 步：最简端点测试
+  → 创建 GET /api/rag/test/stream，发送 5 条固定消息
+  → 结果：正常显示
+  → 结论：SSE 基础设施没问题
+
+第 2 步：对比真实端点
+  → test 端点用 GET，真实端点用 POST
+  → 改 test 为 POST — 仍然正常
+  → 结论：POST 不是问题
+
+第 3 步：对比生成方式
+  → test 端点直接 yield，真实端点用 astream_events
+  → 创建 test/stream2 用 astream_events
+  → 结果：test/stream2 也不显示
+  → 结论：astream_events 是问题所在
+
+第 4 步：检查前端解析
+  → 添加 console.log 打印 buffer
+  → 发现 buffer 有内容但 parts 为空
+  → 结论：split('\n\n') 没有切开 buffer
+
+第 5 步：验证根因
+  → 浏览器控制台测试: "a\r\n\r\nb".split('\n\n')
+  → 返回 ["a\r\n\r\nb"]，确认没切开
+  → 改为 split('\r\n\r\n') — 解决！
+```
+
+**通用排查思路**：
+1. **最小复现**：用最简单的代码复现问题
+2. **逐步排除**：每次只改一个变量，确认是否影响结果
+3. **查看原始数据**：不要假设数据格式，打印出来看（`console.log`、`print`）
+4. **查阅规范**：不要凭记忆猜测协议格式，看 RFC 文档
