@@ -171,23 +171,6 @@
             return {event: eventType, data: eventData};
         }
 
-        async function readSSEStream(resp, onEvent) {
-            const reader = resp.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            while (true) {
-                const {done, value} = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, {stream: true});
-                let parts = buffer.split('\n\n');
-                buffer = parts.pop();
-                for (const part of parts) {
-                    if (part.trim()) onEvent(parseSSEBlock(part));
-                }
-            }
-            if (buffer.trim()) onEvent(parseSSEBlock(buffer));
-        }
-
         // --- Tab switching ---
         function switchTab(name) {
             const tabs = ['chat', 'agent', 'upload', 'admin'];
@@ -222,6 +205,7 @@
             addMessage(messagesDiv, 'user', query);
             const div = addMessage(messagesDiv, 'assistant', '');
             const bubble = div.querySelector('.bubble');
+            bubble.textContent = '思考中...';
             let fullContent = '';
             try {
                 const resp = await fetch('/api/rag/chat/stream', {
@@ -229,19 +213,39 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
+                console.log('[Chat] status:', resp.status, 'type:', resp.headers.get('content-type'));
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    await readSSEStream(resp, ({event, data}) => {
-                        if (event === 'done') return;
-                        if (event === 'error') { fullContent += '\n错误: ' + data; return; }
-                        if (data) fullContent += data;
-                        bubble.textContent = fullContent || '思考中...';
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        const chunk = decoder.decode(value, {stream: true});
+                        buffer += chunk;
+                        let parts = buffer.split('\n\n');
+                        buffer = parts.pop();
+                        for (const part of parts) {
+                            if (!part.trim()) continue;
+                            const ev = parseSSEBlock(part);
+                            if (ev.event === 'done') continue;
+                            if (ev.data) fullContent += ev.data;
+                        }
+                        bubble.textContent = fullContent;
                         messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    });
-                    if (!fullContent) bubble.textContent = '(无响应)';
+                    }
+                    // process remaining buffer
+                    if (buffer.trim()) {
+                        const ev = parseSSEBlock(buffer);
+                        if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+                    }
+                    bubble.textContent = fullContent || '(无响应)';
+                    console.log('[Chat] done, length:', fullContent.length);
                 }
             } catch (e) {
+                console.error('[Chat] error:', e);
                 bubble.textContent = '请求失败: ' + e.message;
             }
             btn.disabled = false;
@@ -269,6 +273,7 @@
             addAgentMessage('user', escHtml(query));
             const div = addAgentMessage('assistant', '');
             const bubble = div.querySelector('.bubble');
+            bubble.textContent = '思考中...';
             let fullContent = '';
             let approvalData = null;
             try {
@@ -277,20 +282,38 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
+                console.log('[Agent] status:', resp.status, 'type:', resp.headers.get('content-type'));
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    await readSSEStream(resp, ({event, data}) => {
-                        if (event === 'start' || event === 'done') return;
-                        if (event === 'error') { fullContent += '\n错误: ' + data; return; }
-                        if (event === 'approval') {
-                            try { approvalData = JSON.parse(data); } catch {}
-                            return;
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        let parts = buffer.split('\n\n');
+                        buffer = parts.pop();
+                        for (const part of parts) {
+                            if (!part.trim()) continue;
+                            const ev = parseSSEBlock(part);
+                            if (ev.event === 'start' || ev.event === 'done') continue;
+                            if (ev.event === 'error') { fullContent += '\n错误: ' + ev.data; continue; }
+                            if (ev.event === 'approval') {
+                                try { approvalData = JSON.parse(ev.data); } catch {}
+                                continue;
+                            }
+                            if (ev.event === 'data' && ev.data) fullContent += ev.data;
                         }
-                        if (event === 'data' && data) fullContent += data;
-                        bubble.textContent = fullContent || '思考中...';
+                        bubble.textContent = fullContent;
                         sqlMessages.scrollTop = sqlMessages.scrollHeight;
-                    });
+                    }
+                    if (buffer.trim()) {
+                        const ev = parseSSEBlock(buffer);
+                        if (ev.event === 'approval') { try { approvalData = JSON.parse(ev.data); } catch {} }
+                        else if (ev.event !== 'done' && ev.event !== 'start' && ev.data) fullContent += ev.data;
+                    }
                     if (approvalData) {
                         bubble.innerHTML = '';
                         renderAgentResponse(div, {
@@ -304,8 +327,10 @@
                     } else {
                         bubble.textContent = '(无响应)';
                     }
+                    console.log('[Agent] done, length:', fullContent.length, 'approval:', !!approvalData);
                 }
             } catch (e) {
+                console.error('[Agent] error:', e);
                 bubble.textContent = '请求失败: ' + e.message;
             }
             agentBtn.disabled = false;
