@@ -63,6 +63,20 @@ async def rag_chat_stream_get(
     return await _stream_rag_chat(inp, request)
 
 
+@router.get("/test/stream")
+async def rag_test_stream(request: Request):
+    """简单 SSE 测试端点。"""
+    import asyncio
+
+    async def generate():
+        for i in range(5):
+            yield {"event": "message", "data": f"chunk-{i}"}
+            await asyncio.sleep(0.3)
+        yield {"event": "done", "data": "[DONE]"}
+
+    return await sse_response(generate(), request)
+
+
 async def _stream_rag_chat(inp: dict, request: Request):
     """Shared streaming logic."""
     graph = build_rag_chat_graph()
