@@ -209,7 +209,7 @@
             bubble.textContent = '思考中...';
             let fullContent = '';
             try {
-                const resp = await fetch('/api/rag/chat/stream', {
+                const resp = await fetch('/api/rag/test/stream2', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
