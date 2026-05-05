@@ -49,14 +49,14 @@ async def check_docs(state: SQLReactState) -> dict:
             es = Elasticsearch(es_url)
             resp = es.search(
                 index=settings.es.index,
-                query={"term": {"source": _SCHEMA_SOURCE}},
+                query={"term": {"metadata.source": _SCHEMA_SOURCE}},
                 size=50,
             )
             from langchain_core.documents import Document
             docs = [
                 Document(
                     page_content=hit["_source"]["text"],
-                    metadata={"source": _SCHEMA_SOURCE, "table_name": hit["_source"].get("table_name", "")},
+                    metadata=hit["_source"].get("metadata", {}),
                 )
                 for hit in resp["hits"]["hits"]
             ]

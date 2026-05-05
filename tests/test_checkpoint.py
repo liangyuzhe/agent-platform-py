@@ -12,8 +12,8 @@ class TestGetCheckpointer:
         import agents.tool.storage.checkpoint as cp
         cp._checkpointer = None
 
-    def test_returns_memory_saver(self):
-        """Default should return MemorySaver."""
+    def test_returns_memory_saver_by_default(self):
+        """Default (checkpointer_enabled=False) should return MemorySaver."""
         from agents.tool.storage.checkpoint import get_checkpointer
         from langgraph.checkpoint.memory import MemorySaver
 
@@ -28,48 +28,28 @@ class TestGetCheckpointer:
         cp2 = get_checkpointer()
         assert cp1 is cp2
 
-
-class TestGetRedisCheckpointer:
-    """Test get_redis_checkpointer."""
-
-    def setup_method(self):
-        """Reset singleton before each test."""
-        import agents.tool.storage.checkpoint as cp
-        cp._checkpointer = None
-
     @patch("langgraph.checkpoint.redis.aio.AsyncRedisSaver")
     @patch("agents.tool.storage.redis_client.get_redis")
-    def test_returns_redis_checkpointer(self, mock_redis, mock_saver):
-        """Should return AsyncRedisSaver when Redis is available."""
-        mock_client = MagicMock()
-        mock_redis.return_value = mock_client
-        mock_instance = MagicMock()
-        mock_saver.return_value = mock_instance
-
-        from agents.tool.storage.checkpoint import get_redis_checkpointer
-        result = get_redis_checkpointer()
-
-        assert result is mock_instance
-        mock_saver.assert_called_once_with(redis_client=mock_client)
-
-    @patch("agents.tool.storage.redis_client.get_redis", side_effect=Exception("Redis down"))
-    def test_fallback_to_memory(self, mock_redis):
-        """Should fall back to MemorySaver on error."""
-        from agents.tool.storage.checkpoint import get_redis_checkpointer
-        from langgraph.checkpoint.memory import MemorySaver
-
-        result = get_redis_checkpointer()
-        assert isinstance(result, MemorySaver)
-
-    @patch("langgraph.checkpoint.redis.aio.AsyncRedisSaver")
-    @patch("agents.tool.storage.redis_client.get_redis")
-    def test_returns_singleton(self, mock_redis, mock_saver):
-        """Should return the same instance on repeated calls."""
+    @patch("agents.config.settings.settings")
+    def test_returns_redis_when_enabled(self, mock_settings, mock_redis, mock_saver):
+        """Should return AsyncRedisSaver when checkpointer_enabled=True."""
+        mock_settings.redis.checkpointer_enabled = True
         mock_redis.return_value = MagicMock()
         mock_saver.return_value = MagicMock()
 
-        from agents.tool.storage.checkpoint import get_redis_checkpointer
+        from agents.tool.storage.checkpoint import get_checkpointer
+        result = get_checkpointer()
 
-        cp1 = get_redis_checkpointer()
-        cp2 = get_redis_checkpointer()
-        assert cp1 is cp2
+        assert result is mock_saver.return_value
+
+    @patch("agents.tool.storage.redis_client.get_redis", side_effect=Exception("Redis down"))
+    @patch("agents.config.settings.settings")
+    def test_fallback_to_memory_on_redis_error(self, mock_settings, mock_redis):
+        """Should fall back to MemorySaver when Redis is enabled but unavailable."""
+        mock_settings.redis.checkpointer_enabled = True
+
+        from agents.tool.storage.checkpoint import get_checkpointer
+        from langgraph.checkpoint.memory import MemorySaver
+
+        result = get_checkpointer()
+        assert isinstance(result, MemorySaver)

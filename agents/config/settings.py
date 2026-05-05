@@ -149,6 +149,7 @@ class RedisSettings(BaseSettings):
     addr: str = Field(default="localhost:6379", description="Redis address host:port")
     password: str = Field(default="", description="Redis password")
     db: int = Field(default=0, description="Redis database number")
+    checkpointer_enabled: bool = Field(default=False, description="Use Redis for LangGraph checkpoint persistence")
 
     @model_validator(mode="before")
     @classmethod

@@ -226,9 +226,11 @@ def _store_schema_docs(docs: list[Document]) -> dict:
                 id=doc_id,
                 document={
                     "text": doc.page_content,
-                    "source": _SCHEMA_SOURCE,
-                    "table_name": doc.metadata.get("table_name", ""),
-                    "doc_id": doc_id,
+                    "metadata": {
+                        "source": _SCHEMA_SOURCE,
+                        "table_name": doc.metadata.get("table_name", ""),
+                        "doc_id": doc_id,
+                    },
                 },
             )
         logger.info("Stored %d schema docs in Elasticsearch", len(docs))

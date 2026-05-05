@@ -2,9 +2,9 @@
 
 Creates a checkpointer for LangGraph interrupt/resume support.
 
-To use persistent Redis-backed checkpointing, install RedisJSON:
-  docker run -p 6379:6379 redis/redis-stack-server:latest
-Then set ``use_redis=True`` or call :func:`get_redis_checkpointer`.
+Set ``REDIS_CHECKPOINTER_ENABLED=true`` to use Redis-backed persistent
+checkpointing (requires RedisJSON).  Falls back to in-memory ``MemorySaver``
+if Redis is unavailable.
 """
 
 from __future__ import annotations
@@ -21,38 +21,30 @@ _checkpointer: Optional[BaseCheckpointSaver] = None
 
 
 def get_checkpointer() -> BaseCheckpointSaver:
-    """Return an in-memory checkpointer (default).
+    """Return a checkpointer based on configuration.
 
-    Suitable for single-process deployments.  For persistent checkpointing
-    across restarts, use :func:`get_redis_checkpointer`.
+    If ``settings.redis.checkpointer_enabled`` is True and Redis is reachable,
+    returns an ``AsyncRedisSaver`` for persistent checkpointing across restarts.
+    Otherwise returns an in-memory ``MemorySaver``.
     """
     global _checkpointer
     if _checkpointer is not None:
         return _checkpointer
+
+    from agents.config.settings import settings
+
+    if settings.redis.checkpointer_enabled:
+        try:
+            from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+            from agents.tool.storage.redis_client import get_redis
+
+            client = get_redis()
+            _checkpointer = AsyncRedisSaver(redis_client=client)
+            logger.info("LangGraph AsyncRedisSaver checkpointer created")
+            return _checkpointer
+        except Exception as e:
+            logger.warning("Redis checkpointer unavailable (%s), falling back to MemorySaver", e)
 
     _checkpointer = MemorySaver()
     logger.info("LangGraph MemorySaver checkpointer created")
-    return _checkpointer
-
-
-def get_redis_checkpointer() -> BaseCheckpointSaver:
-    """Return a Redis-backed checkpointer (requires RedisJSON module).
-
-    Falls back to ``MemorySaver`` if Redis or RedisJSON is unavailable.
-    """
-    global _checkpointer
-    if _checkpointer is not None:
-        return _checkpointer
-
-    try:
-        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-        from agents.tool.storage.redis_client import get_redis
-
-        client = get_redis()
-        _checkpointer = AsyncRedisSaver(redis_client=client)
-        logger.info("LangGraph AsyncRedisSaver checkpointer created")
-    except Exception as e:
-        logger.warning("Redis checkpointer unavailable (%s), using MemorySaver", e)
-        _checkpointer = MemorySaver()
-
     return _checkpointer

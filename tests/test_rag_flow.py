@@ -132,8 +132,8 @@ class TestRAGChatConstructMessages:
 
         result = await construct_messages(state)
         assert "messages" in result
-        assert len(result["messages"]) == 1
-        assert "hello" in result["messages"][0].content
+        assert len(result["messages"]) == 2  # SystemMessage + HumanMessage
+        assert "hello" in result["messages"][1].content
 
     @pytest.mark.asyncio
     async def test_construct_messages_with_summary(self):
@@ -147,7 +147,7 @@ class TestRAGChatConstructMessages:
         }
 
         result = await construct_messages(state)
-        assert "User likes Python" in result["messages"][0].content
+        assert "User likes Python" in result["messages"][1].content
 
     @pytest.mark.asyncio
     async def test_construct_messages_with_docs(self):
@@ -162,7 +162,7 @@ class TestRAGChatConstructMessages:
         }
 
         result = await construct_messages(state)
-        assert "AI is artificial intelligence" in result["messages"][0].content
+        assert "AI is artificial intelligence" in result["messages"][1].content
 
 
 class TestBuildRAGChatGraph:

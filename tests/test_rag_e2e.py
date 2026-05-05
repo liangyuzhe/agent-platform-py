@@ -148,7 +148,7 @@ class TestRAGChatGraphE2E:
         assert result["answer"] == "Follow-up answer"
         # Verify the model was called with context including history
         call_args = mock_model.ainvoke.call_args[0][0]
-        context = call_args[0].content
+        context = call_args[1].content  # index 0 is SystemMessage, 1 is HumanMessage
         assert "Python" in context
 
     @pytest.mark.asyncio
@@ -310,8 +310,8 @@ class TestConstructMessagesNode:
         result = await construct_messages(state)
 
         assert "messages" in result
-        assert len(result["messages"]) == 1
-        content = result["messages"][0].content
+        assert len(result["messages"]) == 2  # SystemMessage + HumanMessage
+        content = result["messages"][1].content
         assert "Python" in content
         assert "learning programming" in content
 
@@ -326,8 +326,8 @@ class TestConstructMessagesNode:
         }
 
         result = await construct_messages(state)
-        assert len(result["messages"]) == 1
-        assert "hello" in result["messages"][0].content
+        assert len(result["messages"]) == 2  # SystemMessage + HumanMessage
+        assert "hello" in result["messages"][1].content
 
 
 class TestRetrieveNode:

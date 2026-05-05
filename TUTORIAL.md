@@ -1437,6 +1437,62 @@ es.index(index=..., id=doc_id, document={
 
 **教训**：存储和读取要用同一套协议。如果用 langchain 的 `ElasticsearchStore` 读，就应该用它的 `add_documents()` 方法存，而不是直接调 ES client。
 
+**修复**：将 ES 存入格式改为嵌套 `metadata` 结构，同步修改 `check_docs` fallback 的字段访问路径：
+
+```python
+# schema_indexer.py — 修复后
+es.index(index=..., id=doc_id, document={
+    "text": doc.page_content,
+    "metadata": {                          # ← 嵌套 metadata
+        "source": _SCHEMA_SOURCE,
+        "table_name": doc.metadata.get("table_name", ""),
+        "doc_id": doc_id,
+    },
+})
+
+# sql_react.py check_docs — 修复后
+resp = es.search(
+    index=settings.es.index,
+    query={"term": {"metadata.source": _SCHEMA_SOURCE}},  # ← metadata.source
+    size=50,
+)
+docs = [
+    Document(
+        page_content=hit["_source"]["text"],
+        metadata=hit["_source"].get("metadata", {}),       # ← 读嵌套字段
+    )
+    for hit in resp["hits"]["hits"]
+]
+```
+
+---
+
+### 10.9 SystemMessage 导致测试索引偏移
+
+**现象**：6 个 RAG 测试突然全部失败，报 `assert 2 == 1` 或内容在 `messages[0]` 找不到。
+
+**根因**：`construct_messages()` 后来加了 `SystemMessage`（系统提示词），返回从 `[HumanMessage]` 变成了 `[SystemMessage, HumanMessage]`。但测试还在用 `messages[0]` 取内容：
+
+```python
+# 测试代码（未更新）
+result = await construct_messages(state)
+assert len(result["messages"]) == 1                          # ← 实际是 2
+assert "hello" in result["messages"][0].content              # ← 现在 [0] 是 SystemMessage
+```
+
+**教训**：给函数加返回值字段（如新增一个 message）时，必须同步检查所有调用方和测试。这类"接口变更但测试没跟上"的问题在多人协作中非常常见。
+
+**修复**：更新所有测试的索引和长度断言：
+
+```python
+# 修复后
+result = await construct_messages(state)
+assert len(result["messages"]) == 2                          # SystemMessage + HumanMessage
+assert "hello" in result["messages"][1].content              # [1] 才是 HumanMessage
+```
+
+影响文件：`tests/test_rag_flow.py`（3 处）、`tests/test_rag_e2e.py`（3 处），共 6 个测试用例。
+
 ---
 
 ## 附录 A：Bug 排查方法论
