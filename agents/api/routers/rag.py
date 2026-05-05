@@ -77,6 +77,35 @@ async def rag_test_stream(request: Request):
     return await sse_response(generate(), request)
 
 
+@router.post("/test/stream2")
+async def rag_test_stream2(req: RAGChatRequest, request: Request):
+    """测试 astream_events 的 SSE 端点。"""
+    graph = build_rag_chat_graph()
+    callbacks = get_trace_callbacks()
+    config = {"callbacks": callbacks} if callbacks else {}
+
+    async def generate():
+        try:
+            logger.info("test/stream2: starting astream_events")
+            async for event in graph.astream_events(
+                {"input": _build_input(req)},
+                version="v2",
+                config=config,
+            ):
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "message", "data": chunk.content}
+            logger.info("test/stream2: astream_events completed")
+        except Exception as e:
+            logger.exception("test/stream2 error")
+            yield {"event": "error", "data": str(e)}
+        finally:
+            yield {"event": "done", "data": "[DONE]"}
+
+    return await sse_response(generate(), request)
+
+
 async def _stream_rag_chat(inp: dict, request: Request):
     """Shared streaming logic."""
     graph = build_rag_chat_graph()

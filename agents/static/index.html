@@ -257,7 +257,11 @@
             const bubble = div.querySelector('.bubble');
             bubble.textContent = 'testing...';
             try {
-                const resp = await fetch('/api/rag/test/stream', {method: 'POST'});
+                const resp = await fetch('/api/rag/test/stream2', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query: 'hi', session_id: 'test_' + Date.now()}),
+                });
                 console.log('[Test] status:', resp.status, 'type:', resp.headers.get('content-type'));
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
