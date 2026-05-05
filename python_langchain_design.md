@@ -312,6 +312,80 @@ graph.add_conditional_edges("classify_intent", route_intent)
 
 意图分类使用 LLM + 动态领域摘要（从 MySQL/Redis 加载，非硬编码）。
 
+**各意图处理流程**：
+
+**sql_query — 数据库查询**
+```
+用户输入 → classify_intent → sql_query
+  → sql_retrieve (vector-only)
+  → check_docs (schema 充足？)
+    → 不足 → re-retrieve 缺失表 → 合并 → 重新生成
+  → sql_generate (LLM 生成 SQL)
+  → safety_check (安全审查)
+    → 危险 → 拒绝
+  → approve (interrupt 等待人工审批)
+    → 拒绝 → 反馈 → 重新生成
+    → 通过 → execute_sql
+      → 失败 → error_analysis → retry (最多 3 次)
+      → 成功 → 返回结果
+```
+
+**knowledge — 知识库问答**
+```
+用户输入 → classify_intent → knowledge
+  → preprocess (加载 session)
+  → rewrite (查询重写，消解指代)
+  → retrieve (hybrid: Milvus + ES BM25 + RRF)
+  → construct_messages (拼装 prompt + token 预算)
+  → chat (LLM 生成回答)
+  → 保存记忆 → 返回
+```
+
+**chat — 闲聊**
+```
+用户输入 → classify_intent → chat
+  → 同 knowledge 流程（复用 RAG Chat 图）
+```
+
+**anomaly_detect — 异常归因（Phase 2）**
+```
+用户输入 → classify_intent → anomaly_detect
+  → 指标查询 (SQL: 同比/环比)
+  → 波动检测 (阈值/Z-score)
+  → 归因分析 (LLM: 维度下钻)
+  → 生成报告
+```
+
+**reconciliation — 资金核对（Phase 2）**
+```
+用户输入 → classify_intent → reconciliation
+  → 多源拉取 (内部账本 + 链上/银行流水)
+  → 逐条比对 (金额/时间/对方)
+  → 差异标记
+  → LLM 解释差异原因
+  → 生成核对报告
+```
+
+**report — 报告生成（Phase 2）**
+```
+用户输入 → classify_intent → report
+  → 意图解析 (日报/周报/月报？哪些指标？)
+  → 数据聚合 (SQL: SUM/AVG/GROUP BY)
+  → 趋势分析 (环比/同比)
+  → LLM 生成文字报告
+  → ECharts 生成图表
+  → 组装输出
+```
+
+**audit — 审计追踪（Phase 2）**
+```
+用户输入 → classify_intent → audit
+  → 目标识别 (哪笔交易/哪个科目？)
+  → 凭证链查询 (凭证号 → 分录 → 发票 → 审批流)
+  → 时间线构建
+  → LLM 摘要审计要点
+```
+
 ---
 
 ## 6. RAG 管线设计
@@ -633,11 +707,16 @@ python -m agents.eval.cli generate --num-per-table 3 --output eval_dataset.jsonl
 
 ### 13.3 评估指标
 
-| 指标 | 说明 | 公式 |
-|------|------|------|
-| Recall@K | Top-K 结果中命中相关文档的比例 | `hits_in_top_k / total_relevant` |
-| MRR | 第一个相关文档的排名倒数 | `1 / rank_of_first_relevant` |
-| NDCG@K | 归一化折扣累积增益（二元相关性） | `DCG@K / IDCG@K` |
+| 指标 | 核心拷问 | 关注点 | 优缺点 | 公式 |
+| :--- | :--- | :--- | :--- | :--- |
+| Recall@K | 找到了没有？ | 覆盖率（找得全不全） | 简单直观，但忽略了排序先后 | `hits_in_top_k / total_relevant` |
+| MRR | 第一个对的答案来得早不早？ | 首位精准度（找得快不快） | 极其看重第一名，但忽略了后面还有没有其他好答案 | `1 / rank_of_first_relevant` |
+| NDCG@K | 整体排得好不好？ | 排序质量（强相关的在前面吗） | 最全面、最符合人类直觉，但计算相对复杂 | `DCG@K / IDCG@K` |
+
+**如何选择指标**：
+- **快速筛查**：看 Recall@K — 相关文档有没有被捞出来
+- **用户体验**：看 MRR — 用户第一个看到的答案是否正确
+- **综合排序**：看 NDCG@K — 强相关文档是否排在前面，兼顾了排序质量
 
 评估函数实现：`agents/eval/metrics.py`
 
