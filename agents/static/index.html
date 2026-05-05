@@ -267,7 +267,7 @@
                     const chunk = decoder.decode(value, {stream: true});
                     console.log('[Test chunk #' + count + ']', JSON.stringify(chunk));
                     buffer += chunk;
-                    let parts = buffer.split('\n\n');
+                    let parts = buffer.split('\r\n\r\n');
                     buffer = parts.pop();
                     for (const part of parts) {
                         if (!part.trim()) continue;
@@ -329,7 +329,7 @@
                         const chunk = decoder.decode(value, {stream: true});
                         buffer += chunk;
                         console.log('[Agent chunk #' + chunkCount + ']', JSON.stringify(chunk));
-                        let parts = buffer.split('\n\n');
+                        let parts = buffer.split('\r\n\r\n');
                         buffer = parts.pop();
                         for (const part of parts) {
                             if (!part.trim()) continue;
