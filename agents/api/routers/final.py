@@ -148,10 +148,14 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
                 # Track intermediate graph nodes to filter their LLM output
                 if evt_type == "on_chain_start" and evt_name == "classify_intent":
                     in_intermediate_node = True
+                    logger.info("Stream: entering classify_intent")
                 elif evt_type == "on_chain_end" and evt_name == "classify_intent":
                     in_intermediate_node = False
+                    logger.info("Stream: leaving classify_intent")
 
                 # Only emit LLM chunks from final nodes (sql_react / chat_direct)
+                if evt_type == "on_chat_model_stream":
+                    logger.info("Stream: LLM chunk, intermediate=%s, content=%r", in_intermediate_node, event["data"]["chunk"].content[:20] if event["data"]["chunk"].content else "")
                 if evt_type == "on_chat_model_stream" and not in_intermediate_node:
                     chunk = event["data"]["chunk"]
                     if chunk.content:
