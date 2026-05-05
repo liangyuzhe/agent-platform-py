@@ -13,6 +13,8 @@
 9. [工具层设计](#9-工具层设计)
 10. [API 层设计](#10-api-层设计)
 11. [配置与部署](#11-配置与部署)
+12. [财务 Copilot 演进路线](#12-财务-copilot-演进路线)
+13. [RAG 检索质量评估框架](#13-rag-检索质量评估框架)
 
 ---
 
@@ -31,6 +33,7 @@
 | 数据分析 | SQL 结果 → 统计分析 → 图表生成 → 文字报告 |
 | 对话记忆 | 三级记忆（工作记忆 + 摘要记忆 + 知识记忆） |
 | SFT 数据采集 | 自动收集 + 教师标注 + JSONL 导出 |
+| 检索评估 | LLM 自动生成评测集 + 多策略对比（Recall/MRR/NDCG） |
 
 ### 1.3 设计亮点
 
@@ -597,6 +600,143 @@ pip install -e .
 - USDT/USD 汇率换算
 - 结算单自动生成
 - 异常工单自动发起
+
+---
+
+## 13. RAG 检索质量评估框架
+
+### 13.1 概述
+
+为量化比较不同检索策略的效果，构建了自动化评估框架。通过 LLM 自动生成评测数据集，对多种检索配置进行 Recall@K、MRR、NDCG@K 等指标的对比评估。
+
+### 13.2 评测数据集生成
+
+使用 LLM 从 Milvus 中已索引的 schema 文档自动生成 `(query, relevant_doc_ids)` 标注对：
+
+```bash
+python -m agents.eval.cli generate --num-per-table 3 --output eval_dataset.jsonl
+```
+
+**生成策略**：
+- 遍历每个已索引的表 schema
+- LLM 为每个表生成 3 条 query：至少 1 条单表查询 + 至少 1 条多表关联查询
+- query 模拟真实业务人员的自然语言提问方式
+- 自动去重
+
+**数据格式**（JSONL）：
+```json
+{"query": "查询所有会计科目的余额方向", "relevant_doc_ids": ["schema_t_account"]}
+{"query": "查看2025年每个成本中心的预算和实际发生额对比", "relevant_doc_ids": ["schema_t_budget", "schema_t_cost_center"]}
+```
+
+**当前数据集规模**：37 条 query，覆盖 15 张财务业务表。
+
+### 13.3 评估指标
+
+| 指标 | 说明 | 公式 |
+|------|------|------|
+| Recall@K | Top-K 结果中命中相关文档的比例 | `hits_in_top_k / total_relevant` |
+| MRR | 第一个相关文档的排名倒数 | `1 / rank_of_first_relevant` |
+| NDCG@K | 归一化折扣累积增益（二元相关性） | `DCG@K / IDCG@K` |
+
+评估函数实现：`agents/eval/metrics.py`
+
+```python
+from agents.eval.metrics import evaluate_single, aggregate_metrics
+
+# 单条 query 评估
+result = evaluate_single(
+    retrieved_ids=["schema_t_account", "schema_t_budget"],
+    relevant_ids={"schema_t_account"},
+    k_values=[1, 3, 5, 10],
+)
+# {"mrr": 1.0, "recall@1": 1.0, "recall@5": 1.0, "ndcg@5": 1.0, ...}
+```
+
+### 13.4 评测策略配置
+
+对比 5 种检索策略变体：
+
+| 策略 | mode | Reranker | 阈值 | 说明 |
+|------|------|----------|------|------|
+| `hybrid_rerank` | traditional | bge-reranker-v2-m3 | 0.01~0.3 | 当前默认，混合 + 重排序 |
+| `hybrid_no_rerank` | traditional | None | - | 混合检索，无重排序 |
+| `vector_only` | vector_only | None | - | 仅 Milvus 向量检索 |
+| `es_only` | es_only | None | - | 仅 ES BM25 关键词检索 |
+| `parent_doc` | parent | bge-reranker-v2-m3 | - | 子块检索 → 父块扩展 |
+
+运行评估：
+```bash
+python -m agents.eval.cli run --dataset eval_dataset.jsonl --output eval_report.json --detail
+```
+
+### 13.5 评估结果（2025-05-05）
+
+**测试环境**：15 张财务业务表 schema，37 条 LLM 生成的评测 query。
+
+#### 第一轮：默认阈值（threshold=0.3）
+
+| 策略 | MRR | Recall@1 | Recall@5 | NDCG@5 | 延迟 |
+|------|-----|----------|----------|--------|------|
+| hybrid_rerank (t=0.3) | 0.73 | 0.50 | 0.57 | 0.61 | 1010ms |
+| hybrid_no_rerank | **0.96** | 0.60 | **0.94** | **0.92** | 289ms |
+| vector_only | **0.97** | **0.62** | **0.94** | **0.93** | 225ms |
+| es_only | 0.00 | 0.00 | 0.00 | 0.00 | 216ms |
+| parent_doc | 0.00 | 0.00 | 0.00 | 0.00 | 21ms |
+
+#### 第二轮：调整 Reranker 阈值
+
+| 策略 | MRR | Recall@1 | Recall@5 | NDCG@5 | 延迟 |
+|------|-----|----------|----------|--------|------|
+| hybrid_rerank (t=0.01) | 0.89 | 0.60 | 0.81 | 0.82 | 934ms |
+| hybrid_rerank (t=0.05) | 0.81 | 0.56 | 0.67 | 0.70 | 807ms |
+| hybrid_no_rerank | 0.96 | 0.60 | 0.94 | 0.92 | 291ms |
+| vector_only | **0.97** | **0.62** | **0.94** | **0.93** | 196ms |
+
+### 13.6 关键发现
+
+1. **Reranker 在 schema 检索场景是负优化**
+   - `bge-reranker-v2-m3` 对「自然语言 → DDL schema」匹配给出的绝对分数很低（最相关文档仅 ~0.14）
+   - 默认阈值 0.3 过滤掉所有结果；即使降到 0.01，recall@5 仍从 0.94 降至 0.81
+   - 延迟增加 4 倍（934ms vs 196ms）
+   - **原因**：Cross-Encoder 模型对中文 schema DDL 格式的语义理解不足
+
+2. **纯向量检索效果最佳**
+   - `vector_only` 的 MRR=0.97、Recall@5=0.94，均优于所有混合策略
+   - 对于「自然语言问题 → 表结构」这种语义匹配场景，dense embedding 足够
+   - BM25 关键词匹配未带来额外收益
+
+3. **ES BM25 对 schema 检索无贡献**
+   - ES 存储时直接使用 `es.index()` API，metadata 未按 langchain `ElasticsearchStore` 格式写入
+   - 检索返回的 Document metadata 为空，导致 doc_id 无法匹配
+   - 需修复 ES 存储格式或适配 metadata 读取
+
+4. **Parent Document RAG 需要独立索引**
+   - schema 文档仅索引到主集合（`GoAgent`），未索引到 `rag_children` / `rag_parents`
+   - 该策略适用于文件类文档，不适用于 schema 检索
+
+### 13.7 优化建议
+
+| 优化项 | 建议 | 预期效果 |
+|--------|------|---------|
+| Schema 检索默认策略 | 改为 `vector_only`，禁用 reranker | Recall@5 提升至 0.94，延迟降至 ~200ms |
+| Reranker 使用场景 | 仅在文件文档检索（非 schema）中启用 | 避免 schema 检索被误伤 |
+| ES metadata 修复 | 改用 `ElasticsearchStore.add_documents()` 写入 | 修复 ES 检索的 doc_id 匹配问题 |
+| 阈值调优 | 若必须用 reranker，阈值设为 0.01 | 保留更多正确结果 |
+
+### 13.8 文件清单
+
+| 文件 | 说明 |
+|------|------|
+| `agents/eval/__init__.py` | 模块入口 |
+| `agents/eval/dataset_generator.py` | LLM 自动生成评测数据集 |
+| `agents/eval/metrics.py` | Recall@K、MRR、NDCG@K 指标计算 |
+| `agents/eval/runner.py` | 多策略评估运行器 + 报告生成 |
+| `agents/eval/cli.py` | CLI 入口（generate / run / detail） |
+| `tests/test_eval_metrics.py` | 指标单元测试（18 个） |
+| `scripts/seed_financial.py` | 财务测试数据种子脚本 |
+| `eval_dataset.jsonl` | 评测数据集（37 条） |
+| `eval_report.json` | 评估报告 JSON |
 
 ---
 

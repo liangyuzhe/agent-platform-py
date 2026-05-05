@@ -1,0 +1,37 @@
+{"query": "列出所有已启用的资产类一级会计科目", "relevant_doc_ids": ["schema_t_account"]}
+{"query": "查询2024年5月每个成本中心的预算科目及其对应的预算和实际发生额", "relevant_doc_ids": ["schema_t_account", "schema_t_budget", "schema_t_cost_center"]}
+{"query": "查看本月已过账的所有凭证行对应的科目名称和余额方向", "relevant_doc_ids": ["schema_t_account", "schema_t_journal_entry", "schema_t_journal_item"]}
+{"query": "2024年3月状态为执行中的预算，总预算金额是多少？", "relevant_doc_ids": ["schema_t_budget"]}
+{"query": "2024年上半年‘研发部’下属成本中心的预算实际支出金额和预算金额的对比情况如何？", "relevant_doc_ids": ["schema_t_budget", "schema_t_cost_center", "schema_t_department"]}
+{"query": "请列出2023年所有未启用的科目对应的已关闭预算记录的预算金额总和", "relevant_doc_ids": ["schema_t_budget", "schema_t_account"]}
+{"query": "启用的成本中心有哪些，请列出它们的编码、名称和负责人？", "relevant_doc_ids": ["schema_t_cost_center"]}
+{"query": "各个正常状态的部门分别关联了哪些启用的成本中心，给出部门名称和对应的成本中心名称？", "relevant_doc_ids": ["schema_t_cost_center", "schema_t_department"]}
+{"query": "2024年1月各启用成本中心的预算金额总和和实际金额总和分别是多少？", "relevant_doc_ids": ["schema_t_cost_center", "schema_t_budget"]}
+{"query": "查询所有状态正常的部门信息，包括部门名称、负责人和联系电话", "relevant_doc_ids": ["schema_t_department"]}
+{"query": "2024年5月份所有“已付款”状态的餐饮报销单有哪些？", "relevant_doc_ids": ["schema_t_expense_claim"]}
+{"query": "市场部近三个月审批金额与报销总额的差值超过10%的报销记录有哪些？", "relevant_doc_ids": ["schema_t_expense_claim", "schema_t_department"]}
+{"query": "查询每个成本中心2023年度所有“已审批”状态的办公类报销总金额？", "relevant_doc_ids": ["schema_t_expense_claim", "schema_t_cost_center"]}
+{"query": "所有在用的电子设备原值合计是多少？", "relevant_doc_ids": ["schema_t_fixed_asset"]}
+{"query": "各成本中心保管的闲置机器设备分别有多少台？", "relevant_doc_ids": ["schema_t_fixed_asset", "schema_t_cost_center"]}
+{"query": "2023年购入且存放地点在总部大楼的固定资产月折旧额总额是多少？", "relevant_doc_ids": ["schema_t_fixed_asset"]}
+{"query": "查询2024年3月所有已执行的银行转账，列出对应的划转单号、金额和申请人", "relevant_doc_ids": ["schema_t_fund_transfer"]}
+{"query": "2023年7月1日到12月31日期间开的所有增值税专用发票的价税合计总和是多少？", "relevant_doc_ids": ["schema_t_invoice"]}
+{"query": "已认证的进项发票对应的往来单位的未结应收应付金额是多少？", "relevant_doc_ids": ["schema_t_invoice", "schema_t_receivable_payable"]}
+{"query": "哪些过账的会计凭证关联了红冲状态的电子发票？请列出凭证号和对应的红冲电子发票号码。", "relevant_doc_ids": ["schema_t_invoice", "schema_t_journal_entry"]}
+{"query": "2024年3月（会计期间2024-03）的已过账凭证总共有多少条？", "relevant_doc_ids": ["schema_t_journal_entry"]}
+{"query": "查询所有凭证行号为1的分录摘要和对应的借方金额", "relevant_doc_ids": ["schema_t_journal_item"]}
+{"query": "统计2024年6月各科目编码对应的总借方发生额，要求关联显示科目名称和科目类型", "relevant_doc_ids": ["schema_t_journal_item", "schema_t_journal_entry", "schema_t_account"]}
+{"query": "查找所有关联了成本中心的凭证分录，显示成本中心名称、凭证号、摘要和借贷方金额", "relevant_doc_ids": ["schema_t_journal_item", "schema_t_journal_entry", "schema_t_cost_center"]}
+{"query": "当前所有状态为逾期的应收单据的原始金额、往来单位和到期日分别是多少？", "relevant_doc_ids": ["schema_t_receivable_payable"]}
+{"query": "关联了正常状态发票的未结清应付账款有哪些？需要显示往来单位、原始金额、已结金额及对应的发票号码和价税合计。", "relevant_doc_ids": ["schema_t_receivable_payable", "schema_t_invoice"]}
+{"query": "请列出近半年已审批且已付款的报销单对应的，通过关联发票核销的应付账款信息，包括报销单号、应付单据号、往来单位和已结金额。", "relevant_doc_ids": ["schema_t_receivable_payable", "schema_t_invoice", "schema_t_expense_claim"]}
+{"query": "系统里有哪些状态正常的角色？请列出它们的名称和编码。", "relevant_doc_ids": ["schema_t_role"]}
+{"query": "系统中各部门负责人分别拥有哪些状态正常的系统角色？请同时展示负责人的真实姓名和所属部门名称。", "relevant_doc_ids": ["schema_t_role", "schema_t_user_role", "schema_t_user", "schema_t_user_department", "schema_t_department"]}
+{"query": "拥有状态正常且编码前缀为SYS的系统角色的用户，他们的真实姓名和联系电话分别是什么？", "relevant_doc_ids": ["schema_t_role", "schema_t_user_role", "schema_t_user"]}
+{"query": "帮我查出所有状态为正常且性别为女的用户信息", "relevant_doc_ids": ["schema_t_user"]}
+{"query": "查询所有拥有部门负责人身份的用户的真实姓名、联系电话以及所在部门的名称", "relevant_doc_ids": ["schema_t_user", "schema_t_user_department", "schema_t_department"]}
+{"query": "找出所有拥有特定角色（比如会计角色）的用户的用户名、真实姓名和该角色的描述", "relevant_doc_ids": ["schema_t_user", "schema_t_role", "schema_t_user_role"]}
+{"query": "查询所有标记为部门负责人的用户与部门的关联信息", "relevant_doc_ids": ["schema_t_user_department"]}
+{"query": "查询所有创建于2024年1月的用户角色分配记录", "relevant_doc_ids": ["schema_t_user_role"]}
+{"query": "查看真实姓名为张三的用户分配了哪些角色", "relevant_doc_ids": ["schema_t_user_role", "schema_t_user", "schema_t_role"]}
+{"query": "统计每个角色当前有多少个正常状态的用户被分配", "relevant_doc_ids": ["schema_t_user_role", "schema_t_user", "schema_t_role"]}

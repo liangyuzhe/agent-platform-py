@@ -165,9 +165,12 @@ def _store_schema_docs(docs: list[Document]) -> dict:
     except Exception:
         pass
 
-    # Embed and insert
+    # Embed and insert (batch to avoid embedding API limits)
     texts = [d.page_content for d in docs]
-    vectors = embeddings.embed_documents(texts)
+    vectors = []
+    batch_size = 10
+    for i in range(0, len(texts), batch_size):
+        vectors.extend(embeddings.embed_documents(texts[i : i + batch_size]))
 
     records = []
     for doc, doc_id, vector in zip(docs, doc_ids, vectors):

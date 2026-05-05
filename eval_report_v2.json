@@ -1,0 +1,70 @@
+[
+  {
+    "strategy": "hybrid_rerank_t0.01",
+    "description": "Hybrid + RRF + Rerank (threshold=0.01)",
+    "num_queries": 37,
+    "avg_latency_ms": 933.6,
+    "metrics": {
+      "mrr": 0.8919,
+      "recall@1": 0.6045,
+      "ndcg@1": 0.8919,
+      "recall@3": 0.7847,
+      "ndcg@3": 0.8128,
+      "recall@5": 0.8072,
+      "ndcg@5": 0.8206,
+      "recall@10": 0.8072,
+      "ndcg@10": 0.8206
+    }
+  },
+  {
+    "strategy": "hybrid_rerank_t0.05",
+    "description": "Hybrid + RRF + Rerank (threshold=0.05)",
+    "num_queries": 37,
+    "avg_latency_ms": 806.9,
+    "metrics": {
+      "mrr": 0.8108,
+      "recall@1": 0.555,
+      "ndcg@1": 0.8108,
+      "recall@3": 0.6676,
+      "ndcg@3": 0.7045,
+      "recall@5": 0.6676,
+      "ndcg@5": 0.701,
+      "recall@10": 0.6676,
+      "ndcg@10": 0.701
+    }
+  },
+  {
+    "strategy": "hybrid_no_rerank",
+    "description": "Hybrid + RRF, no reranker",
+    "num_queries": 37,
+    "avg_latency_ms": 291.2,
+    "metrics": {
+      "mrr": 0.9595,
+      "recall@1": 0.5955,
+      "ndcg@1": 0.9189,
+      "recall@3": 0.8946,
+      "ndcg@3": 0.9018,
+      "recall@5": 0.9396,
+      "ndcg@5": 0.9211,
+      "recall@10": 0.9396,
+      "ndcg@10": 0.9211
+    }
+  },
+  {
+    "strategy": "vector_only",
+    "description": "Milvus vector search only",
+    "num_queries": 37,
+    "avg_latency_ms": 195.6,
+    "metrics": {
+      "mrr": 0.973,
+      "recall@1": 0.618,
+      "ndcg@1": 0.9459,
+      "recall@3": 0.9171,
+      "ndcg@3": 0.9275,
+      "recall@5": 0.9396,
+      "ndcg@5": 0.9326,
+      "recall@10": 0.9396,
+      "ndcg@10": 0.9326
+    }
+  }
+]

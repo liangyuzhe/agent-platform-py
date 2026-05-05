@@ -1,0 +1,87 @@
+[
+  {
+    "strategy": "hybrid_rerank",
+    "description": "Hybrid (Milvus + ES BM25) + RRF + Cross-Encoder rerank",
+    "num_queries": 37,
+    "avg_latency_ms": 1009.9,
+    "metrics": {
+      "mrr": 0.7297,
+      "recall@1": 0.4955,
+      "ndcg@1": 0.7297,
+      "recall@3": 0.5676,
+      "ndcg@3": 0.6066,
+      "recall@5": 0.5676,
+      "ndcg@5": 0.6066,
+      "recall@10": 0.5676,
+      "ndcg@10": 0.6066
+    }
+  },
+  {
+    "strategy": "hybrid_no_rerank",
+    "description": "Hybrid (Milvus + ES BM25) + RRF, no reranker",
+    "num_queries": 37,
+    "avg_latency_ms": 288.8,
+    "metrics": {
+      "mrr": 0.9595,
+      "recall@1": 0.5955,
+      "ndcg@1": 0.9189,
+      "recall@3": 0.8946,
+      "ndcg@3": 0.9018,
+      "recall@5": 0.9396,
+      "ndcg@5": 0.9211,
+      "recall@10": 0.9396,
+      "ndcg@10": 0.9211
+    }
+  },
+  {
+    "strategy": "vector_only",
+    "description": "Milvus vector search only (dense)",
+    "num_queries": 37,
+    "avg_latency_ms": 224.6,
+    "metrics": {
+      "mrr": 0.973,
+      "recall@1": 0.618,
+      "ndcg@1": 0.9459,
+      "recall@3": 0.9171,
+      "ndcg@3": 0.9275,
+      "recall@5": 0.9396,
+      "ndcg@5": 0.9326,
+      "recall@10": 0.9396,
+      "ndcg@10": 0.9326
+    }
+  },
+  {
+    "strategy": "es_only",
+    "description": "Elasticsearch BM25 only (sparse)",
+    "num_queries": 37,
+    "avg_latency_ms": 215.9,
+    "metrics": {
+      "mrr": 0.0,
+      "recall@1": 0.0,
+      "ndcg@1": 0.0,
+      "recall@3": 0.0,
+      "ndcg@3": 0.0,
+      "recall@5": 0.0,
+      "ndcg@5": 0.0,
+      "recall@10": 0.0,
+      "ndcg@10": 0.0
+    }
+  },
+  {
+    "strategy": "parent_doc",
+    "description": "Parent document retriever (child→parent expansion)",
+    "num_queries": 37,
+    "avg_latency_ms": 20.9,
+    "metrics": {
+      "mrr": 0.0,
+      "recall@1": 0.0,
+      "ndcg@1": 0.0,
+      "recall@3": 0.0,
+      "ndcg@3": 0.0,
+      "recall@5": 0.0,
+      "ndcg@5": 0.0,
+      "recall@10": 0.0,
+      "ndcg@10": 0.0
+    }
+  }
+]
