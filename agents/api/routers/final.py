@@ -133,8 +133,8 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
     async def generate() -> AsyncGenerator[dict, None]:
         yield {"event": "start", "data": ""}
         final_result = None
-        # Skip LLM output from intermediate nodes (e.g. classify_intent)
         in_intermediate_node = False
+        event_count = 0
 
         try:
             async for event in graph.astream_events(
@@ -144,18 +144,13 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
             ):
                 evt_type = event["event"]
                 evt_name = event.get("name", "")
+                event_count += 1
 
                 # Track intermediate graph nodes to filter their LLM output
                 if evt_type == "on_chain_start" and evt_name == "classify_intent":
                     in_intermediate_node = True
-                    logger.info("Stream: entering classify_intent")
                 elif evt_type == "on_chain_end" and evt_name == "classify_intent":
                     in_intermediate_node = False
-                    logger.info("Stream: leaving classify_intent")
-
-                # Log all events for debugging
-                if evt_type not in ("on_llm_start", "on_llm_end"):
-                    logger.info("Stream evt: %s name=%s", evt_type, evt_name)
 
                 # Only emit LLM chunks from final nodes (sql_react / chat_direct)
                 if evt_type == "on_chat_model_stream" and not in_intermediate_node:
@@ -164,6 +159,8 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
                         yield {"event": "data", "data": chunk.content}
                 elif evt_type == "on_chain_end" and evt_name == "LangGraph":
                     final_result = event["data"].get("output")
+
+            yield {"event": "debug", "data": f"events={event_count}"}
         except Exception as e:
             logger.exception("Final graph stream error")
             yield {"event": "error", "data": str(e)}
