@@ -160,6 +160,35 @@
     </div>
 
     <script>
+        // --- SSE helpers ---
+        function parseSSEBlock(block) {
+            const lines = block.split('\n');
+            let eventType = 'message', eventData = '';
+            for (const line of lines) {
+                if (line.startsWith('event:')) eventType = line.slice(6).trim();
+                else if (line.startsWith('data:')) eventData = line.slice(5).trim();
+            }
+            return {event: eventType, data: eventData};
+        }
+
+        async function readSSEStream(resp, onEvent) {
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, {stream: true});
+                let parts = buffer.split('\n\n');
+                buffer = parts.pop();
+                for (const part of parts) {
+                    if (part.trim()) onEvent(parseSSEBlock(part));
+                }
+            }
+            // Process remaining buffer
+            if (buffer.trim()) onEvent(parseSSEBlock(buffer));
+        }
+
         // --- Tab switching ---
         function switchTab(name) {
             const tabs = ['chat', 'agent', 'upload', 'admin'];
@@ -204,30 +233,13 @@
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const reader = resp.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, {stream: true});
-                        let parts = buffer.split('\n\n');
-                        buffer = parts.pop();
-                        for (const part of parts) {
-                            const lines = part.split('\n');
-                            let eventType = 'message';
-                            let eventData = '';
-                            for (const line of lines) {
-                                if (line.startsWith('event:')) eventType = line.slice(6).trim();
-                                else if (line.startsWith('data:')) eventData = line.slice(5).trim();
-                            }
-                            if (eventType === 'done') continue;
-                            if (eventType === 'error') { fullContent += '\n错误: ' + eventData; continue; }
-                            if (eventData) fullContent += eventData;
-                        }
+                    await readSSEStream(resp, ({event, data}) => {
+                        if (event === 'done') return;
+                        if (event === 'error') { fullContent += '\n错误: ' + data; return; }
+                        if (data) fullContent += data;
                         bubble.textContent = fullContent || '思考中...';
                         messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    }
+                    });
                     if (!fullContent) bubble.textContent = '(无响应)';
                 }
             } catch (e) {
@@ -269,35 +281,17 @@
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
-                    const reader = resp.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        buffer += decoder.decode(value, {stream: true});
-                        let parts = buffer.split('\n\n');
-                        buffer = parts.pop();
-                        for (const part of parts) {
-                            const lines = part.split('\n');
-                            let eventType = 'message';
-                            let eventData = '';
-                            for (const line of lines) {
-                                if (line.startsWith('event:')) eventType = line.slice(6).trim();
-                                else if (line.startsWith('data:')) eventData = line.slice(5).trim();
-                            }
-                            if (eventType === 'start' || eventType === 'done') continue;
-                            if (eventType === 'error') { fullContent += '\n错误: ' + eventData; continue; }
-                            if (eventType === 'approval') {
-                                try { approvalData = JSON.parse(eventData); } catch {}
-                                continue;
-                            }
-                            if (eventType === 'data' && eventData) fullContent += eventData;
+                    await readSSEStream(resp, ({event, data}) => {
+                        if (event === 'start' || event === 'done') return;
+                        if (event === 'error') { fullContent += '\n错误: ' + data; return; }
+                        if (event === 'approval') {
+                            try { approvalData = JSON.parse(data); } catch {}
+                            return;
                         }
+                        if (event === 'data' && data) fullContent += data;
                         bubble.textContent = fullContent || '思考中...';
                         sqlMessages.scrollTop = sqlMessages.scrollHeight;
-                    }
-                    // Render final result
+                    });
                     if (approvalData) {
                         bubble.innerHTML = '';
                         renderAgentResponse(div, {
