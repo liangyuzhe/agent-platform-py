@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from typing import AsyncGenerator, Literal
+from typing import Literal
 
 from agents.flow.rag_chat import build_rag_chat_graph
 from agents.api.sse import sse_response
