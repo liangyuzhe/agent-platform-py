@@ -108,7 +108,6 @@
                 <div class="input-area">
                     <input type="text" id="query" placeholder="输入你的问题..." onkeydown="if(event.key==='Enter')send()">
                     <button onclick="send()" id="btn">发送</button>
-                    <button onclick="testSSE()" style="background:#999;font-size:12px;padding:12px 12px;">Test</button>
                 </div>
             </div>
         </div>
@@ -245,44 +244,6 @@
             btn.disabled = false;
         }
 
-        async function testSSE() {
-            const div = addMessage(messagesDiv, 'assistant', '');
-            const bubble = div.querySelector('.bubble');
-            bubble.textContent = 'testing...';
-            try {
-                const resp = await fetch('/api/rag/test/stream2', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query: 'hi', session_id: 'test_' + Date.now()}),
-                });
-                console.log('[Test] status:', resp.status, 'type:', resp.headers.get('content-type'));
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-                let count = 0;
-                while (true) {
-                    const {done, value} = await reader.read();
-                    if (done) break;
-                    count++;
-                    const chunk = decoder.decode(value, {stream: true});
-                    console.log('[Test chunk #' + count + ']', JSON.stringify(chunk));
-                    buffer += chunk;
-                    let parts = buffer.split('\r\n\r\n');
-                    buffer = parts.pop();
-                    for (const part of parts) {
-                        if (!part.trim()) continue;
-                        const ev = parseSSEBlock(part);
-                        console.log('[Test parsed]', ev.event, JSON.stringify(ev.data));
-                        if (ev.event !== 'done' && ev.data) bubble.textContent += ' ' + ev.data;
-                    }
-                }
-                console.log('[Test] done, chunks:', count);
-            } catch (e) {
-                console.error('[Test] error:', e);
-                bubble.textContent = 'error: ' + e.message;
-            }
-        }
-
         // --- SQL Agent ---
         const sqlMessages = document.getElementById('sqlMessages');
         const sqlQuery = document.getElementById('sqlQuery');
@@ -314,27 +275,21 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
-                console.log('[Agent] status:', resp.status, 'type:', resp.headers.get('content-type'));
                 if (!resp.ok) {
                     bubble.textContent = '请求失败: HTTP ' + resp.status;
                 } else {
                     const reader = resp.body.getReader();
                     const decoder = new TextDecoder();
                     let buffer = '';
-                    let chunkCount = 0;
                     while (true) {
                         const {done, value} = await reader.read();
                         if (done) break;
-                        chunkCount++;
-                        const chunk = decoder.decode(value, {stream: true});
-                        buffer += chunk;
-                        console.log('[Agent chunk #' + chunkCount + ']', JSON.stringify(chunk));
+                        buffer += decoder.decode(value, {stream: true});
                         let parts = buffer.split('\r\n\r\n');
                         buffer = parts.pop();
                         for (const part of parts) {
                             if (!part.trim()) continue;
                             const ev = parseSSEBlock(part);
-                            console.log('[Agent parsed]', ev.event, JSON.stringify(ev.data));
                             if (ev.event === 'start' || ev.event === 'done') continue;
                             if (ev.event === 'error') { fullContent += '\n错误: ' + ev.data; continue; }
                             if (ev.event === 'approval') {
@@ -343,18 +298,7 @@
                             }
                             if (ev.event === 'data' && ev.data) fullContent += ev.data;
                         }
-                        for (const part of parts) {
-                            if (!part.trim()) continue;
-                            const ev = parseSSEBlock(part);
-                            if (ev.event === 'start' || ev.event === 'done') continue;
-                            if (ev.event === 'error') { fullContent += '\n错误: ' + ev.data; continue; }
-                            if (ev.event === 'approval') {
-                                try { approvalData = JSON.parse(ev.data); } catch {}
-                                continue;
-                            }
-                            if (ev.event === 'data' && ev.data) fullContent += ev.data;
-                        }
-                        bubble.textContent = fullContent;
+                        if (fullContent) bubble.textContent = fullContent;
                         sqlMessages.scrollTop = sqlMessages.scrollHeight;
                     }
                     if (buffer.trim()) {
@@ -375,10 +319,8 @@
                     } else {
                         bubble.textContent = '(无响应)';
                     }
-                    console.log('[Agent] done, length:', fullContent.length, 'approval:', !!approvalData);
                 }
             } catch (e) {
-                console.error('[Agent] error:', e);
                 bubble.textContent = '请求失败: ' + e.message;
             }
             agentBtn.disabled = false;
