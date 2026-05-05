@@ -30,6 +30,11 @@ class FinalResponse(BaseModel):
     sql: str = ""
 
 
+class ClassifyResponse(BaseModel):
+    intent: str
+    session_id: str
+
+
 class ApproveRequest(BaseModel):
     session_id: str = "default_user"
     approved: bool = True
@@ -57,6 +62,17 @@ def _extract_interrupt(result: dict) -> dict | None:
     if isinstance(value, list) and value:
         value = value[0]
     return value if isinstance(value, dict) else None
+
+
+@router.post("/classify", response_model=ClassifyResponse)
+async def classify_intent_endpoint(req: FinalRequest):
+    """意图分类（非流式），前端据此选择流式端点。"""
+    from agents.flow.final_graph import classify_intent
+    result = await classify_intent({"query": req.query})
+    return ClassifyResponse(
+        intent=result.get("intent", "chat"),
+        session_id=req.session_id,
+    )
 
 
 @router.post("/invoke", response_model=FinalResponse)

@@ -266,26 +266,75 @@
             addAgentMessage('user', escHtml(query));
             const div = addAgentMessage('assistant', '');
             const bubble = div.querySelector('.bubble');
-            let dots = 0;
-            const loading = setInterval(() => {
-                dots = (dots + 1) % 4;
-                bubble.textContent = '思考中' + '.'.repeat(dots);
-            }, 500);
+            bubble.textContent = '思考中...';
             try {
-                const resp = await fetch('/api/final/invoke', {
+                // Step 1: Classify intent
+                const clsResp = await fetch('/api/final/classify', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
-                clearInterval(loading);
-                if (!resp.ok) {
-                    bubble.textContent = '请求失败: HTTP ' + resp.status;
+                if (!clsResp.ok) {
+                    bubble.textContent = '意图分类失败: HTTP ' + clsResp.status;
+                    agentBtn.disabled = false;
+                    return;
+                }
+                const {intent} = await clsResp.json();
+
+                if (intent === 'sql_query') {
+                    // SQL path: non-streaming (needs approval flow)
+                    let dots = 0;
+                    const loading = setInterval(() => {
+                        dots = (dots + 1) % 4;
+                        bubble.textContent = '生成 SQL' + '.'.repeat(dots);
+                    }, 500);
+                    const resp = await fetch('/api/final/invoke', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({query, session_id: sessionId}),
+                    });
+                    clearInterval(loading);
+                    if (!resp.ok) {
+                        bubble.textContent = '请求失败: HTTP ' + resp.status;
+                    } else {
+                        const data = await resp.json();
+                        renderAgentResponse(div, data);
+                    }
                 } else {
-                    const data = await resp.json();
-                    renderAgentResponse(div, data);
+                    // Chat/Knowledge path: streaming
+                    const resp = await fetch('/api/rag/chat/stream', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({query, session_id: sessionId}),
+                    });
+                    if (!resp.ok) {
+                        bubble.textContent = '请求失败: HTTP ' + resp.status;
+                    } else {
+                        let fullContent = '';
+                        const reader = resp.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        while (true) {
+                            const {done, value} = await reader.read();
+                            if (done) break;
+                            buffer += decoder.decode(value, {stream: true});
+                            let parts = buffer.split('\r\n\r\n');
+                            buffer = parts.pop();
+                            for (const part of parts) {
+                                if (!part.trim()) continue;
+                                const ev = parseSSEBlock(part);
+                                if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+                            }
+                            if (fullContent) bubble.textContent = fullContent;
+                        }
+                        if (buffer.trim()) {
+                            const ev = parseSSEBlock(buffer);
+                            if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+                        }
+                        bubble.textContent = fullContent || '(无响应)';
+                    }
                 }
             } catch (e) {
-                clearInterval(loading);
                 bubble.textContent = '请求失败: ' + e.message;
             }
             agentBtn.disabled = false;
