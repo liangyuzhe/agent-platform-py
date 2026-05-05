@@ -350,7 +350,7 @@ class TestSqlGenerate:
         assert result["is_sql"] is True
 
     @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.get_hybrid_retriever")
+    @patch("agents.flow.sql_react.get_vector_only_retriever")
     @patch("agents.flow.sql_react.settings")
     @patch("agents.flow.sql_react.create_format_tool")
     @patch("agents.flow.sql_react.get_chat_model")

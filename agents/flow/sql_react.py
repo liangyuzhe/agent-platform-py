@@ -11,7 +11,7 @@ from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
-from agents.rag.retriever import get_hybrid_retriever
+from agents.rag.retriever import get_vector_only_retriever
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
@@ -27,7 +27,7 @@ _MAX_RETRIES = 3
 
 async def sql_retrieve(state: SQLReactState, config=None) -> dict:
     """检索表结构信息。"""
-    retriever = get_hybrid_retriever()
+    retriever = get_vector_only_retriever()
     callbacks = (config or {}).get("callbacks", [])
     docs = await asyncio.to_thread(retriever.retrieve, state["query"], callbacks=callbacks)
     return {"docs": docs}
@@ -79,7 +79,7 @@ _MAX_TABLE_SEARCH_ROUNDS = 3
 async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: list) -> list:
     """Re-retrieve schema docs for missing table names."""
     from langchain_core.documents import Document
-    retriever = get_hybrid_retriever()
+    retriever = get_vector_only_retriever()
     new_docs = []
     for table_name in missing_tables:
         try:
