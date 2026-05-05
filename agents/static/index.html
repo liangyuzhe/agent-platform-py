@@ -204,51 +204,7 @@
             queryInput.value = '';
             btn.disabled = true;
             addMessage(messagesDiv, 'user', query);
-            const div = addMessage(messagesDiv, 'assistant', '');
-            const bubble = div.querySelector('.bubble');
-            bubble.textContent = '思考中...';
-            let fullContent = '';
-            try {
-                const resp = await fetch('/api/rag/test/stream2', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query, session_id: sessionId}),
-                });
-                console.log('[Chat] status:', resp.status, 'type:', resp.headers.get('content-type'));
-                if (!resp.ok) {
-                    bubble.textContent = '请求失败: HTTP ' + resp.status;
-                } else {
-                    const reader = resp.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        const chunk = decoder.decode(value, {stream: true});
-                        buffer += chunk;
-                        let parts = buffer.split('\n\n');
-                        buffer = parts.pop();
-                        for (const part of parts) {
-                            if (!part.trim()) continue;
-                            const ev = parseSSEBlock(part);
-                            if (ev.event === 'done') continue;
-                            if (ev.data) fullContent += ev.data;
-                        }
-                        bubble.textContent = fullContent;
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    }
-                    // process remaining buffer
-                    if (buffer.trim()) {
-                        const ev = parseSSEBlock(buffer);
-                        if (ev.event !== 'done' && ev.data) fullContent += ev.data;
-                    }
-                    bubble.textContent = fullContent || '(无响应)';
-                    console.log('[Chat] done, length:', fullContent.length);
-                }
-            } catch (e) {
-                console.error('[Chat] error:', e);
-                bubble.textContent = '请求失败: ' + e.message;
-            }
+            await testSSE();
             btn.disabled = false;
         }
 
