@@ -257,7 +257,7 @@
             const bubble = div.querySelector('.bubble');
             bubble.textContent = 'testing...';
             try {
-                const resp = await fetch('/api/rag/test/stream');
+                const resp = await fetch('/api/rag/test/stream', {method: 'POST'});
                 console.log('[Test] status:', resp.status, 'type:', resp.headers.get('content-type'));
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();

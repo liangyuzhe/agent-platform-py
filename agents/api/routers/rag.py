@@ -63,9 +63,9 @@ async def rag_chat_stream_get(
     return await _stream_rag_chat(inp, request)
 
 
-@router.get("/test/stream")
+@router.post("/test/stream")
 async def rag_test_stream(request: Request):
-    """简单 SSE 测试端点。"""
+    """简单 SSE 测试端点 (POST)。"""
     import asyncio
 
     async def generate():
