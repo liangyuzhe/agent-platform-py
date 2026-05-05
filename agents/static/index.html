@@ -230,9 +230,12 @@
                         console.log('[send] read:', done, value ? value.length : 0);
                         if (done) break;
                         chunkCount++;
-                        buffer += decoder.decode(value, {stream: true});
+                        const decoded = decoder.decode(value, {stream: true});
+                        buffer += decoded;
+                        console.log('[send decoded]', JSON.stringify(decoded), 'buffer:', JSON.stringify(buffer));
                         let parts = buffer.split('\n\n');
                         buffer = parts.pop();
+                        console.log('[send parts]', parts.length, 'buffer now:', JSON.stringify(buffer));
                         for (const part of parts) {
                             if (!part.trim()) continue;
                             const ev = parseSSEBlock(part);
