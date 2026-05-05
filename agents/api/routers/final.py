@@ -152,6 +152,12 @@ async def final_invoke_stream(req: FinalRequest, request: Request):
                 elif evt_type == "on_chain_end" and evt_name == "classify_intent":
                     in_intermediate_node = False
 
+                # Log LLM stream events to see what names they have
+                if evt_type == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield {"event": "debug", "data": f"LLM name={evt_name} intermediate={in_intermediate_node} content={chunk.content[:20]}"}
+
                 # Only emit LLM chunks from final nodes (sql_react / chat_direct)
                 if evt_type == "on_chat_model_stream" and not in_intermediate_node:
                     chunk = event["data"]["chunk"]
