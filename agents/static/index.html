@@ -199,12 +199,50 @@
         }
 
         async function send() {
+            console.log('[send] called');
             const query = queryInput.value.trim();
             if (!query) return;
             queryInput.value = '';
             btn.disabled = true;
             addMessage(messagesDiv, 'user', query);
-            await testSSE();
+            const div = addMessage(messagesDiv, 'assistant', '');
+            const bubble = div.querySelector('.bubble');
+            bubble.textContent = '思考中...';
+            let fullContent = '';
+            try {
+                const resp = await fetch('/api/rag/chat/stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query, session_id: sessionId}),
+                });
+                if (!resp.ok) {
+                    bubble.textContent = '请求失败: HTTP ' + resp.status;
+                } else {
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        let parts = buffer.split('\n\n');
+                        buffer = parts.pop();
+                        for (const part of parts) {
+                            if (!part.trim()) continue;
+                            const ev = parseSSEBlock(part);
+                            if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+                        }
+                        if (fullContent) bubble.textContent = fullContent;
+                    }
+                    if (buffer.trim()) {
+                        const ev = parseSSEBlock(buffer);
+                        if (ev.event !== 'done' && ev.data) fullContent += ev.data;
+                    }
+                    bubble.textContent = fullContent || '(无响应)';
+                }
+            } catch (e) {
+                bubble.textContent = '请求失败: ' + e.message;
+            }
             btn.disabled = false;
         }
 
