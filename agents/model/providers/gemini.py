@@ -26,6 +26,8 @@ def _create_chat_model():
             model=settings.gemini.chat_model,
             api_key=settings.gemini.key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            request_timeout=60,
+            max_retries=2,
         )
 
 

@@ -64,13 +64,15 @@ async def init_mcp_tools() -> ClientSession:
     return await _connect()
 
 
-async def execute_sql(sql: str) -> str:
+async def execute_sql(sql: str, timeout: float | None = None) -> str:
     """Execute an arbitrary SQL statement via the MCP ``mysql_query`` tool.
 
     Parameters
     ----------
     sql:
         The SQL statement to execute.
+    timeout:
+        Maximum seconds to wait for the MCP server to respond.
 
     Returns
     -------
@@ -78,7 +80,11 @@ async def execute_sql(sql: str) -> str:
         The result payload returned by the MCP server (JSON-encoded).
     """
     session = await _connect()
-    result = await session.call_tool("mysql_query", {"sql": sql})
+    effective_timeout = timeout if timeout is not None else settings.resilience.sql_execution_timeout
+    result = await asyncio.wait_for(
+        session.call_tool("mysql_query", {"sql": sql}),
+        timeout=effective_timeout,
+    )
     # ``result.content`` is a list of content blocks; extract text.
     parts = []
     for block in result.content:

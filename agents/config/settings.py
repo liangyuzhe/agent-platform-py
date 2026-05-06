@@ -111,7 +111,7 @@ class MilvusSettings(BaseSettings):
         description="Minimum similarity score to keep a result",
     )
     collection_name: str = Field(
-        default="GoAgent",
+        default="knowledge_base",
         description="Default Milvus collection",
     )
     top_k: int = Field(default=5, description="Number of results to retrieve")
@@ -133,7 +133,7 @@ class ElasticSearchSettings(BaseSettings):
     )
     username: str = Field(default="", description="ES username")
     password: str = Field(default="", description="ES password")
-    index: str = Field(default="go_agent_docs", description="Default ES index name")
+    index: str = Field(default="knowledge_base", description="Default ES index name")
 
     @property
     def addresses(self) -> list[str]:
@@ -288,6 +288,33 @@ class MemorySettings(BaseSettings):
         return {k: v for k, v in data.items() if v != ""}
 
 
+class ResilienceSettings(BaseSettings):
+    """Timeout and retry configuration for external service calls."""
+
+    model_config = SettingsConfigDict(env_prefix="RESILIENCE_")
+
+    max_sql_retries: int = Field(
+        default=5,
+        description="Maximum SQL execution retries on retryable errors",
+    )
+    sql_execution_timeout: float = Field(
+        default=15,
+        description="SQL execution timeout in seconds",
+    )
+    milvus_timeout: float = Field(
+        default=8,
+        description="Milvus query timeout in seconds",
+    )
+    llm_timeout: float = Field(
+        default=60,
+        description="LLM API call timeout in seconds",
+    )
+    llm_rewrite_timeout: float = Field(
+        default=15,
+        description="LLM query rewrite/compress timeout in seconds",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level settings
 # ---------------------------------------------------------------------------
@@ -341,6 +368,7 @@ class Settings(BaseSettings):
     cozeloop: CozeLoopSettings = Field(default_factory=CozeLoopSettings)
     rag: RAGSettings = Field(default_factory=RAGSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    resilience: ResilienceSettings = Field(default_factory=ResilienceSettings)
 
 
 # ---------------------------------------------------------------------------

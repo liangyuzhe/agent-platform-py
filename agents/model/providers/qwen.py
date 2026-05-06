@@ -14,6 +14,8 @@ def _create_chat_model() -> ChatOpenAI:
         model=settings.qwen.chat_model,
         api_key=settings.qwen.key,
         base_url=settings.qwen.base_url,
+        request_timeout=60,
+        max_retries=2,
     )
 
 

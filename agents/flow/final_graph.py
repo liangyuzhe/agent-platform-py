@@ -30,6 +30,14 @@ async def classify_intent(state: FinalGraphState) -> dict:
 
     domain = await get_domain_summary()
 
+    # 构建对话历史上下文
+    chat_history = state.get("chat_history", [])
+    history_context = ""
+    if chat_history:
+        recent = chat_history[-6:]  # 最近 3 轮
+        lines = [f"[{h['role']}]: {h['content']}" for h in recent]
+        history_context = "\n\n最近对话历史:\n" + "\n".join(lines)
+
     response = await model.ainvoke([
         HumanMessage(content=f"""请判断以下用户问题的意图类型，只回答意图类别名称。
 
@@ -44,6 +52,7 @@ async def classify_intent(state: FinalGraphState) -> dict:
 - audit：审计追踪、凭证查询，如"查一下凭证 TX001 的流转"
 - knowledge：财务制度、会计准则、合规规则查询
 - chat：闲聊、通用问答、与上述无关的问题
+{history_context}
 
 用户问题: {state['query']}
 
@@ -66,7 +75,10 @@ async def sql_react(state: FinalGraphState, config=None) -> dict:
     from agents.flow.sql_react import build_sql_react_graph
     sql_graph = build_sql_react_graph()
     result = await sql_graph.ainvoke(
-        {"query": state["query"]},
+        {
+            "query": state["query"],
+            "chat_history": state.get("chat_history", []),
+        },
         config=config,
     )
     return {

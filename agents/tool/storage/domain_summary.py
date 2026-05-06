@@ -24,47 +24,67 @@ _summary_text: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# MySQL DDL / CRUD via MCP
+# MySQL DDL / CRUD via pymysql (MCP is read-only)
 # ---------------------------------------------------------------------------
 
-def _parse_json_result(raw: str) -> list[dict]:
-    """Parse MCP query result JSON, stripping trailing timing info."""
-    clean = raw
-    idx = raw.rfind("]Query execution time:")
-    if idx != -1:
-        clean = raw[: idx + 1]
-    return json.loads(clean)
+def _get_mysql_conn():
+    """Create a direct pymysql connection."""
+    import pymysql
+    return pymysql.connect(
+        host=settings.mysql.host,
+        port=settings.mysql.port,
+        user=settings.mysql.username,
+        password=settings.mysql.password,
+        database=settings.mysql.database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
 
 
 async def ensure_domain_summary_table() -> None:
     """Create the domain_summary table if it doesn't exist."""
-    from agents.tool.sql_tools.mcp_client import execute_sql
+    import asyncio
 
-    ddl = (
-        "CREATE TABLE IF NOT EXISTS domain_summary ("
-        "  id INT PRIMARY KEY DEFAULT 1,"
-        "  summary_text TEXT NOT NULL,"
-        "  updated_at DATETIME NOT NULL"
-        ")"
-    )
-    await execute_sql(ddl)
-    logger.info("domain_summary table ensured")
+    def _create():
+        conn = _get_mysql_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS domain_summary ("
+                    "  id INT PRIMARY KEY DEFAULT 1,"
+                    "  summary_text TEXT NOT NULL,"
+                    "  updated_at DATETIME NOT NULL"
+                    ")"
+                )
+            conn.commit()
+            logger.info("domain_summary table ensured")
+        finally:
+            conn.close()
+
+    await asyncio.to_thread(_create)
 
 
 async def load_domain_summary() -> str | None:
     """Load domain summary from MySQL. Returns None if not found."""
-    from agents.tool.sql_tools.mcp_client import execute_sql
+    import asyncio
+
+    def _load():
+        conn = _get_mysql_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT summary_text FROM domain_summary WHERE id = 1")
+                row = cur.fetchone()
+                if row:
+                    return row.get("summary_text")
+        finally:
+            conn.close()
+        return None
 
     try:
-        raw = await execute_sql(
-            "SELECT summary_text FROM domain_summary WHERE id = 1"
-        )
-        rows = _parse_json_result(raw)
-        if rows:
-            return rows[0].get("summary_text") or rows[0].get("SUMMARY_TEXT")
+        return await asyncio.to_thread(_load)
     except Exception as e:
         logger.warning("Failed to load domain summary from MySQL: %s", e)
-    return None
+        return None
 
 
 async def save_domain_summary(text: str) -> None:
@@ -72,18 +92,27 @@ async def save_domain_summary(text: str) -> None:
     global _summary_text
     _summary_text = text
 
-    # MySQL (upsert)
-    from agents.tool.sql_tools.mcp_client import execute_sql
+    # MySQL (upsert via pymysql)
+    import asyncio
+
+    def _save():
+        conn = _get_mysql_conn()
+        try:
+            with conn.cursor() as cur:
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    "INSERT INTO domain_summary (id, summary_text, updated_at) "
+                    "VALUES (%s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE summary_text = VALUES(summary_text), updated_at = VALUES(updated_at)",
+                    (1, text, now),
+                )
+            conn.commit()
+            logger.info("Domain summary saved to MySQL (%d chars)", len(text))
+        finally:
+            conn.close()
 
     try:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        sql = (
-            f"INSERT INTO domain_summary (id, summary_text, updated_at) "
-            f"VALUES (1, '{text.replace(chr(39), chr(39)+chr(39))}', '{now}') "
-            f"ON DUPLICATE KEY UPDATE summary_text = VALUES(summary_text), updated_at = VALUES(updated_at)"
-        )
-        await execute_sql(sql)
-        logger.info("Domain summary saved to MySQL (%d chars)", len(text))
+        await asyncio.to_thread(_save)
     except Exception as e:
         logger.warning("Failed to save domain summary to MySQL: %s", e)
 

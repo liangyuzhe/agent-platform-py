@@ -150,9 +150,10 @@ def split_documents(
 
 def build_indexing_graph(
     milvus_uri: str | None = None,
-    milvus_collection: str = "rag_chunks",
+    milvus_collection: str | None = None,
     es_url: str | None = None,
     es_index: str = "rag_chunks",
+    source: str = "user_document",
 ) -> Callable[[str], dict[str, Any]]:
     """Return a callable that indexes a document into Milvus and Elasticsearch.
 
@@ -162,24 +163,26 @@ def build_indexing_graph(
     Parameters
     ----------
     milvus_uri:
-        Milvus connection URI.  Defaults to ``settings.milvus_uri`` or
-        ``"http://localhost:19530"``.
+        Milvus connection URI.  Defaults to ``settings.milvus.addr``.
     milvus_collection:
-        Name of the Milvus collection.
+        Milvus collection name.  Defaults to ``settings.milvus.collection_name``.
     es_url:
-        Elasticsearch connection URL.  Defaults to ``settings.es_url`` or
-        ``"http://localhost:9200"``.
+        Elasticsearch connection URL.  Defaults to ``settings.es.address``.
     es_index:
         Name of the Elasticsearch index.
+    source:
+        Knowledge source type. One of ``user_document``, ``business_knowledge``,
+        ``agent_knowledge``. Stored in metadata for retrieval filtering.
     """
-    _milvus_uri = milvus_uri or getattr(settings, "milvus_uri", None) or "http://localhost:19530"
-    _es_url = es_url or getattr(settings, "es_url", None) or "http://localhost:9200"
+    _milvus_uri = milvus_uri or f"http://{settings.milvus.addr}"
+    _milvus_collection = milvus_collection or settings.milvus.collection_name
+    _es_url = es_url or settings.es.address
     embeddings = _get_embeddings()
 
     milvus_store = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": _milvus_uri},
-        collection_name=milvus_collection,
+        collection_name=_milvus_collection,
     )
 
     es_store = ElasticsearchStore(
@@ -200,13 +203,13 @@ def build_indexing_graph(
         chunks = split_documents(raw_docs)
 
         # Generate deterministic IDs from file path + chunk index
-        doc_ids = [
-            f"{os.path.basename(file_path)}_{i}"
-            for i in range(len(chunks))
-        ]
+        base_name = os.path.basename(file_path)
+        doc_ids = [f"{base_name}_{i}" for i in range(len(chunks))]
         for chunk, cid in zip(chunks, doc_ids):
             chunk.metadata["doc_id"] = cid
-            chunk.metadata["source"] = file_path
+            chunk.metadata["source"] = source
+            chunk.metadata["file_path"] = file_path
+            chunk.metadata["table_name"] = ""  # not a schema doc
 
         # Store in both vector store (Milvus) and keyword store (ES)
         milvus_store.add_documents(chunks, ids=doc_ids)
@@ -219,14 +222,15 @@ def build_indexing_graph(
 
 def build_parent_indexing_graph(
     milvus_uri: str | None = None,
-    child_collection: str = "rag_children",
-    parent_collection: str = "rag_parents",
+    child_collection: str | None = None,
+    parent_collection: str | None = None,
     es_url: str | None = None,
     es_index: str = "rag_children",
     parent_chunk_size: int = 2048,
     parent_chunk_overlap: int = 200,
     child_chunk_size: int = 512,
     child_chunk_overlap: int = 64,
+    source: str = "user_document",
 ) -> Callable[[str], dict[str, Any]]:
     """Return a callable that indexes a document using parent-child chunking.
 
@@ -256,19 +260,21 @@ def build_parent_indexing_graph(
     child_chunk_overlap:
         Overlap between child chunks.
     """
-    _milvus_uri = milvus_uri or getattr(settings, "milvus_uri", None) or "http://localhost:19530"
-    _es_url = es_url or getattr(settings, "es_url", None) or "http://localhost:9200"
+    _milvus_uri = milvus_uri or f"http://{settings.milvus.addr}"
+    _child_collection = child_collection or settings.milvus.collection_name
+    _parent_collection = parent_collection or settings.milvus.collection_name
+    _es_url = es_url or settings.es.address
     embeddings = _get_embeddings()
 
     child_milvus = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": _milvus_uri},
-        collection_name=child_collection,
+        collection_name=_child_collection,
     )
     parent_milvus = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": _milvus_uri},
-        collection_name=parent_collection,
+        collection_name=_parent_collection,
     )
     es_store = ElasticsearchStore(
         es_url=_es_url,
@@ -300,7 +306,9 @@ def build_parent_indexing_graph(
         parent_ids = [f"{base_name}_parent_{i}" for i in range(len(parent_chunks))]
         for chunk, pid in zip(parent_chunks, parent_ids):
             chunk.metadata["doc_id"] = pid
-            chunk.metadata["source"] = file_path
+            chunk.metadata["source"] = source
+            chunk.metadata["file_path"] = file_path
+            chunk.metadata["table_name"] = ""
 
         # Split each parent into child chunks (small)
         child_splitter = RecursiveCharacterTextSplitter(
@@ -319,7 +327,9 @@ def build_parent_indexing_graph(
                 child_id = f"{base_name}_child_{child_idx}"
                 child.metadata["parent_id"] = pid
                 child.metadata["doc_id"] = child_id
-                child.metadata["source"] = file_path
+                child.metadata["source"] = source
+                child.metadata["file_path"] = file_path
+                child.metadata["table_name"] = ""
                 all_children.append(child)
                 all_child_ids.append(child_id)
                 child_idx += 1

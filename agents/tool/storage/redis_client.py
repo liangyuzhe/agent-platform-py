@@ -50,23 +50,15 @@ async def init_redis() -> aioredis.Redis:
         await _client.ping()
         logger.info("Async Redis client connected to %s", url.split("@")[-1])
     except Exception as e:
-        logger.error("Failed to connect to Redis: %s", e)
+        logger.warning("Failed to connect to Redis: %s (using in-memory fallback)", e)
         await close_redis()
-        raise
+        # Don't raise — allow server to start without Redis
 
     return _client
 
 
-def get_redis() -> aioredis.Redis:
-    """Return the initialized async Redis client.
-
-    Raises:
-        RuntimeError: If ``init_redis`` has not been called yet.
-    """
-    if _client is None:
-        raise RuntimeError(
-            "Redis client not initialized. Call init_redis() first."
-        )
+def get_redis() -> Optional[aioredis.Redis]:
+    """Return the initialized async Redis client, or None if unavailable."""
     return _client
 
 

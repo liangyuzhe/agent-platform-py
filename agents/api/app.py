@@ -28,6 +28,9 @@ async def lifespan(app: FastAPI):
     # 初始化基础设施
     await init_redis()
 
+    # 初始化 Milvus 连接（pymilvus 兼容 patch + 连接验证）
+    _init_milvus(logger)
+
     # 初始化模型
     init_chat_models()
     init_embedding_models()
@@ -48,10 +51,62 @@ async def lifespan(app: FastAPI):
     await close_redis()
 
 
+def _init_milvus(logger):
+    """Apply pymilvus compatibility patch and verify Milvus connection."""
+    from agents.rag.retriever import _patch_milvus_connections
+
+    _patch_milvus_connections()
+
+    # Verify connection and ensure collection exists
+    try:
+        from pymilvus import MilvusClient
+        uri = f"http://{settings.milvus.addr}"
+        client = MilvusClient(uri=uri)
+        coll = settings.milvus.collection_name
+        if coll in client.list_collections():
+            stats = client.get_collection_stats(coll)
+            logger.info("Milvus connected: %s has %s rows", coll, stats.get("row_count", "?"))
+        else:
+            _create_knowledge_base_collection(client, coll, logger)
+        client.close()
+    except Exception as e:
+        logger.warning("Milvus connection check failed: %s", e)
+
+
+def _create_knowledge_base_collection(client, coll: str, logger):
+    """Create the unified knowledge_base collection with all required fields."""
+    from pymilvus import CollectionSchema, FieldSchema, DataType
+
+    schema = CollectionSchema(fields=[
+        FieldSchema("pk", DataType.VARCHAR, is_primary=True, max_length=65535),
+        FieldSchema("text", DataType.VARCHAR, max_length=65535),
+        FieldSchema("vector", DataType.FLOAT_VECTOR, dim=1024),
+        FieldSchema("source", DataType.VARCHAR, max_length=65535),
+        FieldSchema("table_name", DataType.VARCHAR, max_length=65535),
+        FieldSchema("doc_id", DataType.VARCHAR, max_length=65535),
+    ], enable_dynamic_field=True)
+
+    index_params = client.prepare_index_params()
+    index_params.add_index(
+        field_name="vector",
+        index_type="IVF_FLAT",
+        metric_type="COSINE",
+        params={"nlist": 128},
+    )
+
+    client.create_collection(
+        collection_name=coll,
+        schema=schema,
+        index_params=index_params,
+    )
+    client.load_collection(coll)
+    logger.info("Created Milvus collection '%s' with schema (pk, text, vector, source, table_name, doc_id)", coll)
+
+
 async def _index_schemas_background(logger):
     """后台任务：连接 MySQL 并将表结构向量化到 Milvus + ES。
 
-    如果 domain_summary 表中已有摘要，跳过全量索引，直接加载摘要。
+    如果 Milvus 集合为空或 domain_summary 表无数据，则执行索引。
     """
     try:
         from agents.tool.storage.domain_summary import (
@@ -59,14 +114,33 @@ async def _index_schemas_background(logger):
             get_domain_summary,
         )
         from agents.rag.schema_indexer import index_mysql_schemas
+        from pymilvus import MilvusClient
 
         await ensure_domain_summary_table()
 
-        existing = await get_domain_summary()
-        if existing:
-            logger.info("Domain summary found in cache/DB (%d chars), skipping schema re-index", len(existing))
-            return
+        # Check if schema docs exist in collection (not just row count, which can be stale)
+        uri = f"http://{settings.milvus.addr}"
+        client = MilvusClient(uri=uri)
+        try:
+            schema_docs = client.query(
+                collection_name=settings.milvus.collection_name,
+                filter='source == "mysql_schema"',
+                output_fields=["pk"],
+                limit=1,
+            )
+            has_schemas = len(schema_docs) > 0
+        except Exception:
+            has_schemas = False
+        finally:
+            client.close()
 
+        if has_schemas:
+            existing = await get_domain_summary()
+            if existing:
+                logger.info("Domain summary cached (%d chars), schema docs exist, skipping re-index", len(existing))
+                return
+
+        logger.info("No schema docs found, running schema indexing...")
         result = await index_mysql_schemas()
         logger.info("Schema auto-indexing done: %s", result)
     except Exception as e:

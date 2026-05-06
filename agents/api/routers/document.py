@@ -24,9 +24,15 @@ class InsertDocumentResponse(BaseModel):
 async def insert_document(
     file: UploadFile = File(...),
     rag_mode: Literal["traditional", "parent"] | None = Form(None),
+    source: Literal["user_document", "business_knowledge", "agent_knowledge"] = Form("user_document"),
 ):
-    """上传文档并索引。"""
-    # 保存到临时文件
+    """上传文档并索引到统一知识库。
+
+    source 决定文档分类：
+    - user_document: 用户上传的一般文档（默认）
+    - business_knowledge: 业务知识（术语、公式、规则）
+    - agent_knowledge: 智能体知识（SQL Q&A、操作指南）
+    """
     suffix = os.path.splitext(file.filename or ".txt")[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -37,21 +43,21 @@ async def insert_document(
 
     try:
         if mode == "parent":
-            index_fn = build_parent_indexing_graph()
+            index_fn = build_parent_indexing_graph(source=source)
             result = index_fn(tmp_path)
             return InsertDocumentResponse(
                 success=True,
-                message=f"文档索引成功（Parent 模式），共 {result['parent_count']} 个父分块，{result['chunk_count']} 个子分块",
+                message=f"文档索引成功（{source}，Parent 模式），共 {result['parent_count']} 个父分块，{result['chunk_count']} 个子分块",
                 doc_ids=result["doc_ids"],
                 chunk_count=result["chunk_count"],
                 parent_count=result["parent_count"],
             )
         else:
-            index_fn = build_indexing_graph()
+            index_fn = build_indexing_graph(source=source)
             result = index_fn(tmp_path)
             return InsertDocumentResponse(
                 success=True,
-                message=f"文档索引成功，共 {result['chunk_count']} 个分块",
+                message=f"文档索引成功（{source}），共 {result['chunk_count']} 个分块",
                 doc_ids=result["doc_ids"],
                 chunk_count=result["chunk_count"],
             )

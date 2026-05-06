@@ -43,11 +43,18 @@ async def rewrite(state: RAGChatState) -> dict:
         {"role": h["role"], "content": h["content"]} for h in history
     ]
 
-    rewritten = await rewrite_query(
-        summary=summary,
-        history=history_dicts,
-        query=state["query"],
-    )
+    try:
+        rewritten = await asyncio.wait_for(
+            rewrite_query(
+                summary=summary,
+                history=history_dicts,
+                query=state["query"],
+            ),
+            timeout=settings.resilience.llm_rewrite_timeout,
+        )
+    except Exception as e:
+        logger.warning("Query rewrite failed, using original: %s", e)
+        rewritten = state["query"]
     return {"rewritten_query": rewritten}
 
 
@@ -62,12 +69,12 @@ async def retrieve(state: RAGChatState, config=None) -> dict:
             from agents.rag.parent_retriever import ParentDocumentRetriever
             retriever = ParentDocumentRetriever()
         else:
-            retriever = get_hybrid_retriever()
+            retriever = get_hybrid_retriever(source_filter="user_document")
 
         # Run sync retrieval in thread pool with timeout
         docs = await asyncio.wait_for(
             asyncio.to_thread(retriever.retrieve, query, callbacks=callbacks),
-            timeout=15,
+            timeout=settings.resilience.milvus_timeout,
         )
     except Exception as e:
         logger.warning("Retrieval failed, continuing with empty docs: %s", e)
@@ -119,7 +126,10 @@ async def construct_messages(state: RAGChatState) -> dict:
 async def chat(state: RAGChatState) -> dict:
     """LLM 生成响应。"""
     model = get_chat_model(settings.chat_model_type)
-    response = await model.ainvoke(state["messages"])
+    response = await asyncio.wait_for(
+        model.ainvoke(state["messages"]),
+        timeout=settings.resilience.llm_timeout,
+    )
 
     # 更新记忆
     session = state.get("session", {})
@@ -142,7 +152,7 @@ async def _compress_and_save(session_id: str, session: dict):
     # 压缩记忆（如果历史过长）
     try:
         model = get_chat_model(settings.chat_model_type)
-        await compress_session(session_obj, llm=model)
+        await asyncio.wait_for(compress_session(session_obj, llm=model), timeout=settings.resilience.llm_rewrite_timeout)
     except Exception as e:
         logger.warning("Memory compression failed: %s", e)
 

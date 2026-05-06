@@ -12,6 +12,8 @@ def _create_chat_model() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.openai.chat_model,
         api_key=settings.openai.key,
+        request_timeout=60,
+        max_retries=2,
     )
 
 

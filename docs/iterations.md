@@ -285,3 +285,246 @@ response = llm.invoke(f"从 {candidate_tables} 中选出需要的表")
 ### 待优化（后续迭代）
 
 - **外键扩展**：向量粗筛后，自动补全外键关联的缺失表（需外键元数据）
+
+---
+
+## 迭代 6：上下文记忆系统 ✅
+
+### 为什么优化
+
+用户先问"zhangsan01是谁"（SQL 正确返回），接着问"他在哪个部门"时，系统无法解析"他"指的是 zhangsan01，生成的 SQL 缺少真实用户名。
+
+**根因**：`FinalGraphState` 和 `SQLReactState` 没有 `chat_history` 字段，API 端点不传对话历史，SQL 生成流水线每次都是独立执行，没有上下文。
+
+### 优化了什么
+
+1. `FinalGraphState` 和 `SQLReactState` 新增 `chat_history` 和 `rewritten_query` 字段
+2. API 端点（classify/invoke/approve）从 session store 加载对话历史，注入 graph state
+3. SQL React 图新增 `contextualize_query` 入口节点，调用 `rewrite_query` 将代词化查询重写为独立查询
+4. 意图分类（`classify_intent`）注入最近 3 轮对话历史，帮助理解代词
+5. 下游节点（`select_tables`/`recall_evidence`/`sql_generate`）使用重写后的查询
+6. SQL 审批中断时暂存原始 query，approve 后正确恢复并保存 Q&A
+
+### 怎么优化的
+
+#### 状态变更
+
+```python
+class FinalGraphState(TypedDict):
+    query: str
+    session_id: str
+    chat_history: list[dict]     # 新增：对话历史
+    intent: str
+    ...
+
+class SQLReactState(TypedDict):
+    query: str
+    rewritten_query: str         # 新增：上下文化后的独立问题
+    chat_history: list[dict]     # 新增：对话历史
+    ...
+```
+
+#### 图流程变更
+
+```
+优化前: START → select_tables → recall_evidence → sql_retrieve → ...
+优化后: START → contextualize_query → select_tables → recall_evidence → sql_retrieve → ...
+```
+
+#### contextualize_query 逻辑
+
+```python
+async def contextualize_query(state):
+    chat_history = state.get("chat_history", [])
+    if not chat_history:
+        return {"rewritten_query": state["query"]}  # 无历史，原样返回
+
+    rewritten = await rewrite_query(
+        summary=summary,
+        history=chat_history[-6:],  # 最近 3 轮
+        query=state["query"],
+    )
+    return {"rewritten_query": rewritten}
+```
+
+#### Session 持久化流程
+
+```
+invoke 端点:
+  1. _load_chat_history(session_id) → 从 session store 加载历史
+  2. graph.ainvoke({query, chat_history})
+  3. _save_qa_to_session(session_id, query, answer) → 保存本轮 Q&A
+
+approve 端点:
+  1. invoke 中断时: _save_pending_query(session_id, query) → 暂存 query
+  2. approve 恢复时: _pop_pending_query(session_id) → 取出原始 query
+  3. _save_qa_to_session(session_id, original_query, answer) → 保存完整 Q&A
+```
+
+### Bug 修复
+
+| Bug | 原因 | 修复 |
+|-----|------|------|
+| Q&A 未保存到 session | `compress_session` 是 async 函数，但在同步函数中直接调用未 await | 移除 compress_session 调用（历史 < 20 条不需要压缩） |
+| approve 后 query 为空 | graph 恢复后 state 中 query 字段可能丢失 | 中断时暂存 query 到 session preferences，approve 后恢复 |
+| Redis 未启动导致服务不可用 | `init_redis()` 连接失败直接 raise，阻断服务启动 | 改为 warning 日志，允许无 Redis 环境启动（session store 有内存 fallback） |
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "zhangsan01是谁" → "他在哪个部门" | "他"无法解析，SQL 缺少条件 | 重写为"zhangsan01在哪个部门" |
+| "查一下这个月的费用" → "按部门分呢" | "按部门分"无法理解上下文 | 重写为"这个月的费用按部门分组" |
+| 意图分类带代词 | "他"可能被分类为 chat | 注入历史后正确分类为 sql_query |
+
+---
+
+## 迭代 7：熔断降级与超时保护 ✅
+
+### 为什么优化
+
+项目依赖 Milvus、MySQL、Redis、LLM API、Elasticsearch 5 个外部服务。分析发现 Milvus 直接查询（5 个函数）、LLM API（8+ 调用点）、MySQL MCP 三个关键路径**无超时**，一旦下游挂起，整个请求链阻塞。
+
+select_tables 节点在 Milvus 不可用时无限阻塞，是最先暴露的问题。
+
+### 优化了什么
+
+**Phase 1：超时保护（本次实施）**
+
+| 文件 | 改动 |
+|------|------|
+| `agents/rag/retriever.py` | 5 个 Milvus 直接查询函数加 try/except，失败返回空 |
+| `agents/flow/sql_react.py` | select_tables/recall_evidence/sql_retrieve/contextualize_query 加 `asyncio.wait_for` 超时 |
+| `agents/model/providers/*.py` | 所有 5 个 provider 加 `request_timeout=60, max_retries=2` |
+| `agents/tool/sql_tools/mcp_client.py` | execute_sql 加 `asyncio.wait_for(timeout=15)` |
+| `agents/flow/rag_chat.py` | rewrite/chat/compress_and_save 加超时 |
+| `agents/tool/storage/redis_client.py` | init_redis 失败不再 raise，允许无 Redis 启动 |
+
+**Phase 2：Fallback 降级（已内置）**
+
+| 组件 | 降级策略 |
+|------|----------|
+| Milvus 向量检索超时 | 返回空列表，跳过该路召回 |
+| LLM 重写超时 | 使用原始 query |
+| LLM 选表超时 | 使用向量检索结果 |
+| MySQL 执行超时 | 进入 error_analysis 重试 |
+| Redis 不可用 | session store 使用内存 dict |
+| Redis checkpointer 不可用 | 使用 MemorySaver |
+
+### 超时配置汇总
+
+| 调用 | 超时 | 降级行为 |
+|------|------|----------|
+| Milvus 向量检索 | 8s | 返回空 |
+| Milvus metadata 查询 | 10s | 返回空 |
+| LLM request_timeout | 60s | 自动重试 2 次 |
+| LLM rewrite/compress | 15s/30s | 使用原始值 |
+| MySQL MCP execute_sql | 15s | 返回错误 |
+| Milvus HybridRetriever | 30s 外层 | 返回空 |
+
+### DataAgent 对比
+
+对比本地 DataAgent 项目（`/Users/a0000/project/DataAgent`），熔断降级方面：
+
+| 能力 | DataAgent | 我们 | 状态 |
+|------|-----------|------|------|
+| SQL 执行重试 | LLM 引导，最多 10 次 | LLM 引导，最多 5 次（可配置） | ✅ 已有 |
+| DB 连接重试 | 3 次 + 线性退避 | MCP 长连接，无重试 | ⚠️ 后续补齐 |
+| SQL 执行超时 | 30s | 15s（可配置） | ✅ 已有 |
+| LLM 超时 | 仅图表生成 3s | 所有调用点 15~60s（可配置） | ✅ 超越 |
+| LLM 重试 | ❌ 无 | max_retries=2 | ✅ 超越 |
+| 向量检索降级 | catch → 返回空 | catch → 返回空 | ✅ 已有 |
+| 知识入库降级 | mark FAILED | log only | ⚠️ 后续补齐 |
+| 错误码映射 | 20+ SQLState | 16 种 SQLState + is_retryable() | ✅ 已有 |
+| 可配置重试次数 | 配置文件 | ResilienceSettings（环境变量） | ✅ 已有 |
+| 熔断器 | ❌ 无 | ❌ 无 | 双方都无 |
+
+**核心结论**：DataAgent 也没有熔断器，其容错依赖"超时 + LLM 引导重试 + 节点级降级"三板斧。我们已在这三方面达到或超越 DataAgent。错误码映射和可配置重试已补齐。
+
+### 详细设计
+
+见 `docs/resilience_design.md`，包含 DataAgent 对比分析、三层方案、错误码映射设计。
+
+---
+
+## 迭代 8：错误码分类 + 可配置重试 ✅
+
+### 为什么优化
+
+迭代 7 实现了超时保护和基础重试，但存在两个问题：
+
+1. **重试不区分错误类型**：语法错误（表不存在、列不存在）和连接错误（连接中断）同样重试，浪费 LLM 调用
+2. **重试次数硬编码**：`_MAX_RETRIES = 3` 无法通过配置调整，需要改代码
+
+DataAgent 有 16 种 SQLState 映射（`ErrorCodeEnum`）和可配置重试次数（`DataAgentProperties`），我们需要补齐。
+
+### 优化了什么
+
+1. 新建 `agents/tool/sql_tools/error_codes.py`，定义 16 种 SQLState 错误码分类 + `is_retryable()` 函数
+2. 新增 `ResilienceSettings` 到 `agents/config/settings.py`，支持环境变量配置重试次数和超时
+3. `sql_react.py` 的 `route_after_execute` 使用 `is_retryable()` 判断是否重试
+4. 所有超时值改为从 `settings.resilience` 读取，不再硬编码
+
+### 怎么优化的
+
+#### 错误码分类
+
+```python
+# agents/tool/sql_tools/error_codes.py
+SQL_ERROR_CODES = {
+    "08001": ("连接建立失败", True),    # 可重试
+    "08S01": ("连接中断", True),        # 可重试
+    "28P01": ("密码错误", False),       # 不可重试
+    "42S02": ("表不存在", False),       # 不可重试
+    "42S22": ("列不存在", False),       # 不可重试
+    # ... 共 16 种
+}
+
+def is_retryable(error_msg: str) -> bool:
+    """连接类错误重试，语法/权限类不重试。未知错误默认不重试。"""
+```
+
+#### 可配置超时
+
+```python
+# agents/config/settings.py
+class ResilienceSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="RESILIENCE_")
+    max_sql_retries: int = 5            # RESILIENCE_MAX_SQL_RETRIES
+    sql_execution_timeout: float = 15   # RESILIENCE_SQL_EXECUTION_TIMEOUT
+    milvus_timeout: float = 8           # RESILIENCE_MILVUS_TIMEOUT
+    llm_timeout: float = 60             # RESILIENCE_LLM_TIMEOUT
+    llm_rewrite_timeout: float = 15     # RESILIENCE_LLM_REWRITE_TIMEOUT
+```
+
+#### 条件路由
+
+```python
+def route_after_execute(state):
+    if not state.get("error"):
+        return END
+    if not is_retryable(state["error"]):  # 语法/权限错误不重试
+        return END
+    if state.get("retry_count", 0) < settings.resilience.max_sql_retries:
+        return "error_analysis"
+    return END
+```
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "查不存在的表" | 重试 3 次 LLM（浪费 token） | 直接结束，返回"表不存在" |
+| "密码错误" | 重试 3 次（无意义） | 直接结束，返回认证错误 |
+| 连接超时 | 重试 3 次（正确） | 重试 5 次（可配置） |
+| 生产环境调优 | 改代码重新部署 | 改环境变量重启 |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| 新建 `agents/tool/sql_tools/error_codes.py` | 16 种 SQLState + `is_retryable()` |
+| `agents/config/settings.py` | 新增 `ResilienceSettings`，5 个可配置参数 |
+| `agents/flow/sql_react.py` | `route_after_execute` 使用 `is_retryable`，超时从配置读取 |
+| `agents/flow/rag_chat.py` | 超时从 `settings.resilience` 读取 |
+| `agents/tool/sql_tools/mcp_client.py` | SQL 执行超时从配置读取 |

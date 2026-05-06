@@ -21,7 +21,9 @@ class RAGChatState(TypedDict):
 
 class SQLReactState(TypedDict):
     """SQL React 图的状态。"""
-    query: str
+    query: str                                   # 当前用户问题（可能是代词化的）
+    rewritten_query: str                         # 上下文化后的独立问题
+    chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     table_names: list[str]                       # 所有可用表名（启动时缓存）
     selected_tables: list[str]                   # LLM 选中的相关表名
     evidence: list[str]                          # 业务知识检索结果
@@ -53,6 +55,7 @@ class FinalGraphState(TypedDict):
     """主调度图的状态。"""
     query: str
     session_id: str
+    chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat
     sql: str
     result: str

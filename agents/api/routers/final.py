@@ -8,6 +8,8 @@ from langgraph.types import Command
 
 from agents.flow.final_graph import build_final_graph
 from agents.tool.trace.tracing import get_trace_callbacks
+from agents.tool.memory.store import get_session, save_session
+from agents.tool.memory.session import Message
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,50 @@ class ApproveRequest(BaseModel):
     feedback: str = ""
 
 
+def _load_chat_history(session_id: str) -> list[dict]:
+    """从 session store 加载对话历史。"""
+    session = get_session(session_id)
+    history = [{"role": m.role, "content": m.content} for m in session.history]
+    if session.summary:
+        history.insert(0, {"role": "system", "content": f"[对话摘要] {session.summary}"})
+    logger.info("Loaded chat history for session %s: %d messages", session_id, len(history))
+    return history
+
+
+def _save_qa_to_session(session_id: str, query: str, answer: str) -> None:
+    """将本轮 Q&A 保存到 session store。"""
+    try:
+        session = get_session(session_id)
+        session.history.append(Message(role="user", content=query))
+        session.history.append(Message(role="assistant", content=answer))
+        save_session(session_id, session)
+        logger.info("Saved Q&A to session %s, history length: %d", session_id, len(session.history))
+    except Exception as e:
+        logger.warning("Failed to save Q&A to session: %s", e)
+
+
+def _save_pending_query(session_id: str, query: str) -> None:
+    """中断时暂存原始 query，供 approve 后恢复。"""
+    try:
+        session = get_session(session_id)
+        session.preferences["_pending_query"] = query
+        save_session(session_id, session)
+    except Exception as e:
+        logger.warning("Failed to save pending query: %s", e)
+
+
+def _pop_pending_query(session_id: str) -> str:
+    """取出中断时暂存的 query。"""
+    try:
+        session = get_session(session_id)
+        query = session.preferences.pop("_pending_query", "")
+        if query:
+            save_session(session_id, session)
+        return query
+    except Exception:
+        return ""
+
+
 def _make_config(session_id: str) -> dict:
     """构建包含 thread_id 和 trace callbacks 的 config。"""
     callbacks = get_trace_callbacks()
@@ -66,7 +112,8 @@ def _extract_interrupt(result: dict) -> dict | None:
 async def classify_intent_endpoint(req: FinalRequest):
     """意图分类（非流式），前端据此选择流式端点。"""
     from agents.flow.final_graph import classify_intent
-    result = await classify_intent({"query": req.query})
+    chat_history = _load_chat_history(req.session_id)
+    result = await classify_intent({"query": req.query, "chat_history": chat_history})
     return ClassifyResponse(
         intent=result.get("intent", "chat"),
         session_id=req.session_id,
@@ -78,15 +125,19 @@ async def final_invoke(req: FinalRequest):
     """非流式 Final Graph 调用。"""
     graph = build_final_graph()
     config = _make_config(req.session_id)
+    chat_history = _load_chat_history(req.session_id)
 
     result = await graph.ainvoke({
         "query": req.query,
         "session_id": req.session_id,
+        "chat_history": chat_history,
     }, config=config)
 
     # 检查是否被 interrupt（等待审批）
     interrupt_val = _extract_interrupt(result)
     if interrupt_val:
+        # 暂存原始 query，供 approve 后恢复
+        _save_pending_query(req.session_id, req.query)
         return FinalResponse(
             query=req.query,
             answer=interrupt_val.get("message", "请确认是否执行该 SQL"),
@@ -96,9 +147,14 @@ async def final_invoke(req: FinalRequest):
             sql=interrupt_val.get("sql", ""),
         )
 
+    answer = result.get("answer", "")
+    # 保存本轮 Q&A 到 session
+    if answer:
+        _save_qa_to_session(req.session_id, req.query, answer)
+
     return FinalResponse(
         query=req.query,
-        answer=result.get("answer", ""),
+        answer=answer,
         status=result.get("status", "completed"),
         session_id=req.session_id,
     )
@@ -130,9 +186,16 @@ async def approve_sql(req: ApproveRequest):
             sql=interrupt_val.get("sql", ""),
         )
 
+    answer = result.get("answer", "")
+    # 恢复中断时暂存的原始 query
+    original_query = _pop_pending_query(req.session_id) or result.get("query", "")
+    # 保存本轮 Q&A 到 session
+    if answer and original_query:
+        _save_qa_to_session(req.session_id, original_query, answer)
+
     return FinalResponse(
-        query="",
-        answer=result.get("answer", ""),
+        query=original_query,
+        answer=answer,
         status=result.get("status", "completed"),
         session_id=req.session_id,
     )

@@ -11,7 +11,9 @@ from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
+from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import get_schema_table_names, get_schema_docs_by_tables, recall_business_knowledge, recall_agent_knowledge, search_schema_tables
+from agents.rag.query_rewrite import rewrite_query
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
@@ -22,7 +24,44 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 3
+
+async def contextualize_query(state: SQLReactState) -> dict:
+    """利用对话历史将代词化查询重写为独立查询。
+
+    例如 "他在哪个部门" → "zhangsan01 在哪个部门"
+    """
+    query = state.get("query", "")
+    chat_history = state.get("chat_history", [])
+
+    if not chat_history:
+        return {"rewritten_query": query}
+
+    # 提取最近对话摘要和历史
+    summary = ""
+    history_dicts = []
+    for h in chat_history:
+        if h.get("role") == "system" and h.get("content", "").startswith("[对话摘要]"):
+            summary = h["content"].replace("[对话摘要] ", "")
+        else:
+            history_dicts.append(h)
+
+    if not history_dicts:
+        return {"rewritten_query": query}
+
+    try:
+        rewritten = await asyncio.wait_for(
+            rewrite_query(
+                summary=summary,
+                history=history_dicts[-6:],  # 最近 3 轮
+                query=query,
+            ),
+            timeout=settings.resilience.llm_rewrite_timeout,
+        )
+        logger.info("contextualize_query: '%s' -> '%s'", query, rewritten)
+        return {"rewritten_query": rewritten}
+    except Exception as e:
+        logger.warning("Query contextualization failed, using original: %s", e)
+        return {"rewritten_query": query}
 
 
 async def load_table_names(state: SQLReactState) -> dict:
@@ -45,25 +84,30 @@ async def select_tables(state: SQLReactState) -> dict:
     Stage 1: 用户问题向量检索 top-K schema 文档，提取候选表名
     Stage 2: 候选表 > 3 个时，LLM 从候选中精选；否则直接使用
     """
-    query = state.get("query", "")
+    query = state.get("rewritten_query") or state.get("query", "")
 
-    # Stage 1: 向量粗筛
+    # Stage 1: 向量粗筛（带超时）
     candidate_tables = []
     try:
-        candidate_tables = await asyncio.to_thread(search_schema_tables, query, 10)
+        candidate_tables = await asyncio.wait_for(
+            asyncio.to_thread(search_schema_tables, query, 10),
+            timeout=settings.resilience.milvus_timeout,
+        )
     except Exception as e:
         logger.warning("Vector search for tables failed: %s", e)
 
-    # Fallback: 向量检索无结果，加载全量表名
+    # Fallback: 向量检索无结果，加载全量表名（带超时）
     if not candidate_tables:
         table_names = state.get("table_names", [])
         if not table_names:
             try:
-                table_names = await asyncio.to_thread(get_schema_table_names)
+                table_names = await asyncio.wait_for(
+                    asyncio.to_thread(get_schema_table_names),
+                    timeout=settings.resilience.milvus_timeout,
+                )
             except Exception:
                 table_names = []
         if table_names:
-            # 全量表名太多，仍用 LLM 筛选
             candidate_tables = table_names
 
     if not candidate_tables:
@@ -105,24 +149,30 @@ async def select_tables(state: SQLReactState) -> dict:
 
 async def recall_evidence(state: SQLReactState) -> dict:
     """向量检索业务知识 + 智能体知识库，注入 SQL 生成上下文。"""
-    query = state.get("query", "")
+    query = state.get("rewritten_query") or state.get("query", "")
     if not query:
         return {"evidence": [], "few_shot_examples": []}
 
     evidence = []
     few_shot = []
 
-    # 业务知识（术语、公式）
+    # 业务知识（术语、公式）— 带超时
     try:
-        bk_docs = await asyncio.to_thread(recall_business_knowledge, query, 5)
+        bk_docs = await asyncio.wait_for(
+            asyncio.to_thread(recall_business_knowledge, query, 5),
+            timeout=settings.resilience.milvus_timeout,
+        )
         evidence = [d.page_content for d in bk_docs if d.metadata.get("score", 0) > 0.3]
         logger.info("recall_evidence: %d business knowledge entries", len(evidence))
     except Exception as e:
         logger.warning("Business knowledge recall failed: %s", e)
 
-    # 智能体知识库（SQL Q&A few-shot）
+    # 智能体知识库（SQL Q&A few-shot）— 带超时
     try:
-        ak_docs = await asyncio.to_thread(recall_agent_knowledge, query, 3)
+        ak_docs = await asyncio.wait_for(
+            asyncio.to_thread(recall_agent_knowledge, query, 3),
+            timeout=settings.resilience.milvus_timeout,
+        )
         few_shot = [d.page_content for d in ak_docs if d.metadata.get("score", 0) > 0.3]
         logger.info("recall_evidence: %d agent knowledge entries", len(few_shot))
     except Exception as e:
@@ -136,15 +186,27 @@ async def sql_retrieve(state: SQLReactState, config=None) -> dict:
     selected = state.get("selected_tables", [])
 
     if selected:
-        docs = await asyncio.to_thread(get_schema_docs_by_tables, selected)
-        if docs:
-            return {"docs": docs}
+        try:
+            docs = await asyncio.wait_for(
+                asyncio.to_thread(get_schema_docs_by_tables, selected),
+                timeout=settings.resilience.milvus_timeout,
+            )
+            if docs:
+                return {"docs": docs}
+        except Exception as e:
+            logger.warning("sql_retrieve by selected tables failed: %s", e)
 
     # Fallback: LLM 没选出表或过滤无结果，拉取全部 schema
     table_names = state.get("table_names", [])
     if table_names:
-        docs = await asyncio.to_thread(get_schema_docs_by_tables, table_names)
-        return {"docs": docs}
+        try:
+            docs = await asyncio.wait_for(
+                asyncio.to_thread(get_schema_docs_by_tables, table_names),
+                timeout=settings.resilience.milvus_timeout,
+            )
+            return {"docs": docs}
+        except Exception as e:
+            logger.warning("sql_retrieve by all tables failed: %s", e)
 
     return {"docs": []}
 
@@ -230,10 +292,17 @@ async def sql_generate(state: SQLReactState) -> dict:
     # Accumulate docs across re-retrieval rounds
     all_docs = list(state.get("docs", []))
 
+    # 使用上下文化后的查询生成 SQL，但保留原始查询作为参考
+    effective_query = state.get("rewritten_query") or state.get("query", "")
+    original_query = state.get("query", "")
+    query_for_sql = effective_query
+    if effective_query != original_query:
+        query_for_sql = f"{effective_query}\n（用户原始问题: {original_query}）"
+
     for round_idx in range(_MAX_TABLE_SEARCH_ROUNDS):
         docs_text = "\n\n".join([d.page_content for d in all_docs])
 
-        messages = _build_sql_messages(state["query"], docs_text, refine_context, history_context, evidence_text, few_shot_text)
+        messages = _build_sql_messages(query_for_sql, docs_text, refine_context, history_context, evidence_text, few_shot_text)
         response = await model_with_tools.ainvoke(messages)
 
         if not response.tool_calls:
@@ -340,7 +409,7 @@ async def execute_sql(state: SQLReactState) -> dict:
         }
     except Exception as e:
         error_msg = str(e)
-        logger.warning("SQL execution failed (retry %d/%d): %s", state.get("retry_count", 0), _MAX_RETRIES, error_msg)
+        logger.warning("SQL execution failed (retry %d/%d): %s", state.get("retry_count", 0), settings.resilience.max_sql_retries, error_msg)
         execution_history.append({"sql": sql, "result": None, "error": error_msg})
         return {
             "result": f"SQL 执行失败: {error_msg}",
@@ -390,6 +459,7 @@ def build_sql_react_graph():
     """
     graph = StateGraph(SQLReactState)
 
+    graph.add_node("contextualize_query", contextualize_query)
     graph.add_node("select_tables", select_tables)
     graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("sql_retrieve", sql_retrieve)
@@ -400,7 +470,8 @@ def build_sql_react_graph():
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("error_analysis", error_analysis)
 
-    graph.add_edge(START, "select_tables")
+    graph.add_edge(START, "contextualize_query")
+    graph.add_edge("contextualize_query", "select_tables")
     graph.add_edge("select_tables", "recall_evidence")
     graph.add_edge("recall_evidence", "sql_retrieve")
     graph.add_edge("sql_retrieve", "check_docs")
@@ -431,10 +502,16 @@ def build_sql_react_graph():
         # 执行成功
         if not state.get("error"):
             return END
-        # 重试次数未达上限，进入错误分析
-        if state.get("retry_count", 0) < _MAX_RETRIES:
+        # 错误不可重试（语法/权限/表不存在），直接结束
+        if not is_retryable(state["error"]):
+            logger.info("route_after_execute: non-retryable error, ending: %s", state["error"][:200])
+            return END
+        # 可重试错误：检查次数
+        max_retries = settings.resilience.max_sql_retries
+        if state.get("retry_count", 0) < max_retries:
             return "error_analysis"
         # 超过最大重试次数
+        logger.warning("route_after_execute: max retries (%d) reached", max_retries)
         return END
 
     graph.add_conditional_edges("execute_sql", route_after_execute)

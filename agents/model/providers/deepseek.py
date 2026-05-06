@@ -16,6 +16,8 @@ def _create_chat_model() -> ChatOpenAI:
         model=settings.deepseek.chat_model,
         api_key=settings.deepseek.key,
         base_url=_DEEPSEEK_BASE_URL,
+        request_timeout=60,
+        max_retries=2,
     )
 
 

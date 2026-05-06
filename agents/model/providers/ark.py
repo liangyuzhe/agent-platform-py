@@ -17,6 +17,8 @@ def _create_chat_model() -> ChatOpenAI:
         model=settings.ark.chat_model,
         api_key=settings.ark.key,
         base_url=_ARK_BASE_URL,
+        request_timeout=60,
+        max_retries=2,
     )
 
 

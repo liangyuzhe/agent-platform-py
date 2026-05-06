@@ -91,28 +91,24 @@ def build_milvus_retriever(
     milvus_uri: str | None = None,
     collection: str | None = None,
     search_kwargs: dict | None = None,
+    source_filter: str | None = None,
 ) -> BaseRetriever:
     """Build a dense vector retriever backed by Milvus.
 
     Parameters
     ----------
     milvus_uri:
-        Milvus connection URI.  Falls back to ``settings.milvus.addr`` or
-        ``"http://localhost:19530"``.
+        Milvus connection URI.  Falls back to ``settings.milvus.addr``.
     collection:
         Milvus collection name.  Defaults to ``settings.milvus.collection_name``.
     search_kwargs:
         Extra keyword arguments forwarded to ``as_retriever``.
+    source_filter:
+        If set, add ``source == "<value>"`` filter to Milvus search.
     """
     uri = milvus_uri or f"http://{settings.milvus.addr}"
     coll = collection or settings.milvus.collection_name
     embeddings = _get_embeddings()
-
-    # Workaround: langchain-milvus 0.3.x + pymilvus 2.6.x has a bug where
-    # MilvusClient's internal connection is not registered in the global
-    # pymilvus connections registry, causing Collection() to fail.
-    # Monkey-patch MilvusClient to auto-register its handler on init.
-    _patch_milvus_connections()
 
     store = Milvus(
         embedding_function=embeddings,
@@ -120,6 +116,8 @@ def build_milvus_retriever(
         collection_name=coll,
     )
     kwargs = search_kwargs or {"search_type": "similarity", "k": 20}
+    if source_filter:
+        kwargs["expr"] = f'source == "{source_filter}"'
     return store.as_retriever(**kwargs)
 
 
@@ -199,12 +197,14 @@ class HybridRetriever:
         reranker_model: str | None = "BAAI/bge-reranker-v2-m3",
         reranker_top_k: int = 5,
         rerank_threshold: float = 0.1,
+        source_filter: str | None = None,
     ) -> None:
         search_kwargs = {"search_type": "similarity", "k": retrieve_k}
         self._milvus = build_milvus_retriever(
             milvus_uri=milvus_uri,
             collection=milvus_collection,
             search_kwargs=search_kwargs,
+            source_filter=source_filter,
         )
         self._es = build_es_retriever(
             es_url=es_url,
@@ -357,11 +357,13 @@ class VectorOnlyRetriever:
         milvus_uri: str | None = None,
         milvus_collection: str | None = None,
         retrieve_k: int = 10,
+        source_filter: str | None = None,
     ) -> None:
         self._retriever = build_milvus_retriever(
             milvus_uri=milvus_uri,
             collection=milvus_collection,
             search_kwargs={"search_type": "similarity", "k": retrieve_k},
+            source_filter=source_filter,
         )
 
     def retrieve(self, query: str, top_k: int | None = None, callbacks=None) -> list[Document]:
@@ -382,6 +384,7 @@ def get_hybrid_retriever(
     reranker_model: str | None = None,
     reranker_top_k: int | None = None,
     rerank_threshold: float | None = None,
+    source_filter: str | None = None,
 ) -> HybridRetriever:
     """Return a cached HybridRetriever singleton.
 
@@ -405,6 +408,7 @@ def get_hybrid_retriever(
             reranker_model=reranker_model,
             reranker_top_k=reranker_top_k,
             rerank_threshold=rerank_threshold,
+            source_filter=source_filter,
         )
     return _retriever_instance
 
@@ -415,6 +419,7 @@ _vector_only_instance: VectorOnlyRetriever | None = None
 def get_vector_only_retriever(
     milvus_collection: str | None = None,
     retrieve_k: int = 10,
+    source_filter: str | None = None,
 ) -> VectorOnlyRetriever:
     """Return a cached VectorOnlyRetriever singleton.
 
@@ -426,6 +431,7 @@ def get_vector_only_retriever(
         _vector_only_instance = VectorOnlyRetriever(
             milvus_collection=milvus_collection,
             retrieve_k=retrieve_k,
+            source_filter=source_filter,
         )
     return _vector_only_instance
 
@@ -448,6 +454,9 @@ def get_schema_table_names(source: str = "mysql_schema") -> list[str]:
         )
         names = sorted({r["table_name"] for r in results if r.get("table_name")})
         return names
+    except Exception as e:
+        logger.warning("get_schema_table_names failed: %s", e)
+        return []
     finally:
         client.close()
 
@@ -478,6 +487,9 @@ def search_schema_tables(query: str, top_k: int = 10, source: str = "mysql_schem
                 names.append(name)
         logger.info("Vector search recalled %d tables for query '%s': %s", len(names), query[:50], names)
         return names
+    except Exception as e:
+        logger.warning("search_schema_tables failed: %s", e)
+        return []
     finally:
         client.close()
 
@@ -511,6 +523,9 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
             ))
         logger.info("Business knowledge recall: %d docs for query '%s'", len(docs), query[:50])
         return docs
+    except Exception as e:
+        logger.warning("recall_business_knowledge failed: %s", e)
+        return []
     finally:
         client.close()
 
@@ -544,6 +559,9 @@ def recall_agent_knowledge(query: str, top_k: int = 3) -> list[Document]:
             ))
         logger.info("Agent knowledge recall: %d docs for query '%s'", len(docs), query[:50])
         return docs
+    except Exception as e:
+        logger.warning("recall_agent_knowledge failed: %s", e)
+        return []
     finally:
         client.close()
 
@@ -582,5 +600,8 @@ def get_schema_docs_by_tables(
         ]
         logger.info("Metadata filter retrieved %d schema docs for tables: %s", len(docs), table_names)
         return docs
+    except Exception as e:
+        logger.warning("get_schema_docs_by_tables failed: %s", e)
+        return []
     finally:
         client.close()
