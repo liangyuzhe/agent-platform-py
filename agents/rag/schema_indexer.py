@@ -61,6 +61,37 @@ def _parse_json_result(raw: str) -> list[dict]:
     return json.loads(clean)
 
 
+async def _load_semantic_model() -> dict[str, dict[str, dict]]:
+    """Load semantic model from MySQL, returns {table_name: {column_name: {...}}}."""
+    import pymysql
+
+    try:
+        conn = pymysql.connect(
+            host=settings.mysql.host,
+            port=settings.mysql.port,
+            user=settings.mysql.username,
+            password=settings.mysql.password,
+            database=settings.mysql.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name, column_name, business_name, synonyms, business_description FROM t_semantic_model")
+            rows = cur.fetchall()
+        conn.close()
+
+        result: dict[str, dict[str, dict]] = {}
+        for row in rows:
+            tbl = row["table_name"]
+            col = row["column_name"]
+            result.setdefault(tbl, {})[col] = row
+        logger.info("Loaded semantic model: %d tables, %d entries", len(result), len(rows))
+        return result
+    except Exception as e:
+        logger.info("Semantic model not available (%s), using raw schema only", e)
+        return {}
+
+
 async def _fetch_table_schemas() -> list[Document]:
     """Connect to MySQL via MCP and fetch all table schemas via information_schema."""
     docs: list[Document] = []
@@ -86,6 +117,9 @@ async def _fetch_table_schemas() -> list[Document]:
 
     logger.info("Found %d tables: %s", len(table_names), table_names)
 
+    # Load semantic model for enrichment
+    semantic_map = await _load_semantic_model()
+
     for table_name in table_names:
         try:
             columns_raw = await execute_sql(
@@ -101,6 +135,7 @@ async def _fetch_table_schemas() -> list[Document]:
                 logger.warning("Failed to parse columns for %s", table_name)
                 continue
 
+            table_semantic = semantic_map.get(table_name, {})
             lines = [f"表名: {table_name}", "字段:"]
             for col in columns_data:
                 name = col.get("COLUMN_NAME") or col.get("column_name", "?")
@@ -109,6 +144,11 @@ async def _fetch_table_schemas() -> list[Document]:
                 key = col.get("COLUMN_KEY") or col.get("column_key", "")
                 comment = col.get("COLUMN_COMMENT") or col.get("column_comment", "")
 
+                sem = table_semantic.get(name, {})
+                biz_name = sem.get("business_name", "")
+                synonyms = sem.get("synonyms", "")
+                biz_desc = sem.get("business_description", "")
+
                 parts = [f"  {name} {col_type}"]
                 if key == "PRI":
                     parts.append("PRIMARY KEY")
@@ -116,9 +156,15 @@ async def _fetch_table_schemas() -> list[Document]:
                     parts.append("UNIQUE")
                 if nullable == "NO":
                     parts.append("NOT NULL")
-                if comment:
+                if biz_name:
+                    parts.append(f"-- {biz_name}")
+                if comment and comment != biz_name:
                     parts.append(f"COMMENT '{comment}'")
                 lines.append(" ".join(parts))
+                if synonyms:
+                    lines.append(f"    同义词: {synonyms}")
+                if biz_desc:
+                    lines.append(f"    描述: {biz_desc}")
 
             content = "\n".join(lines)
 

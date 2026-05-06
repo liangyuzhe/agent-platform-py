@@ -59,10 +59,74 @@
 
 ---
 
-## 迭代 2：业务知识配置（TODO）
+## 迭代 2：语义模型（字段级业务映射）
+
+### 为什么优化
+
+现在 schema 文档只包含 information_schema 的原始信息（字段名、类型、COMMENT）。用户说"查记账金额"，LLM 看到的是 `amount decimal(18,2)`，无法确定哪个字段对应"记账金额"。
+
+DataAgent 的语义模型为每个字段维护：
+- `business_name`：业务名称（如"记账金额"）
+- `synonyms`：同义词（如"交易金额, 发生额"）
+- `business_description`：业务描述（解释枚举值、状态码等）
+
+这些信息注入 SQL 生成 prompt 后，LLM 能准确映射业务语言到物理字段。
+
+### 优化了什么
+
+1. MySQL 新建 `t_semantic_model` 表，存储字段级业务映射
+2. Admin API 支持 CRUD 语义模型配置
+3. `schema_indexer` 索引时 JOIN 语义模型，丰富 schema 文档内容
+4. `sql_generate` prompt 自动带上增强后的 schema（含业务名称和同义词）
+
+### 怎么优化的
+
+#### 数据模型
+
+```sql
+CREATE TABLE t_semantic_model (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    table_name VARCHAR(128) NOT NULL,
+    column_name VARCHAR(128) NOT NULL,
+    business_name VARCHAR(256) COMMENT '业务名称',
+    synonyms TEXT COMMENT '同义词，逗号分隔',
+    business_description TEXT COMMENT '业务描述',
+    UNIQUE KEY uk_table_col (table_name, column_name)
+);
+```
+
+#### Schema 文档增强
+
+索引时，对每个字段查找语义模型，丰富 page_content：
+
+```
+优化前:
+  表名: t_journal_item
+  字段:
+    amount decimal(18,2) COMMENT '金额'
+
+优化后:
+  表名: t_journal_item
+  字段:
+    amount decimal(18,2) -- 记账金额
+      同义词: 交易金额, 发生额, 借贷金额
+      描述: 凭证行的借方或贷方金额，正值表示借方，负值表示贷方
+```
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "查记账金额" | LLM 可能猜错字段 | 直接映射到 amount |
+| "交易金额是多少" | 需要 LLM 理解 COMMENT | 同义词直接命中 |
+| 枚举值查询 | LLM 不知道 status=1 含义 | 业务描述解释清楚 |
+
+---
+
+## 迭代 3：业务知识配置（TODO）
 
 > 参考 DataAgent 的 BusinessKnowledge 模块，支持业务术语、公式定义的存储和检索。
 
-## 迭代 3：SQL 领域智能体知识库（TODO）
+## 迭代 4：SQL 领域智能体知识库（TODO）
 
 > 参考 DataAgent 的 AgentKnowledge 模块，支持 Q&A few-shot 对注入 SQL 生成 prompt。
