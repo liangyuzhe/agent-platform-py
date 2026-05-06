@@ -1,15 +1,16 @@
-# Agent Platform Py
+# Financial Copilot Platform
 
-基于 **LangChain + LangGraph** 构建的 AI Agent 平台，提供 RAG 对话、SQL 生成与执行、数据分析、对话记忆等核心能力。
+基于 **LangChain + LangGraph** 构建的财务 Copilot 平台，提供自然语言查数据、SQL 自动生成与执行、异常归因、资金核对、审计追踪等核心能力。
 
 ## 核心特性
 
-- **RAG 对话**：文档索引 + 混合检索（向量 + BM25）+ RRF 融合 + Cross-Encoder 重排序
-- **SQL 生成与执行**：自然语言 → SQL → 人工审批 → MCP 执行，含 SQL 安全分析 + **自动纠错重试**
-- **多场景意图路由**：7 种意图自动分类（SQL 查询/异常归因/资金核对/报告/审计/知识库/闲聊）
+- **自然语言查数据**：自然语言 → SQL → 人工审批 → 执行，含 SQL 安全分析 + 自动纠错重试 + 自动补表
+- **多场景意图路由**：7 种财务场景自动分类（SQL 查询/异常归因/资金核对/报告/审计/知识库/闲聊）
+- **RAG 知识问答**：文档索引 + 混合检索（向量 + BM25）+ RRF 融合 + Cross-Encoder 重排序
+- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
+- **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成
 - **统一 Tool Registry**：工具按分类注册，LLM 动态发现和调用
 - **数据分析**：SQL 结果 → 统计分析 → 图表生成（ECharts）+ 文字报告
-- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
 - **SFT 数据管线**：自动采集训练数据 + 教师模型标注 + JSONL 导出
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
 
@@ -474,6 +475,7 @@ docker-compose logs -f milvus
 
 ## 技术文档
 
+- [新手教学文档](TUTORIAL.md)
 - [Python 版设计文档](python_langchain_design.md)
 
 ## 依赖说明
