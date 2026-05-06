@@ -34,7 +34,7 @@
 ## 项目结构
 
 ```
-agent-platform-py/
+financial-copilot-platform/
 ├── pyproject.toml                  # 项目配置 + 依赖
 ├── .env.example                    # 环境变量模板
 ├── docker-compose.yaml             # 基础设施（Milvus、ES、Redis）

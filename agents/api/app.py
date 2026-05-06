@@ -74,8 +74,8 @@ async def _index_schemas_background(logger):
 
 
 app = FastAPI(
-    title="Agents-Py",
-    description="AI Agent Platform built with LangChain and LangGraph",
+    title="Financial Copilot",
+    description="Financial Copilot Platform built with LangChain and LangGraph",
     version="0.1.0",
     lifespan=lifespan,
 )

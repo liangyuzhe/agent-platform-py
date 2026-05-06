@@ -905,7 +905,7 @@ L3 知识记忆: 提取的实体和事实（结构化）
 ```bash
 # 克隆项目
 git clone <repo-url>
-cd agent-platform-py
+cd financial-copilot-platform
 
 # 创建虚拟环境
 python -m venv .venv
