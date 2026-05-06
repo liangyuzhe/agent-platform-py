@@ -1,5 +1,7 @@
 """Seed semantic model (field-level business mappings) into MySQL.
 
+Column names must match the actual table schemas created by seed_financial.py.
+
 Usage:
     python -m scripts.seed_semantic_model
 """
@@ -44,84 +46,121 @@ def create_table(conn):
 
 
 def seed_data(conn):
-    """Seed semantic model for financial tables."""
+    """Seed semantic model for financial tables.
+
+    Column names match seed_financial.py table definitions exactly.
+    """
     records = [
         # t_account
-        ("t_account", "code", "科目编码", "会计科目代码", "财务科目唯一编码，如 1001=库存现金"),
-        ("t_account", "name", "科目名称", "会计科目, 账户名称", "财务科目名称"),
-        ("t_account", "type", "科目类型", "账户类型", "资产/负债/所有者权益/成本/损益"),
+        ("t_account", "account_code", "科目编码", "会计科目代码", "财务科目唯一编码，如 1001=库存现金"),
+        ("t_account", "account_name", "科目名称", "会计科目, 账户名称", "财务科目名称"),
+        ("t_account", "account_type", "科目类型", "账户类型", "资产/负债/所有者权益/成本/损益"),
         ("t_account", "balance_direction", "余额方向", "借贷方向", "借/贷"),
         ("t_account", "level", "科目层级", "", "1=一级科目, 2=二级科目"),
+        ("t_account", "parent_code", "父科目编码", "上级科目", "用于多级科目树形结构"),
+        ("t_account", "is_active", "是否启用", "", "1=启用, 0=停用"),
 
         # t_cost_center
-        ("t_cost_center", "code", "成本中心编码", "部门编码", "成本中心唯一编码"),
-        ("t_cost_center", "name", "成本中心名称", "部门名称", "如：研发部、市场部、财务部"),
+        ("t_cost_center", "center_code", "成本中心编码", "部门编码", "成本中心唯一编码"),
+        ("t_cost_center", "center_name", "成本中心名称", "部门名称", "如：研发部、市场部、财务部"),
         ("t_cost_center", "manager", "负责人", "部门经理, 主管", "成本中心负责人姓名"),
         ("t_cost_center", "annual_budget", "年度预算", "全年预算", "该成本中心的年度预算金额"),
 
         # t_journal_entry
         ("t_journal_entry", "entry_no", "凭证号", "记账凭证编号", "会计凭证唯一编号"),
         ("t_journal_entry", "entry_date", "凭证日期", "记账日期", "凭证录入日期"),
-        ("t_journal_entry", "entry_type", "凭证类型", "", "收/付/转"),
-        ("t_journal_entry", "period", "会计期间", "账期", "格式 YYYYMM，如 202601"),
-        ("t_journal_entry", "debit_total", "借方合计", "", "凭证借方金额合计"),
-        ("t_journal_entry", "credit_total", "贷方合计", "", "凭证贷方金额合计"),
-        ("t_journal_entry", "status", "凭证状态", "", "draft=草稿, posted=已过账, voided=已作废"),
-        ("t_journal_entry", "preparer", "制单人", "录入人", "凭证制单人姓名"),
-        ("t_journal_entry", "reviewer", "审核人", "", "凭证审核人姓名"),
+        ("t_journal_entry", "entry_type", "凭证类型", "", "收款/付款/转账/期末调整"),
+        ("t_journal_entry", "period", "会计期间", "账期", "格式 YYYY-MM，如 2025-01"),
+        ("t_journal_entry", "total_debit", "借方合计", "借方总额", "凭证借方金额合计"),
+        ("t_journal_entry", "total_credit", "贷方合计", "贷方总额", "凭证贷方金额合计"),
+        ("t_journal_entry", "status", "凭证状态", "", "草稿/已审核/已过账/已作废"),
+        ("t_journal_entry", "prepared_by", "制单人", "录入人, 制单会计", "凭证制单人姓名"),
+        ("t_journal_entry", "reviewed_by", "审核人", "审核会计", "凭证审核人姓名"),
+        ("t_journal_entry", "attachment_count", "附件数", "", "凭证附件张数"),
+        ("t_journal_entry", "source_system", "来源系统", "", "凭证来源的业务系统"),
 
         # t_journal_item
-        ("t_journal_item", "amount", "记账金额", "交易金额, 发生额, 借贷金额", "凭证行的借方或贷方金额"),
-        ("t_journal_item", "direction", "借贷方向", "", "debit=借方, credit=贷方"),
-        ("t_journal_item", "description", "摘要", "备注, 说明", "凭证行摘要说明"),
-        ("t_journal_item", "cost_center_id", "成本中心", "部门", "关联的成本中心"),
+        ("t_journal_item", "entry_id", "凭证ID", "", "关联 t_journal_entry.id"),
+        ("t_journal_item", "line_no", "行号", "", "分录行号"),
+        ("t_journal_item", "account_code", "科目编码", "会计科目", "关联 t_account.account_code"),
+        ("t_journal_item", "summary", "摘要", "备注, 说明", "凭证行摘要说明"),
+        ("t_journal_item", "debit_amount", "借方金额", "借记金额", "凭证行借方金额"),
+        ("t_journal_item", "credit_amount", "贷方金额", "贷记金额", "凭证行贷方金额"),
+        ("t_journal_item", "cost_center_id", "成本中心ID", "部门", "关联 t_cost_center.id"),
+        ("t_journal_item", "project_code", "项目编码", "", "项目核算编码"),
 
         # t_fund_transfer
         ("t_fund_transfer", "transfer_no", "转账单号", "划款单号", "资金划转单号"),
-        ("t_fund_transfer", "transfer_type", "转账类型", "划款类型", "internal=内部转账, external=外部转账"),
-        ("t_fund_transfer", "amount", "转账金额", "划款金额", "资金划转金额"),
-        ("t_fund_transfer", "status", "转账状态", "", "pending=待审批, approved=已批准, completed=已完成, rejected=已拒绝"),
+        ("t_fund_transfer", "transfer_date", "划转日期", "转账日期", "资金划转日期"),
+        ("t_fund_transfer", "transfer_type", "转账类型", "划款类型", "内部调拨/银行转账/现金存取/跨公司划转"),
+        ("t_fund_transfer", "from_account", "转出账户", "付款账户", "资金转出的银行账户"),
+        ("t_fund_transfer", "to_account", "转入账户", "收款账户", "资金转入的银行账户"),
+        ("t_fund_transfer", "amount", "划转金额", "转账金额", "资金划转金额"),
         ("t_fund_transfer", "currency", "币种", "", "CNY/USD/EUR"),
+        ("t_fund_transfer", "status", "转账状态", "", "待审批/已审批/已执行/已拒绝/已撤销"),
+        ("t_fund_transfer", "applicant", "申请人", "", "资金划转申请人"),
+        ("t_fund_transfer", "approver", "审批人", "", "资金划转审批人"),
+        ("t_fund_transfer", "purpose", "用途说明", "", "资金划转用途"),
 
         # t_budget
-        ("t_budget", "year", "预算年度", "", "预算所属年份"),
-        ("t_budget", "month", "预算月份", "", "预算所属月份，1-12"),
+        ("t_budget", "budget_year", "预算年度", "", "预算所属年份"),
+        ("t_budget", "budget_month", "预算月份", "", "预算所属月份，1-12"),
+        ("t_budget", "cost_center_id", "成本中心ID", "部门", "关联 t_cost_center.id"),
+        ("t_budget", "account_code", "科目编码", "", "关联 t_account.account_code"),
         ("t_budget", "budget_amount", "预算金额", "预算额度", "该月预算金额"),
         ("t_budget", "actual_amount", "实际金额", "实际发生额", "该月实际发生金额"),
-        ("t_budget", "variance", "差异", "偏差", "实际 - 预算，正数=超支"),
+        ("t_budget", "status", "预算状态", "", "编制中/已审批/执行中/已关闭"),
 
         # t_invoice
         ("t_invoice", "invoice_no", "发票号码", "", "发票唯一号码"),
-        ("t_invoice", "invoice_type", "发票类型", "", "增值税专用/普通/电子"),
-        ("t_invoice", "amount", "发票金额", "不含税金额", "发票不含税金额"),
+        ("t_invoice", "invoice_type", "发票类型", "", "增值税专用发票/增值税普通发票/电子发票/收据"),
+        ("t_invoice", "direction", "开票方向", "", "销项=对外开票, 进项=收到发票"),
+        ("t_invoice", "invoice_date", "开票日期", "", "发票开具日期"),
+        ("t_invoice", "buyer_name", "购方名称", "购买方", "发票购买方名称"),
+        ("t_invoice", "seller_name", "销方名称", "销售方", "发票销售方名称"),
+        ("t_invoice", "amount_without_tax", "不含税金额", "发票金额", "发票不含税金额"),
         ("t_invoice", "tax_amount", "税额", "", "发票税额"),
-        ("t_invoice", "direction", "开票方向", "", "input=进项, output=销项"),
-        ("t_invoice", "verify_status", "认证状态", "", "pending=待认证, verified=已认证, rejected=已退回"),
+        ("t_invoice", "total_amount", "价税合计", "含税金额", "不含税金额 + 税额"),
+        ("t_invoice", "tax_rate", "税率", "", "增值税税率(%)"),
+        ("t_invoice", "status", "发票状态", "", "正常/红冲/作废"),
+        ("t_invoice", "verification_status", "认证状态", "", "进项发票: 未认证/已认证/认证失败"),
 
         # t_receivable_payable
-        ("t_receivable_payable", "type", "类型", "", "receivable=应收, payable=应付"),
+        ("t_receivable_payable", "rp_type", "类型", "", "应收/应付"),
+        ("t_receivable_payable", "rp_no", "单据号", "", "应收应付单据编号"),
         ("t_receivable_payable", "counterparty", "往来单位", "对方单位, 客户/供应商", "交易对手方名称"),
+        ("t_receivable_payable", "contract_no", "合同号", "", "关联合同编号"),
         ("t_receivable_payable", "original_amount", "原始金额", "合同金额", "应收/应付原始金额"),
-        ("t_receivable_payable", "settled_amount", "已结算金额", "已收/已付金额", "已结算的金额"),
-        ("t_receivable_payable", "balance", "余额", "未结金额", "未结算余额 = 原始金额 - 已结算金额"),
+        ("t_receivable_payable", "settled_amount", "已结金额", "已收/已付金额", "已结算的金额"),
         ("t_receivable_payable", "due_date", "到期日", "", "应收/应付到期日期"),
-        ("t_receivable_payable", "status", "状态", "", "pending=待结算, partial=部分结算, settled=已结清, overdue=逾期"),
+        ("t_receivable_payable", "status", "状态", "", "未结/部分结清/已结清/逾期/核销"),
 
         # t_expense_claim
         ("t_expense_claim", "claim_no", "报销单号", "", "报销单编号"),
+        ("t_expense_claim", "claim_date", "报销日期", "", "报销申请日期"),
         ("t_expense_claim", "claimant", "报销人", "申请人", "报销申请人姓名"),
-        ("t_expense_claim", "expense_type", "费用类型", "报销类型", "差旅/办公/招待/交通/培训"),
-        ("t_expense_claim", "amount", "报销金额", "费用金额", "报销总金额"),
-        ("t_expense_claim", "status", "报销状态", "", "pending=待审批, approved=已批准, paid=已付款, rejected=已拒绝"),
+        ("t_expense_claim", "cost_center_id", "成本中心ID", "部门", "关联 t_cost_center.id"),
+        ("t_expense_claim", "expense_type", "费用类型", "报销类型", "差旅/交通/餐饮/办公/招待/培训/其他"),
+        ("t_expense_claim", "total_amount", "报销总额", "费用金额", "报销总金额"),
+        ("t_expense_claim", "approved_amount", "审批金额", "", "审批通过的金额"),
+        ("t_expense_claim", "status", "报销状态", "", "草稿/已提交/已审批/已付款/已拒绝/已撤回"),
         ("t_expense_claim", "approver", "审批人", "", "报销审批人"),
+        ("t_expense_claim", "description", "费用说明", "", "报销费用说明"),
 
         # t_fixed_asset
         ("t_fixed_asset", "asset_code", "资产编码", "资产编号", "固定资产唯一编码"),
         ("t_fixed_asset", "asset_name", "资产名称", "设备名称", "固定资产名称"),
-        ("t_fixed_asset", "original_cost", "原值", "购置原值", "固定资产原始购置成本"),
+        ("t_fixed_asset", "asset_category", "资产类别", "", "房屋建筑/机器设备/运输工具/电子设备/办公家具/其他"),
+        ("t_fixed_asset", "acquisition_date", "购入日期", "", "固定资产购入日期"),
+        ("t_fixed_asset", "acquisition_cost", "原值", "购置原值", "固定资产原始购置成本"),
+        ("t_fixed_asset", "salvage_value", "残值", "预计残值", "固定资产预计净残值"),
+        ("t_fixed_asset", "useful_life_months", "使用月数", "折旧月数", "预计使用月数"),
+        ("t_fixed_asset", "monthly_depreciation", "月折旧额", "", "每月应计提折旧额"),
         ("t_fixed_asset", "accumulated_depreciation", "累计折旧", "", "截至当前的累计折旧额"),
-        ("t_fixed_asset", "net_value", "净值", "", "原值 - 累计折旧"),
+        ("t_fixed_asset", "depreciation_method", "折旧方法", "", "直线法/双倍余额递减法/年数总和法"),
         ("t_fixed_asset", "location", "存放地点", "使用部门", "资产存放位置"),
+        ("t_fixed_asset", "custodian", "保管人", "", "资产保管责任人"),
+        ("t_fixed_asset", "status", "资产状态", "", "在用/闲置/已报废/已处置"),
     ]
 
     with conn.cursor() as cur:

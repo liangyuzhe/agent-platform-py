@@ -24,6 +24,8 @@ class SQLReactState(TypedDict):
     query: str
     table_names: list[str]                       # 所有可用表名（启动时缓存）
     selected_tables: list[str]                   # LLM 选中的相关表名
+    evidence: list[str]                          # 业务知识检索结果
+    few_shot_examples: list[str]                 # SQL Q&A few-shot 参考
     docs: list[Document]                         # 检索到的表结构
     sql: str                                     # 生成的 SQL
     is_sql: bool                                 # 是否为 SQL 输出

@@ -64,15 +64,17 @@
         .sql-messages { height: 500px; overflow-y: auto; padding: 20px; }
         .sql-message { margin-bottom: 16px; }
         .sql-message.user { text-align: right; }
-        .sql-message .bubble { display: inline-block; max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; text-align: left; }
-        .sql-message.user .bubble { background: #007AFF; color: white; border-bottom-right-radius: 4px; }
+        .sql-message .bubble { display: inline-block; max-width: 85%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; text-align: left; }
+        .sql-message.user .bubble { background: #007AFF; color: white; border-bottom-right-radius: 4px; white-space: pre-wrap; }
         .sql-message.assistant .bubble { background: #E9ECEF; color: #333; border-bottom-left-radius: 4px; }
         .sql-detail { margin-top: 8px; }
         .sql-detail summary { cursor: pointer; font-size: 12px; color: #888; }
         .sql-detail pre {
-            margin-top: 6px; padding: 10px; background: #f8f9fa; border-radius: 6px;
+            margin-top: 6px; padding: 12px; background: #f8f9fa; border-radius: 6px;
             font-size: 13px; overflow-x: auto; border: 1px solid #eee;
+            white-space: pre-wrap; word-break: break-all; max-width: 100%;
         }
+        .bubble .answer-text { display: block; margin-bottom: 8px; }
         .intent-tag {
             display: inline-block; padding: 2px 8px; border-radius: 4px;
             font-size: 11px; font-weight: 600; margin-bottom: 6px;
@@ -346,9 +348,9 @@
 
             if (data.pending_approval && data.sql) {
                 // SQL approval flow
-                html += '<span class="intent-tag sql">SQL</span><br>';
-                html += escHtml(data.answer || '请确认是否执行该 SQL') + '<br>';
-                html += '<details class="sql-detail"><summary>查看 SQL</summary>';
+                html += '<span class="intent-tag sql">SQL</span>';
+                html += '<div class="answer-text">' + escHtml(data.answer || '请确认是否执行该 SQL') + '</div>';
+                html += '<details class="sql-detail" open><summary>SQL 语句</summary>';
                 html += '<pre>' + escHtml(data.sql) + '</pre></details>';
                 html += '<div class="approval-actions">';
                 html += '<button class="btn-approve" onclick="approveSql(this, true)">执行</button>';
@@ -357,8 +359,8 @@
             } else {
                 // Normal response
                 const isSql = data.answer && data.answer.includes('SELECT');
-                html += `<span class="intent-tag ${isSql ? 'sql' : 'chat'}">${isSql ? 'SQL' : 'Chat'}</span><br>`;
-                html += escHtml(data.answer || '(无响应)');
+                html += `<span class="intent-tag ${isSql ? 'sql' : 'chat'}">${isSql ? 'SQL' : 'Chat'}</span>`;
+                html += '<div class="answer-text">' + escHtml(data.answer || '(无响应)') + '</div>';
             }
 
             bubble.innerHTML = html;

@@ -452,6 +452,102 @@ def get_schema_table_names(source: str = "mysql_schema") -> list[str]:
         client.close()
 
 
+def search_schema_tables(query: str, top_k: int = 10, source: str = "mysql_schema") -> list[str]:
+    """Vector search schema docs, return top-K unique table names (Stage 1 pre-filter)."""
+    from pymilvus import MilvusClient
+
+    embeddings = _get_embeddings()
+    uri = f"http://{settings.milvus.addr}"
+    client = MilvusClient(uri=uri)
+    try:
+        vector = embeddings.embed_query(query)
+        results = client.search(
+            collection_name=settings.milvus.collection_name,
+            data=[vector],
+            limit=top_k,
+            filter=f'source == "{source}"',
+            output_fields=["table_name"],
+        )
+        names = []
+        seen = set()
+        for hit in results[0]:
+            entity = hit.get("entity", {})
+            name = entity.get("table_name", "")
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        logger.info("Vector search recalled %d tables for query '%s': %s", len(names), query[:50], names)
+        return names
+    finally:
+        client.close()
+
+
+def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
+    """Vector search for business knowledge (terms, formulas, synonyms)."""
+    from pymilvus import MilvusClient
+
+    embeddings = _get_embeddings()
+    uri = f"http://{settings.milvus.addr}"
+    client = MilvusClient(uri=uri)
+    try:
+        vector = embeddings.embed_query(query)
+        results = client.search(
+            collection_name=settings.milvus.collection_name,
+            data=[vector],
+            limit=top_k,
+            filter='source == "business_knowledge"',
+            output_fields=["text", "doc_id"],
+        )
+        docs = []
+        for hit in results[0]:
+            entity = hit.get("entity", {})
+            docs.append(Document(
+                page_content=entity.get("text", ""),
+                metadata={
+                    "source": "business_knowledge",
+                    "doc_id": entity.get("doc_id", ""),
+                    "score": hit.get("distance", 0),
+                },
+            ))
+        logger.info("Business knowledge recall: %d docs for query '%s'", len(docs), query[:50])
+        return docs
+    finally:
+        client.close()
+
+
+def recall_agent_knowledge(query: str, top_k: int = 3) -> list[Document]:
+    """Vector search for agent knowledge (SQL Q&A few-shot pairs)."""
+    from pymilvus import MilvusClient
+
+    embeddings = _get_embeddings()
+    uri = f"http://{settings.milvus.addr}"
+    client = MilvusClient(uri=uri)
+    try:
+        vector = embeddings.embed_query(query)
+        results = client.search(
+            collection_name=settings.milvus.collection_name,
+            data=[vector],
+            limit=top_k,
+            filter='source == "agent_knowledge"',
+            output_fields=["text", "doc_id"],
+        )
+        docs = []
+        for hit in results[0]:
+            entity = hit.get("entity", {})
+            docs.append(Document(
+                page_content=entity.get("text", ""),
+                metadata={
+                    "source": "agent_knowledge",
+                    "doc_id": entity.get("doc_id", ""),
+                    "score": hit.get("distance", 0),
+                },
+            ))
+        logger.info("Agent knowledge recall: %d docs for query '%s'", len(docs), query[:50])
+        return docs
+    finally:
+        client.close()
+
+
 def get_schema_docs_by_tables(
     table_names: list[str],
     source: str = "mysql_schema",

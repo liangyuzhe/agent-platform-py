@@ -57,6 +57,8 @@
 
 **取舍**：用一次额外的 LLM 调用换取更高的召回准确率。对于 SQL 场景，错误的 schema 会导致生成错误 SQL，准确率比延迟更重要。
 
+> **后续优化**：迭代 5 进一步优化为"向量粗筛 top-10 + LLM 精选"两阶段方案，避免全量表名发 LLM 的 token 浪费。
+
 ---
 
 ## 迭代 2：语义模型（字段级业务映射）
@@ -123,10 +125,163 @@ CREATE TABLE t_semantic_model (
 
 ---
 
-## 迭代 3：业务知识配置（TODO）
+## 迭代 3：业务知识配置 ✅
 
-> 参考 DataAgent 的 BusinessKnowledge 模块，支持业务术语、公式定义的存储和检索。
+### 为什么优化
 
-## 迭代 4：SQL 领域智能体知识库（TODO）
+用户问"毛利率是多少"，LLM 不知道"毛利率 = (收入 - 成本) / 收入 * 100"，也无法知道这个公式关联 `t_journal_item` 和 `t_account` 表。业务知识是"不存在于数据库 schema 中的计算逻辑和领域定义"。
 
-> 参考 DataAgent 的 AgentKnowledge 模块，支持 Q&A few-shot 对注入 SQL 生成 prompt。
+DataAgent 的 BusinessKnowledge 模块存储业务术语 + 公式 + 同义词，向量检索后注入 SQL 生成 prompt。
+
+### 优化了什么
+
+1. MySQL 新建 `t_business_knowledge` 表，存储业务术语、公式、同义词
+2. 向量化存入 Milvus（metadata.source = "business_knowledge"）
+3. `sql_react` 图新增 `recall_evidence` 节点，向量检索业务知识
+4. 检索结果注入 `sql_generate` prompt
+5. Admin API 新增业务知识 CRUD（GET/POST/DELETE/batch/reindex）
+
+### 怎么优化的
+
+#### 数据模型
+
+```sql
+CREATE TABLE t_business_knowledge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    term VARCHAR(128) NOT NULL COMMENT '业务术语',
+    formula TEXT NOT NULL COMMENT '公式/定义',
+    synonyms TEXT COMMENT '同义词，逗号分隔',
+    related_tables TEXT COMMENT '关联表名，逗号分隔',
+    UNIQUE KEY uk_term (term)
+);
+```
+
+#### 图流程变更
+
+```
+优化前: START → load_table_names → select_tables → sql_retrieve → ...
+优化后: START → load_table_names → select_tables → recall_evidence → sql_retrieve → ...
+```
+
+#### 消费路径
+
+```
+recall_evidence:
+  用户问题 → 向量检索 t_business_knowledge (score > 0.3) → 匹配的业务知识
+  ↓
+sql_generate:
+  prompt += "业务知识:\n毛利率 = (收入-成本)/收入*100\n预算执行率 = 实际/预算*100"
+```
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "毛利率是多少" | LLM 不知道公式，无法生成 SQL | 注入公式 + 关联表，直接生成 |
+| "预算执行率" | LLM 可能误解为普通字段查询 | 注入"实际/预算*100"公式 |
+| 术语同义词匹配 | 无法识别 | 向量检索匹配同义词 |
+
+## 迭代 4：SQL 领域智能体知识库 ✅
+
+### 为什么优化
+
+用户问"查询各部门费用汇总"，LLM 需要从零开始构造 SQL，可能遗漏 JOIN 条件、GROUP BY 逻辑。如果有相似问题的 SQL 示例（few-shot），LLM 可以参考模式生成更准确的 SQL。
+
+DataAgent 的 AgentKnowledge 模块存储 Q&A 对，向量检索后注入 prompt 作为 few-shot 示例。
+
+### 优化了什么
+
+1. MySQL 新建 `t_agent_knowledge` 表，存储问题、SQL、说明、分类
+2. 向量化存入 Milvus（metadata.source = "agent_knowledge"）
+3. `recall_evidence` 节点同时检索业务知识 + 智能体知识库
+4. 检索结果作为 few-shot 示例注入 `sql_generate` prompt
+5. Admin API 新增智能体知识库 CRUD（GET/POST/DELETE/batch/reindex）
+6. 种子数据：12 个常见财务 SQL Q&A 对
+
+### 怎么优化的
+
+#### 数据模型
+
+```sql
+CREATE TABLE t_agent_knowledge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    question TEXT NOT NULL COMMENT '用户问题',
+    sql_text TEXT NOT NULL COMMENT '参考 SQL',
+    description TEXT COMMENT '说明',
+    category VARCHAR(64) COMMENT '分类: query/report/analysis',
+    UNIQUE KEY uk_question (question(128))
+);
+```
+
+#### 图流程
+
+```
+recall_evidence:
+  用户问题 → 向量检索 business_knowledge (score > 0.3) → 业务知识
+  用户问题 → 向量检索 agent_knowledge (score > 0.3) → SQL Q&A few-shot
+  ↓
+sql_generate:
+  prompt += "业务知识:\n毛利率 = ..."
+  prompt += "相似问题参考:\n问题: 查询所有科目余额\nSQL: SELECT ..."
+```
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "各部门费用汇总" | LLM 从零构造 SQL | 参考相似 Q&A，JOIN 逻辑更准确 |
+| "预算执行情况" | LLM 可能忘记计算公式 | 注入 few-shot + 业务知识双保险 |
+| 复杂多表查询 | LLM 容易遗漏关联条件 | 参考已有示例模式 |
+
+---
+
+## 迭代 5：表选择两阶段优化（向量粗筛 + LLM 精选）✅
+
+### 为什么优化
+
+迭代 1 把表选择从"向量检索"改为"LLM 选表"，但问题是把**所有表名**都发给 LLM。表少时没问题，表多（50+）时浪费 token。
+
+对比 DataAgent 的方案：先向量检索 top-10 候选表，再让 LLM 从候选中精选。两阶段组合兼顾效率和准确率。
+
+### 优化了什么
+
+1. `select_tables` 节点改为两阶段：向量粗筛 → LLM 精选
+2. 新增 `search_schema_tables` 函数：向量检索 schema 文档，返回 top-K 候选表名
+3. 候选 ≤ 3 个时直接使用，省一次 LLM 调用
+4. 向量检索失败时 fallback 到全量表名 + LLM 选表
+5. 移除 `load_table_names` 独立节点（合并到 `select_tables` 内部）
+
+### 怎么优化的
+
+#### 图流程变更
+
+```
+优化前: START → load_table_names（全量） → select_tables（LLM 从全部选） → ...
+优化后: START → select_tables（向量 top-10 → LLM 精选） → recall_evidence → ...
+```
+
+#### select_tables 逻辑
+
+```python
+# Stage 1: 向量粗筛
+candidate_tables = search_schema_tables(query, top_k=10)
+
+# Stage 2: 候选少，直接用
+if len(candidate_tables) <= 3:
+    return candidate_tables
+
+# Stage 2: 候选多，LLM 精选
+response = llm.invoke(f"从 {candidate_tables} 中选出需要的表")
+```
+
+### 提升预期
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| 50+ 表库 | 全量表名发 LLM（浪费 token） | 向量 top-10 → LLM 只看 10 个 |
+| 3 个表命中 | LLM 调用（不必要） | 直接使用，省一次 LLM |
+| 向量检索失败 | 报错 | fallback 到全量 + LLM |
+
+### 待优化（后续迭代）
+
+- **外键扩展**：向量粗筛后，自动补全外键关联的缺失表（需外键元数据）

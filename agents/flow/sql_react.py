@@ -11,7 +11,7 @@ from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
-from agents.rag.retriever import get_schema_table_names, get_schema_docs_by_tables
+from agents.rag.retriever import get_schema_table_names, get_schema_docs_by_tables, recall_business_knowledge, recall_agent_knowledge, search_schema_tables
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
@@ -26,7 +26,7 @@ _MAX_RETRIES = 3
 
 
 async def load_table_names(state: SQLReactState) -> dict:
-    """从 Milvus 加载所有已索引的表名列表（启动时调用一次）。"""
+    """从 Milvus 加载所有已索引的表名列表（fallback 用）。"""
     table_names = state.get("table_names", [])
     if table_names:
         return {}
@@ -40,34 +40,95 @@ async def load_table_names(state: SQLReactState) -> dict:
 
 
 async def select_tables(state: SQLReactState) -> dict:
-    """LLM 从表名列表中选择与用户问题相关的表。"""
-    table_names = state.get("table_names", [])
-    if not table_names:
-        return {"selected_tables": []}
+    """两阶段表选择：向量粗筛 → LLM 精选。
 
+    Stage 1: 用户问题向量检索 top-K schema 文档，提取候选表名
+    Stage 2: 候选表 > 3 个时，LLM 从候选中精选；否则直接使用
+    """
+    query = state.get("query", "")
+
+    # Stage 1: 向量粗筛
+    candidate_tables = []
+    try:
+        candidate_tables = await asyncio.to_thread(search_schema_tables, query, 10)
+    except Exception as e:
+        logger.warning("Vector search for tables failed: %s", e)
+
+    # Fallback: 向量检索无结果，加载全量表名
+    if not candidate_tables:
+        table_names = state.get("table_names", [])
+        if not table_names:
+            try:
+                table_names = await asyncio.to_thread(get_schema_table_names)
+            except Exception:
+                table_names = []
+        if table_names:
+            # 全量表名太多，仍用 LLM 筛选
+            candidate_tables = table_names
+
+    if not candidate_tables:
+        return {"selected_tables": [], "table_names": state.get("table_names", [])}
+
+    # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
+    if len(candidate_tables) <= 3:
+        logger.info("select_tables: %d candidates, using directly: %s", len(candidate_tables), candidate_tables)
+        return {"selected_tables": candidate_tables, "table_names": candidate_tables}
+
+    # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
-    names_text = ", ".join(table_names)
+    names_text = ", ".join(candidate_tables)
 
     response = await model.ainvoke([
-        SystemMessage(content=f"""你是一个数据库专家。根据用户的问题，从可用表名列表中选出需要用到的表。
+        SystemMessage(content=f"""你是一个数据库专家。根据用户的问题，从候选表名中选出需要用到的表。
 
-可用表名: {names_text}
+候选表名: {names_text}
 
 要求：
 1. 只返回需要用到的表名，用逗号分隔
 2. 如果需要多表关联，选出所有涉及的表
 3. 如果问题与数据库无关（如闲聊），返回空
 4. 只返回表名，不要其他内容"""),
-        HumanMessage(content=state["query"]),
+        HumanMessage(content=query),
     ])
 
     raw = response.content.strip()
     if not raw:
-        return {"selected_tables": []}
+        return {"selected_tables": candidate_tables, "table_names": candidate_tables}
 
-    selected = [n.strip() for n in raw.split(",") if n.strip() in table_names]
-    logger.info("select_tables: LLM selected %s from query: %s", selected, state["query"][:50])
-    return {"selected_tables": selected}
+    selected = [n.strip() for n in raw.split(",") if n.strip() in candidate_tables]
+    if not selected:
+        selected = candidate_tables
+
+    logger.info("select_tables: LLM selected %d from %d candidates: %s", len(selected), len(candidate_tables), selected)
+    return {"selected_tables": selected, "table_names": candidate_tables}
+
+
+async def recall_evidence(state: SQLReactState) -> dict:
+    """向量检索业务知识 + 智能体知识库，注入 SQL 生成上下文。"""
+    query = state.get("query", "")
+    if not query:
+        return {"evidence": [], "few_shot_examples": []}
+
+    evidence = []
+    few_shot = []
+
+    # 业务知识（术语、公式）
+    try:
+        bk_docs = await asyncio.to_thread(recall_business_knowledge, query, 5)
+        evidence = [d.page_content for d in bk_docs if d.metadata.get("score", 0) > 0.3]
+        logger.info("recall_evidence: %d business knowledge entries", len(evidence))
+    except Exception as e:
+        logger.warning("Business knowledge recall failed: %s", e)
+
+    # 智能体知识库（SQL Q&A few-shot）
+    try:
+        ak_docs = await asyncio.to_thread(recall_agent_knowledge, query, 3)
+        few_shot = [d.page_content for d in ak_docs if d.metadata.get("score", 0) > 0.3]
+        logger.info("recall_evidence: %d agent knowledge entries", len(few_shot))
+    except Exception as e:
+        logger.warning("Agent knowledge recall failed: %s", e)
+
+    return {"evidence": evidence, "few_shot_examples": few_shot}
 
 
 async def sql_retrieve(state: SQLReactState, config=None) -> dict:
@@ -110,13 +171,13 @@ async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: lis
     return unique_new
 
 
-def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str) -> list:
+def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str, evidence_text: str, few_shot_text: str) -> list:
     """Build messages for sql_generate LLM call."""
     return [
         SystemMessage(content=f"""你是一个 SQL 专家。根据用户的问题和数据库表结构信息，生成正确的 SQL 查询。
 
 表结构信息:
-        {docs_text}{refine_context}{history_context}
+        {docs_text}{evidence_text}{few_shot_text}{refine_context}{history_context}
 
 要求：
 1. 使用 MySQL 语法
@@ -124,7 +185,8 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
 3. 如果有执行历史和错误信息，请分析错误原因并生成修正后的 SQL
 4. 如果现有表结构不足以生成正确的 SQL（例如缺少关联表、缺少字段所在的表），
    请设置 needs_more_tables=true 并在 missing_tables 中列出你需要的表名
-5. 使用 format_response 工具输出结果"""),
+5. 参考相似问题的 SQL 示例，但要根据实际表结构调整
+6. 使用 format_response 工具输出结果"""),
         HumanMessage(content=query),
     ]
 
@@ -153,13 +215,25 @@ async def sql_generate(state: SQLReactState) -> dict:
             history_lines.append(entry)
         history_context = f"\n执行历史:\n" + "\n".join(history_lines)
 
+    # Business knowledge evidence
+    evidence = state.get("evidence", [])
+    evidence_text = ""
+    if evidence:
+        evidence_text = "\n\n业务知识:\n" + "\n".join(evidence)
+
+    # Agent knowledge few-shot examples
+    few_shot = state.get("few_shot_examples", [])
+    few_shot_text = ""
+    if few_shot:
+        few_shot_text = "\n\n相似问题参考:\n" + "\n---\n".join(few_shot)
+
     # Accumulate docs across re-retrieval rounds
     all_docs = list(state.get("docs", []))
 
     for round_idx in range(_MAX_TABLE_SEARCH_ROUNDS):
         docs_text = "\n\n".join([d.page_content for d in all_docs])
 
-        messages = _build_sql_messages(state["query"], docs_text, refine_context, history_context)
+        messages = _build_sql_messages(state["query"], docs_text, refine_context, history_context, evidence_text, few_shot_text)
         response = await model_with_tools.ainvoke(messages)
 
         if not response.tool_calls:
@@ -316,8 +390,8 @@ def build_sql_react_graph():
     """
     graph = StateGraph(SQLReactState)
 
-    graph.add_node("load_table_names", load_table_names)
     graph.add_node("select_tables", select_tables)
+    graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
     graph.add_node("sql_generate", sql_generate)
@@ -326,9 +400,9 @@ def build_sql_react_graph():
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("error_analysis", error_analysis)
 
-    graph.add_edge(START, "load_table_names")
-    graph.add_edge("load_table_names", "select_tables")
-    graph.add_edge("select_tables", "sql_retrieve")
+    graph.add_edge(START, "select_tables")
+    graph.add_edge("select_tables", "recall_evidence")
+    graph.add_edge("recall_evidence", "sql_retrieve")
     graph.add_edge("sql_retrieve", "check_docs")
 
     def route_after_check(state: SQLReactState) -> str:

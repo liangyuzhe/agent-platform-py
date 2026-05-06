@@ -1,6 +1,6 @@
 """Seed financial business tables into MySQL, then re-index into Milvus + ES.
 
-Uses pymysql directly (MCP server is read-only).
+Generates data relative to current date so queries like "last month" always work.
 
 Usage:
     python -m scripts.seed_financial
@@ -8,6 +8,7 @@ Usage:
 
 import random
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import pymysql
@@ -34,6 +35,27 @@ def run_sql(cursor, sql, desc=""):
             print(f"  [OK] {desc}")
     except Exception as e:
         print(f"  [ERR] {desc}: {e}")
+
+
+def _rand_date(year, month):
+    """Generate a random date within the given month."""
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year}-{month:02d}-{random.randint(1, last_day):02d}"
+
+
+def _recent_months(n=6):
+    """Return list of (year, month) for the last n months including current."""
+    today = date.today()
+    months = []
+    for i in range(n - 1, -1, -1):
+        y = today.year
+        m = today.month - i
+        while m <= 0:
+            m += 12
+            y -= 1
+        months.append((y, m))
+    return months
 
 
 def create_tables(cursor):
@@ -233,6 +255,8 @@ def create_tables(cursor):
 def seed_data(conn, cursor):
     print("=== Seeding data ===")
     random.seed(42)
+    today = date.today()
+    months = _recent_months(6)
 
     # -- 会计科目 (29 条) --
     accounts = [
@@ -292,7 +316,7 @@ def seed_data(conn, cursor):
             f"cost_center {cc[0]}")
     conn.commit()
 
-    # -- 记账凭证 + 分录 (60 张凭证) --
+    # -- 记账凭证 + 分录 (每个凭证 10 条) --
     entry_no = 1
     summaries = [
         "支付供应商货款", "收到客户回款", "报销差旅费", "计提折旧",
@@ -303,10 +327,10 @@ def seed_data(conn, cursor):
     reviewers = ["赵主管", "钱经理"]
     preparers = ["张会计", "李出纳", "王会计"]
 
-    for year_month in ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]:
-        year, month = year_month.split("-")
+    for y, m in months:
+        ym = f"{y}-{m:02d}"
         for _ in range(10):
-            entry_date = f"{year}-{month}-{random.randint(1, 28):02d}"
+            entry_date = _rand_date(y, m)
             entry_type = random.choice(["收款", "付款", "转账", "转账", "转账"])
             status = random.choice(["已审核", "已过账", "已过账", "已过账"])
             prepared = random.choice(preparers)
@@ -324,7 +348,6 @@ def seed_data(conn, cursor):
                     debit = amount if is_debit else 0
                     credit = 0 if is_debit else amount
                 else:
-                    # Last line: balance
                     debit = round(total_credit - total_debit, 2) if total_credit > total_debit else 0
                     credit = round(total_debit - total_credit, 2) if total_debit > total_credit else 0
 
@@ -337,16 +360,16 @@ def seed_data(conn, cursor):
 
                 items.append((line_no, acc[0], summary, debit, credit, cc_num))
 
-            entry_no_str = f"PZ-{year}{month}-{entry_no:04d}"
+            entry_no_str = f"PZ-{y}{m:02d}-{entry_no:04d}"
+            posted_at = f"'{entry_date} 10:00:00'" if status == "已过账" else "NULL"
             run_sql(cursor,
                 f"INSERT IGNORE INTO t_journal_entry (entry_no, entry_date, entry_type, period, "
-                f"total_debit, total_credit, attachment_count, status, prepared_by, reviewed_by, memo) "
-                f"VALUES ('{entry_no_str}', '{entry_date}', '{entry_type}', '{year_month}', "
+                f"total_debit, total_credit, attachment_count, status, prepared_by, reviewed_by, posted_at, memo) "
+                f"VALUES ('{entry_no_str}', '{entry_date}', '{entry_type}', '{ym}', "
                 f"{total_debit:.2f}, {total_credit:.2f}, {random.randint(1, 5)}, '{status}', "
-                f"'{prepared}', '{reviewer}', '自动生成')",
+                f"'{prepared}', '{reviewer}', {posted_at}, '自动生成')",
                 f"entry {entry_no_str}")
 
-            # Get the entry_id
             cursor.execute("SELECT LAST_INSERT_ID()")
             entry_id = cursor.fetchone()[0]
 
@@ -360,144 +383,208 @@ def seed_data(conn, cursor):
 
             entry_no += 1
     conn.commit()
-    print(f"  [OK] 60 journal entries with items")
+    print(f"  [OK] {len(months) * 10} journal entries with items")
 
-    # -- 资金划转 (30 条) --
-    for i in range(30):
-        transfer_no = f"FT-2025-{i+1:04d}"
-        transfer_date = f"2025-{random.randint(1,6):02d}-{random.randint(1,28):02d}"
-        t_type = random.choice(["内部调拨", "银行转账", "银行转账", "跨公司划转"])
-        from_acc = random.choice(["工行基本户", "建行一般户", "招行一般户", "现金库"])
-        to_acc = random.choice(["工行基本户", "建行一般户", "招行一般户", "现金库"])
-        amount = round(random.uniform(10000, 2000000), 2)
-        status = random.choice(["已审批", "已执行", "已执行", "已执行"])
-        applicant = random.choice(["张会计", "李出纳", "王经理"])
-        approver = random.choice(["赵主管", "钱经理"])
-        purpose = random.choice([
-            "日常资金调拨", "支付供应商货款", "缴纳税款", "发放工资",
-            "归还贷款", "投资理财", "备用金提取", "跨账户归集",
-        ])
-        run_sql(cursor,
-            f"INSERT IGNORE INTO t_fund_transfer (transfer_no, transfer_date, transfer_type, "
-            f"from_account, to_account, amount, status, applicant, approver, purpose) "
-            f"VALUES ('{transfer_no}', '{transfer_date}', '{t_type}', '{from_acc}', '{to_acc}', "
-            f"{amount:.2f}, '{status}', '{applicant}', '{approver}', '{purpose}')",
-            f"transfer {transfer_no}")
+    # -- 资金划转 (每月 5 条) --
+    ft_no = 1
+    transfer_purposes = [
+        "日常资金调拨", "支付供应商货款", "缴纳税款", "发放工资",
+        "归还贷款", "投资理财", "备用金提取", "跨账户归集",
+    ]
+    for y, m in months:
+        for _ in range(5):
+            transfer_no = f"FT-{y}{m:02d}-{ft_no:04d}"
+            transfer_date = _rand_date(y, m)
+            t_type = random.choice(["内部调拨", "银行转账", "银行转账", "跨公司划转"])
+            from_acc = random.choice(["工行基本户", "建行一般户", "招行一般户", "现金库"])
+            to_acc = random.choice(["工行基本户", "建行一般户", "招行一般户", "现金库"])
+            amount = round(random.uniform(10000, 2000000), 2)
+            status = random.choice(["已审批", "已执行", "已执行", "已执行"])
+            applicant = random.choice(["张会计", "李出纳", "王经理"])
+            approver = random.choice(["赵主管", "钱经理"])
+            purpose = random.choice(transfer_purposes)
+            approved_at = f"'{transfer_date} 14:00:00'" if status != "待审批" else "NULL"
+            executed_at = f"'{transfer_date} 16:00:00'" if status == "已执行" else "NULL"
+            run_sql(cursor,
+                f"INSERT IGNORE INTO t_fund_transfer (transfer_no, transfer_date, transfer_type, "
+                f"from_account, to_account, amount, status, applicant, approver, approved_at, executed_at, purpose) "
+                f"VALUES ('{transfer_no}', '{transfer_date}', '{t_type}', '{from_acc}', '{to_acc}', "
+                f"{amount:.2f}, '{status}', '{applicant}', '{approver}', {approved_at}, {executed_at}, '{purpose}')",
+                f"transfer {transfer_no}")
+            ft_no += 1
     conn.commit()
-    print("  [OK] 30 fund transfers")
+    print(f"  [OK] {len(months) * 5} fund transfers")
 
-    # -- 预算 (180 条: 6 月 x 6 中心 x 5 科目) --
+    # -- 预算 (每月 x 6 中心 x 5 科目) --
     budget_accounts = ["540101", "540102", "540103", "5402", "5403"]
-    for year in [2025]:
-        for month in range(1, 7):
-            for cc_id in range(1, 7):
-                for acc_code in budget_accounts:
-                    budget = round(random.uniform(10000, 200000), 2)
+    for y, m in months:
+        for cc_id in range(1, 7):
+            for acc_code in budget_accounts:
+                budget = round(random.uniform(10000, 200000), 2)
+                # Past months have actual, current month partial
+                if (y, m) < (today.year, today.month):
                     actual = round(budget * random.uniform(0.6, 1.3), 2)
-                    status = "执行中" if month < 6 else "编制中"
-                    run_sql(cursor,
-                        f"INSERT IGNORE INTO t_budget (budget_year, budget_month, cost_center_id, "
-                        f"account_code, budget_amount, actual_amount, status) "
-                        f"VALUES ({year}, {month}, {cc_id}, '{acc_code}', {budget:.2f}, {actual:.2f}, '{status}')",
-                        "")
+                    status = "执行中"
+                elif (y, m) == (today.year, today.month):
+                    actual = round(budget * random.uniform(0.1, 0.5), 2)
+                    status = "执行中"
+                else:
+                    actual = 0
+                    status = "编制中"
+                run_sql(cursor,
+                    f"INSERT IGNORE INTO t_budget (budget_year, budget_month, cost_center_id, "
+                    f"account_code, budget_amount, actual_amount, status) "
+                    f"VALUES ({y}, {m}, {cc_id}, '{acc_code}', {budget:.2f}, {actual:.2f}, '{status}')",
+                    "")
     conn.commit()
-    print("  [OK] 180 budget records")
+    print(f"  [OK] {len(months) * 30} budget records")
 
-    # -- 发票 (50 条) --
+    # -- 发票 (每月 ~8 条) --
     buyers = ["北京科技有限公司", "上海贸易有限公司", "深圳电子有限公司", "广州制造有限公司"]
     sellers = ["原材料供应商A", "设备供应商B", "办公用品供应商C", "物流公司D"]
-    for i in range(50):
-        invoice_no = f"INV-2025-{i+1:06d}"
-        direction = random.choice(["销项", "进项"])
-        inv_date = f"2025-{random.randint(1,6):02d}-{random.randint(1,28):02d}"
-        inv_type = random.choice(["增值税专用发票", "增值税普通发票", "电子发票"])
-        tax_rate = random.choice([13, 9, 6, 3])
-        amount = round(random.uniform(1000, 300000), 2)
-        tax = round(amount * tax_rate / 100, 2)
-        total = round(amount + tax, 2)
-        if direction == "销项":
-            buyer = random.choice(buyers)
-            seller = "本公司"
-        else:
-            buyer = "本公司"
-            seller = random.choice(sellers)
-        status = random.choice(["正常", "正常", "正常", "红冲"])
-        ver_status = random.choice(["已认证", "已认证", "未认证"]) if direction == "进项" else None
-        vs = "NULL" if ver_status is None else f"'{ver_status}'"
-        run_sql(cursor,
-            f"INSERT IGNORE INTO t_invoice (invoice_no, invoice_type, direction, invoice_date, "
-            f"buyer_name, seller_name, amount_without_tax, tax_amount, total_amount, tax_rate, "
-            f"status, verification_status) "
-            f"VALUES ('{invoice_no}', '{inv_type}', '{direction}', '{inv_date}', "
-            f"'{buyer}', '{seller}', {amount:.2f}, {tax:.2f}, {total:.2f}, {tax_rate}, "
-            f"'{status}', {vs})",
-            "")
+    inv_no = 1
+    for y, m in months:
+        for _ in range(8):
+            invoice_no = f"INV-{y}{m:02d}-{inv_no:06d}"
+            direction = random.choice(["销项", "进项"])
+            inv_date = _rand_date(y, m)
+            inv_type = random.choice(["增值税专用发票", "增值税普通发票", "电子发票"])
+            tax_rate = random.choice([13, 9, 6, 3])
+            amount = round(random.uniform(1000, 300000), 2)
+            tax = round(amount * tax_rate / 100, 2)
+            total = round(amount + tax, 2)
+            if direction == "销项":
+                buyer = random.choice(buyers)
+                seller = "本公司"
+            else:
+                buyer = "本公司"
+                seller = random.choice(sellers)
+            status = random.choice(["正常", "正常", "正常", "红冲"])
+            ver_status = random.choice(["已认证", "已认证", "未认证"]) if direction == "进项" else None
+            vs = "NULL" if ver_status is None else f"'{ver_status}'"
+            run_sql(cursor,
+                f"INSERT IGNORE INTO t_invoice (invoice_no, invoice_type, direction, invoice_date, "
+                f"buyer_name, seller_name, amount_without_tax, tax_amount, total_amount, tax_rate, "
+                f"status, verification_status) "
+                f"VALUES ('{invoice_no}', '{inv_type}', '{direction}', '{inv_date}', "
+                f"'{buyer}', '{seller}', {amount:.2f}, {tax:.2f}, {total:.2f}, {tax_rate}, "
+                f"'{status}', {vs})",
+                "")
+            inv_no += 1
     conn.commit()
-    print("  [OK] 50 invoices")
+    print(f"  [OK] {len(months) * 8} invoices")
 
-    # -- 应收应付 (40 条) --
-    counterparties = ["北京科技有限公司", "上海贸易有限公司", "深圳电子有限公司", "原材料供应商A", "设备供应商B", "物流公司D"]
-    for i in range(40):
-        rp_type = random.choice(["应收", "应付"])
-        rp_no = f"{'AR' if rp_type == '应收' else 'AP'}-2025-{i+1:04d}"
-        cp = random.choice(counterparties)
-        amount = round(random.uniform(5000, 500000), 2)
-        settled = round(amount * random.uniform(0, 1), 2)
-        due_date = f"2025-{random.randint(1,12):02d}-{random.randint(1,28):02d}"
-        status = "已结清" if settled >= amount else ("逾期" if due_date < "2025-05" else "未结")
-        run_sql(cursor,
-            f"INSERT IGNORE INTO t_receivable_payable (rp_type, rp_no, counterparty, original_amount, "
-            f"settled_amount, due_date, status) "
-            f"VALUES ('{rp_type}', '{rp_no}', '{cp}', {amount:.2f}, {settled:.2f}, '{due_date}', '{status}')",
-            "")
+    # -- 应收应付 (每月 ~7 条) --
+    counterparties = ["北京科技有限公司", "上海贸易有限公司", "深圳电子有限公司",
+                      "原材料供应商A", "设备供应商B", "物流公司D"]
+    rp_no = 1
+    for y, m in months:
+        for _ in range(7):
+            rp_type = random.choice(["应收", "应付"])
+            rp_no_str = f"{'AR' if rp_type == '应收' else 'AP'}-{y}{m:02d}-{rp_no:04d}"
+            cp = random.choice(counterparties)
+            amount = round(random.uniform(5000, 500000), 2)
+            roll = random.random()
+            if roll < 0.3:
+                settled = amount
+                status = "已结清"
+                due_date = _rand_date(y, m)
+            elif roll < 0.5:
+                settled = round(amount * random.uniform(0.3, 0.9), 2)
+                status = "部分结清"
+                due_date = _rand_date(y, m)
+            elif roll < 0.8:
+                settled = 0
+                status = "未结"
+                # Future due date
+                future_m = m + random.randint(1, 3)
+                future_y = y
+                if future_m > 12:
+                    future_m -= 12
+                    future_y += 1
+                due_date = _rand_date(future_y, future_m)
+            else:
+                settled = round(amount * random.uniform(0, 0.5), 2)
+                status = "逾期"
+                # Past due date
+                past_m = m - random.randint(1, 2)
+                past_y = y
+                if past_m <= 0:
+                    past_m += 12
+                    past_y -= 1
+                due_date = _rand_date(past_y, past_m)
+            run_sql(cursor,
+                f"INSERT IGNORE INTO t_receivable_payable (rp_type, rp_no, counterparty, original_amount, "
+                f"settled_amount, due_date, status) "
+                f"VALUES ('{rp_type}', '{rp_no_str}', '{cp}', {amount:.2f}, {settled:.2f}, '{due_date}', '{status}')",
+                "")
+            rp_no += 1
     conn.commit()
-    print("  [OK] 40 receivable/payable records")
+    print(f"  [OK] {len(months) * 7} receivable/payable records")
 
-    # -- 费用报销 (35 条) --
-    claimants = ["张三", "李四", "王五", "赵六", "钱七"]
+    # -- 费用报销 (每月 ~7 条) --
+    claimants = [
+        ("张三", 3), ("李四", 4), ("王五", 3), ("赵六", 2), ("钱七", 5),
+        ("孙八", 6), ("周九", 7), ("吴十", 8),
+    ]
     expense_descs = [
         "出差北京客户拜访", "团队建设聚餐", "购买办公文具", "项目培训费用",
         "商务招待餐费", "市内交通费", "打印复印费", "软件许可费",
+        "服务器托管费", "差旅机票费用", "客户礼品采购", "办公家具购置",
     ]
-    for i in range(35):
-        claim_no = f"EXP-2025-{i+1:04d}"
-        claim_date = f"2025-{random.randint(1,6):02d}-{random.randint(1,28):02d}"
-        claimant = random.choice(claimants)
-        exp_type = random.choice(["差旅", "交通", "餐饮", "办公", "招待", "培训"])
-        amount = round(random.uniform(100, 30000), 2)
-        approved = round(amount * random.uniform(0.8, 1.0), 2)
-        status = random.choice(["已审批", "已付款", "已付款", "已拒绝"])
-        desc = random.choice(expense_descs)
-        run_sql(cursor,
-            f"INSERT IGNORE INTO t_expense_claim (claim_no, claim_date, claimant, expense_type, "
-            f"total_amount, approved_amount, status, description) "
-            f"VALUES ('{claim_no}', '{claim_date}', '{claimant}', '{exp_type}', "
-            f"{amount:.2f}, {approved:.2f}, '{status}', '{desc}')",
-            "")
+    approvers_list = ["赵主管", "钱经理", "王总监"]
+    claim_no = 1
+    for y, m in months:
+        for _ in range(7):
+            claim_no_str = f"EXP-{y}{m:02d}-{claim_no:04d}"
+            claim_date = _rand_date(y, m)
+            claimant, cc_id = random.choice(claimants)
+            exp_type = random.choice(["差旅", "交通", "餐饮", "办公", "招待", "培训"])
+            amount = round(random.uniform(200, 30000), 2)
+            approved = round(amount * random.uniform(0.85, 1.0), 2)
+            approver = random.choice(approvers_list)
+            # Past months: mostly approved/paid; current month: mix
+            if (y, m) < (today.year, today.month):
+                status = random.choice(["已审批", "已付款", "已付款", "已付款", "已拒绝"])
+            else:
+                status = random.choice(["草稿", "已提交", "已审批", "已拒绝"])
+            approved_at = f"'{claim_date}'" if status in ("已审批", "已付款") else "NULL"
+            paid_at = f"'{claim_date}'" if status == "已付款" else "NULL"
+            desc = random.choice(expense_descs)
+            run_sql(cursor,
+                f"INSERT IGNORE INTO t_expense_claim (claim_no, claim_date, claimant, cost_center_id, "
+                f"expense_type, total_amount, approved_amount, status, approver, approved_at, paid_at, description) "
+                f"VALUES ('{claim_no_str}', '{claim_date}', '{claimant}', {cc_id}, "
+                f"'{exp_type}', {amount:.2f}, {approved:.2f}, '{status}', "
+                f"'{approver}', {approved_at}, {paid_at}, '{desc}')",
+                "")
+            claim_no += 1
     conn.commit()
-    print("  [OK] 35 expense claims")
+    print(f"  [OK] {len(months) * 7} expense claims")
 
     # -- 固定资产 (8 条) --
     assets = [
-        ("FA-001", "办公楼A栋", "房屋建筑", "2020-01-15", 5000000, 50000, 360, "总部大楼", "行政部"),
-        ("FA-002", "CNC数控机床", "机器设备", "2022-06-01", 1200000, 60000, 120, "生产车间A", "生产部"),
-        ("FA-003", "公司班车", "运输工具", "2023-03-15", 350000, 35000, 60, "公司车库", "行政部"),
-        ("FA-004", "服务器集群", "电子设备", "2023-09-01", 280000, 14000, 36, "机房", "IT部"),
-        ("FA-005", "投影仪", "电子设备", "2024-01-10", 15000, 750, 36, "会议室", "行政部"),
-        ("FA-006", "办公桌椅套装", "办公家具", "2024-02-01", 8000, 400, 60, "办公区", "行政部"),
-        ("FA-007", "3D打印机", "机器设备", "2024-06-15", 180000, 9000, 48, "研发中心", "研发部"),
-        ("FA-008", "空调系统", "其他", "2021-05-01", 200000, 10000, 120, "全楼", "行政部"),
+        ("FA-001", "办公楼A栋", "房屋建筑", "2020-01-15", 5000000, 50000, 360, "总部大楼", "行政部", 1),
+        ("FA-002", "CNC数控机床", "机器设备", "2022-06-01", 1200000, 60000, 120, "生产车间A", "生产部", 6),
+        ("FA-003", "公司班车", "运输工具", "2023-03-15", 350000, 35000, 60, "公司车库", "行政部", 1),
+        ("FA-004", "服务器集群", "电子设备", "2023-09-01", 280000, 14000, 36, "机房", "IT部", 8),
+        ("FA-005", "投影仪", "电子设备", "2024-01-10", 15000, 750, 36, "会议室", "行政部", 1),
+        ("FA-006", "办公桌椅套装", "办公家具", "2024-02-01", 8000, 400, 60, "办公区", "行政部", 1),
+        ("FA-007", "3D打印机", "机器设备", "2024-06-15", 180000, 9000, 48, "研发中心", "研发部", 3),
+        ("FA-008", "空调系统", "其他", "2021-05-01", 200000, 10000, 120, "全楼", "行政部", 1),
     ]
     for a in assets:
         monthly_dep = round((a[4] - a[5]) / a[6], 2)
-        months_used = random.randint(6, min(a[6], 30))
+        acq_date = date.fromisoformat(a[3])
+        months_used = min((today.year - acq_date.year) * 12 + today.month - acq_date.month, a[6])
+        months_used = max(months_used, 1)
         accum_dep = round(monthly_dep * months_used, 2)
         run_sql(cursor,
             f"INSERT IGNORE INTO t_fixed_asset (asset_code, asset_name, asset_category, acquisition_date, "
             f"acquisition_cost, salvage_value, useful_life_months, monthly_depreciation, "
-            f"accumulated_depreciation, location, custodian) "
+            f"accumulated_depreciation, location, custodian, cost_center_id) "
             f"VALUES ('{a[0]}', '{a[1]}', '{a[2]}', '{a[3]}', {a[4]}, {a[5]}, {a[6]}, "
-            f"{monthly_dep}, {accum_dep}, '{a[7]}', '{a[8]}')",
+            f"{monthly_dep}, {accum_dep}, '{a[7]}', '{a[8]}', {a[9]})",
             f"asset {a[0]}")
     conn.commit()
     print("  [OK] 8 fixed assets")
