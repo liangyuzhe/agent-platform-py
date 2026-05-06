@@ -70,6 +70,7 @@ def _get_embeddings():
             model=settings.qwen.embedding_model,
             tiktoken_enabled=False,
             check_embedding_ctx_length=False,
+            chunk_size=10,
         )
     raise ValueError(f"Unsupported embedding_model_type: {provider!r}")
 
