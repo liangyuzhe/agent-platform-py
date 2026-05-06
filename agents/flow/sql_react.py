@@ -11,7 +11,7 @@ from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
-from agents.rag.retriever import get_vector_only_retriever
+from agents.rag.retriever import get_schema_table_names, get_schema_docs_by_tables
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
 
@@ -25,47 +25,73 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 
 
+async def load_table_names(state: SQLReactState) -> dict:
+    """从 Milvus 加载所有已索引的表名列表（启动时调用一次）。"""
+    table_names = state.get("table_names", [])
+    if table_names:
+        return {}
+    try:
+        table_names = await asyncio.to_thread(get_schema_table_names)
+        logger.info("Loaded %d schema table names: %s", len(table_names), table_names)
+    except Exception as e:
+        logger.warning("Failed to load table names: %s", e)
+        table_names = []
+    return {"table_names": table_names}
+
+
+async def select_tables(state: SQLReactState) -> dict:
+    """LLM 从表名列表中选择与用户问题相关的表。"""
+    table_names = state.get("table_names", [])
+    if not table_names:
+        return {"selected_tables": []}
+
+    model = get_chat_model(settings.chat_model_type)
+    names_text = ", ".join(table_names)
+
+    response = await model.ainvoke([
+        SystemMessage(content=f"""你是一个数据库专家。根据用户的问题，从可用表名列表中选出需要用到的表。
+
+可用表名: {names_text}
+
+要求：
+1. 只返回需要用到的表名，用逗号分隔
+2. 如果需要多表关联，选出所有涉及的表
+3. 如果问题与数据库无关（如闲聊），返回空
+4. 只返回表名，不要其他内容"""),
+        HumanMessage(content=state["query"]),
+    ])
+
+    raw = response.content.strip()
+    if not raw:
+        return {"selected_tables": []}
+
+    selected = [n.strip() for n in raw.split(",") if n.strip() in table_names]
+    logger.info("select_tables: LLM selected %s from query: %s", selected, state["query"][:50])
+    return {"selected_tables": selected}
+
+
 async def sql_retrieve(state: SQLReactState, config=None) -> dict:
-    """检索表结构信息。"""
-    retriever = get_vector_only_retriever()
-    callbacks = (config or {}).get("callbacks", [])
-    docs = await asyncio.to_thread(retriever.retrieve, state["query"], callbacks=callbacks)
-    return {"docs": docs}
+    """按选中的表名精确拉取 schema 文档（metadata 过滤，非向量检索）。"""
+    selected = state.get("selected_tables", [])
+
+    if selected:
+        docs = await asyncio.to_thread(get_schema_docs_by_tables, selected)
+        if docs:
+            return {"docs": docs}
+
+    # Fallback: LLM 没选出表或过滤无结果，拉取全部 schema
+    table_names = state.get("table_names", [])
+    if table_names:
+        docs = await asyncio.to_thread(get_schema_docs_by_tables, table_names)
+        return {"docs": docs}
+
+    return {"docs": []}
 
 
 async def check_docs(state: SQLReactState) -> dict:
-    """检查是否检索到相关表结构。
-
-    如果精确检索没有命中（如查询人名等非表结构关键词），回退到
-    获取全部已索引的 schema，让 LLM 自行判断使用哪个表。
-    """
+    """检查是否检索到相关表结构。"""
     docs = state.get("docs", [])
     if not docs:
-        # 回退：直接从 ES 拉取所有 schema 文档（不做相似度过滤）
-        try:
-            from agents.rag.schema_indexer import _SCHEMA_SOURCE
-
-            es_url = settings.es.address
-            es = Elasticsearch(es_url)
-            resp = es.search(
-                index=settings.es.index,
-                query={"term": {"metadata.source": _SCHEMA_SOURCE}},
-                size=50,
-            )
-            from langchain_core.documents import Document
-            docs = [
-                Document(
-                    page_content=hit["_source"]["text"],
-                    metadata=hit["_source"].get("metadata", {}),
-                )
-                for hit in resp["hits"]["hits"]
-            ]
-            if docs:
-                logger.info("check_docs: fallback retrieved %d schema docs", len(docs))
-                return {"docs": docs}
-        except Exception as e:
-            logger.warning("check_docs fallback failed: %s", e)
-
         return {
             "answer": "未找到相关的数据库表结构信息，无法生成 SQL。请先上传数据库表结构文档。",
             "is_sql": False,
@@ -77,17 +103,8 @@ _MAX_TABLE_SEARCH_ROUNDS = 3
 
 
 async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: list) -> list:
-    """Re-retrieve schema docs for missing table names."""
-    from langchain_core.documents import Document
-    retriever = get_vector_only_retriever()
-    new_docs = []
-    for table_name in missing_tables:
-        try:
-            docs = await asyncio.to_thread(retriever.retrieve, f"表结构 {table_name}")
-            new_docs.extend(docs)
-        except Exception as e:
-            logger.warning("Re-retrieve for table '%s' failed: %s", table_name, e)
-    # Deduplicate by table_name
+    """Re-retrieve schema docs for missing table names via metadata filter."""
+    new_docs = await asyncio.to_thread(get_schema_docs_by_tables, missing_tables)
     existing_names = {d.metadata.get("table_name", "") for d in existing_docs}
     unique_new = [d for d in new_docs if d.metadata.get("table_name", "") not in existing_names]
     return unique_new
@@ -140,13 +157,7 @@ async def sql_generate(state: SQLReactState) -> dict:
     all_docs = list(state.get("docs", []))
 
     for round_idx in range(_MAX_TABLE_SEARCH_ROUNDS):
-        # Filter by rerank threshold then keep top-N
-        threshold = settings.rag.rerank_threshold
-        scored_docs = [d for d in all_docs if d.metadata.get("rerank_score", 0) >= threshold]
-        docs = sorted(scored_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:5]
-        if not docs:
-            docs = sorted(all_docs, key=lambda d: d.metadata.get("rerank_score", 0), reverse=True)[:5]
-        docs_text = "\n\n".join([d.page_content for d in docs])
+        docs_text = "\n\n".join([d.page_content for d in all_docs])
 
         messages = _build_sql_messages(state["query"], docs_text, refine_context, history_context)
         response = await model_with_tools.ainvoke(messages)
@@ -299,14 +310,14 @@ async def error_analysis(state: SQLReactState) -> dict:
 def build_sql_react_graph():
     """构建 SQL React 图，支持自动纠错重试。
 
-    流程: retrieve → check_docs → generate → safety_check → approve → execute
-                                                              ↓
-                                                         error_analysis (失败时)
-                                                              ↓
-                                                          generate (重试，最多3次)
+    流程: load_table_names → select_tables → sql_retrieve → check_docs → generate → ...
+                                                  ↓
+                                        (metadata 精确过滤)
     """
     graph = StateGraph(SQLReactState)
 
+    graph.add_node("load_table_names", load_table_names)
+    graph.add_node("select_tables", select_tables)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
     graph.add_node("sql_generate", sql_generate)
@@ -315,7 +326,9 @@ def build_sql_react_graph():
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("error_analysis", error_analysis)
 
-    graph.add_edge(START, "sql_retrieve")
+    graph.add_edge(START, "load_table_names")
+    graph.add_edge("load_table_names", "select_tables")
+    graph.add_edge("select_tables", "sql_retrieve")
     graph.add_edge("sql_retrieve", "check_docs")
 
     def route_after_check(state: SQLReactState) -> str:

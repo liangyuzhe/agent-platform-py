@@ -61,35 +61,14 @@ class TestCheckDocs:
         assert result == {}
 
     @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.Elasticsearch")
-    async def test_missing_docs_key_returns_message(self, MockES):
-        """When 'docs' key is missing from state and ES fallback is empty."""
+    async def test_no_docs_returns_error(self):
+        """When no docs, should return error message."""
         from agents.flow.sql_react import check_docs
 
-        MockES.return_value.search.return_value = {"hits": {"hits": []}}
-
-        result = await check_docs({"query": "查询用户"})
+        result = await check_docs({"query": "查询用户", "docs": []})
 
         assert result["is_sql"] is False
         assert "未找到" in result["answer"]
-
-    @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.Elasticsearch")
-    async def test_no_docs_fallback_to_es_schemas(self, MockES):
-        """When retriever returns nothing, fallback to all schemas from ES."""
-        from agents.flow.sql_react import check_docs
-
-        MockES.return_value.search.return_value = {
-            "hits": {"hits": [
-                {"_source": {"text": "表名: t_user\n字段:\n  id int", "table_name": "t_user", "source": "mysql_schema"}},
-            ]}
-        }
-
-        result = await check_docs({"query": "zhangsan 是谁", "docs": []})
-
-        assert "docs" in result
-        assert len(result["docs"]) == 1
-        assert "t_user" in result["docs"][0].page_content
 
 
 # ---------------------------------------------------------------------------
@@ -270,106 +249,49 @@ class TestSqlGenerate:
         assert "只查询ID字段" in system_msg
 
     @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.settings")
     @patch("agents.flow.sql_react.create_format_tool")
     @patch("agents.flow.sql_react.get_chat_model")
-    async def test_generate_limits_docs_to_top3(self, mock_get_model, mock_format, mock_settings):
-        """sql_generate should only pass top-3 docs by rerank_score to LLM."""
+    async def test_generate_passes_all_docs(self, mock_get_model, mock_format):
+        """sql_generate passes all docs to LLM (no rerank filtering)."""
         from agents.flow.sql_react import sql_generate
-
-        mock_settings.rag.rerank_threshold = 0.3
 
         mock_model = MagicMock()
         mock_model.bind_tools.return_value = mock_model
         mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response("SELECT 1;", True))
         mock_get_model.return_value = mock_model
 
-        # 5 docs with different rerank scores
         docs = [
-            Document(page_content="t_user schema", metadata={"rerank_score": 0.9, "table_name": "t_user"}),
-            Document(page_content="t_department schema", metadata={"rerank_score": 0.8, "table_name": "t_department"}),
-            Document(page_content="t_role schema", metadata={"rerank_score": 0.7, "table_name": "t_role"}),
-            Document(page_content="t_user_department schema", metadata={"rerank_score": 0.2, "table_name": "t_user_department"}),
-            Document(page_content="t_log schema", metadata={"rerank_score": 0.1, "table_name": "t_log"}),
+            Document(page_content="t_user schema", metadata={"table_name": "t_user"}),
+            Document(page_content="t_department schema", metadata={"table_name": "t_department"}),
+            Document(page_content="t_role schema", metadata={"table_name": "t_role"}),
         ]
 
         state = {"query": "查询用户", "docs": docs}
         await sql_generate(state)
 
-        # System message should contain top-3 docs (above threshold 0.3)
+        # All docs should be in the prompt
         call_args = mock_model.ainvoke.call_args[0][0]
         system_msg = call_args[0].content
         assert "t_user schema" in system_msg
         assert "t_department schema" in system_msg
         assert "t_role schema" in system_msg
-        assert "t_user_department schema" not in system_msg
-        assert "t_log schema" not in system_msg
 
     @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.settings")
-    @patch("agents.flow.sql_react.create_format_tool")
-    @patch("agents.flow.sql_react.get_chat_model")
-    async def test_generate_join_scenario_keeps_both_tables(self, mock_get_model, mock_format, mock_settings):
-        """JOIN scenario: both related tables should be kept if scores are high enough."""
-        from agents.flow.sql_react import sql_generate
-
-        mock_settings.rag.rerank_threshold = 0.3
-
-        mock_model = MagicMock()
-        mock_model.bind_tools.return_value = mock_model
-        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response(
-            "SELECT d.name, u.real_name FROM t_department d JOIN t_user u ON d.manager = u.username;", True
-        ))
-        mock_get_model.return_value = mock_model
-
-        # JOIN query: t_department and t_user both relevant, t_role irrelevant
-        docs = [
-            Document(
-                page_content="t_department: id, name, parent_id, manager, phone, status, created_at",
-                metadata={"rerank_score": 0.85, "table_name": "t_department"},
-            ),
-            Document(
-                page_content="t_user: id, username, password, real_name, gender, email, phone, register_time, status",
-                metadata={"rerank_score": 0.80, "table_name": "t_user"},
-            ),
-            Document(
-                page_content="t_role: id, name, code, description, status, created_at",
-                metadata={"rerank_score": 0.15, "table_name": "t_role"},
-            ),
-        ]
-
-        state = {"query": "每个部门的负责人姓名", "docs": docs}
-        result = await sql_generate(state)
-
-        # Both JOIN tables should be in the prompt (above threshold)
-        call_args = mock_model.ainvoke.call_args[0][0]
-        system_msg = call_args[0].content
-        assert "t_department" in system_msg
-        assert "t_user" in system_msg
-        assert "t_role" not in system_msg
-        assert result["is_sql"] is True
-
-    @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.get_vector_only_retriever")
-    @patch("agents.flow.sql_react.settings")
+    @patch("agents.flow.sql_react.get_schema_docs_by_tables")
     @patch("agents.flow.sql_react.create_format_tool")
     @patch("agents.flow.sql_react.get_chat_model")
     async def test_generate_retrieves_missing_tables(
-        self, mock_get_model, mock_format, mock_settings, mock_retriever_cls
+        self, mock_get_model, mock_format, mock_filter
     ):
         """When LLM says tables are missing, should re-retrieve and retry."""
         from agents.flow.sql_react import sql_generate
 
-        mock_settings.rag.rerank_threshold = 0.3
-
-        mock_retriever = MagicMock()
-        mock_retriever.retrieve.return_value = [
+        mock_filter.return_value = [
             Document(
                 page_content="t_user: id, username, real_name",
-                metadata={"rerank_score": 0.9, "table_name": "t_user"},
+                metadata={"table_name": "t_user"},
             ),
         ]
-        mock_retriever_cls.return_value = mock_retriever
 
         # First call: needs more tables; second call: has enough
         first_resp = MagicMock()
@@ -400,7 +322,7 @@ class TestSqlGenerate:
         docs = [
             Document(
                 page_content="t_department: id, name, manager",
-                metadata={"rerank_score": 0.85, "table_name": "t_department"},
+                metadata={"table_name": "t_department"},
             ),
         ]
         state = {"query": "每个部门的负责人姓名", "docs": docs}

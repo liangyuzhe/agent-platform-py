@@ -428,3 +428,63 @@ def get_vector_only_retriever(
             retrieve_k=retrieve_k,
         )
     return _vector_only_instance
+
+
+# ---------------------------------------------------------------------------
+# Metadata-based schema retrieval (for SQL React)
+# ---------------------------------------------------------------------------
+
+def get_schema_table_names(source: str = "mysql_schema") -> list[str]:
+    """Return all distinct table_names for schema documents in Milvus."""
+    from pymilvus import MilvusClient
+
+    uri = f"http://{settings.milvus.addr}"
+    client = MilvusClient(uri=uri)
+    try:
+        results = client.query(
+            collection_name=settings.milvus.collection_name,
+            filter=f'source == "{source}"',
+            output_fields=["table_name"],
+        )
+        names = sorted({r["table_name"] for r in results if r.get("table_name")})
+        return names
+    finally:
+        client.close()
+
+
+def get_schema_docs_by_tables(
+    table_names: list[str],
+    source: str = "mysql_schema",
+) -> list[Document]:
+    """Retrieve schema documents by exact table_name filter (no vector search)."""
+    if not table_names:
+        return []
+
+    from pymilvus import MilvusClient
+
+    uri = f"http://{settings.milvus.addr}"
+    client = MilvusClient(uri=uri)
+    try:
+        # Build IN filter: table_name in ["t_a", "t_b"]
+        names_literal = ", ".join(f'"{n}"' for n in table_names)
+        filter_expr = f'source == "{source}" && table_name in [{names_literal}]'
+        results = client.query(
+            collection_name=settings.milvus.collection_name,
+            filter=filter_expr,
+            output_fields=["text", "table_name", "doc_id"],
+        )
+        docs = [
+            Document(
+                page_content=r["text"],
+                metadata={
+                    "source": source,
+                    "table_name": r.get("table_name", ""),
+                    "doc_id": r.get("doc_id", ""),
+                },
+            )
+            for r in results
+        ]
+        logger.info("Metadata filter retrieved %d schema docs for tables: %s", len(docs), table_names)
+        return docs
+    finally:
+        client.close()
