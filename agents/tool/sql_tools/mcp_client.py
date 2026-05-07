@@ -42,6 +42,7 @@ async def _connect() -> ClientSession:
         "MYSQL_USER": os.environ.get("MCP_MYSQL_USER", settings.mysql.username),
         "MYSQL_PASS": os.environ.get("MCP_MYSQL_PASSWORD", settings.mysql.password),
         "MYSQL_DB": os.environ.get("MCP_MYSQL_DATABASE", settings.mysql.database),
+        "MYSQL_CHARSET": os.environ.get("MCP_MYSQL_CHARSET", "utf8mb4_0900_ai_ci"),
     }
 
     server_params = StdioServerParameters(
