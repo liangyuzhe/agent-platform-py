@@ -1314,3 +1314,30 @@ def _filter_columns_by_keywords(docs, semantic_model, keywords):
 | get_semantic_model_by_tables | 每次查 MySQL t_semantic_model (~5ms×N) | Redis pipeline 一次性取 (~1ms) |
 | DDL 变更后 | 立即生效（直查 MySQL） | binlog → 更新 MySQL → 刷新 Redis（秒级延迟） |
 | Redis 不可用 | N/A | 自动 fallback 到 MySQL，无影响 |
+
+---
+
+## Iteration 19：MCP 错误日志 + API 异常捕获
+
+### 出现了什么问题
+
+SQL Agent 执行 SQL 返回 HTTP 500，但服务器日志中看不到任何错误信息。错误被静默吞掉，无法排查。
+
+### 为什么要解决
+
+- 无日志 = 无法排查。500 可能来自 MCP 执行失败、LLM 调用超时、图执行异常等多种原因
+- 需要在关键路径记录错误，快速定位问题
+
+### 怎么解决
+
+**涉及文件**
+
+| 文件 | 改动 |
+|------|------|
+| `agents/tool/sql_tools/mcp_client.py` | `execute_sql` 记录入参 SQL + 返回结果；检测 `result.isError` 并 `raise RuntimeError` |
+| `agents/api/routers/query.py` | `query_invoke` / `approve_sql` 添加 `try/except` + `logger.error(exc_info=True)`，返回错误而非 500 |
+
+**关键改动**
+
+- MCP 返回 `isError=True` 时，之前静默返回错误文本 → 现在 `logger.error` + `raise`
+- API 端点无 try/except → 现在捕获异常并返回 `"系统错误: ..."` + 完整 traceback 日志
