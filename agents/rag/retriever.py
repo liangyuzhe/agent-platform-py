@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -470,14 +471,42 @@ def get_vector_only_retriever(
 
 
 # ---------------------------------------------------------------------------
+# Sync Redis client (for schema cache)
+# ---------------------------------------------------------------------------
+
+_REDIS_KEY_TABLE_META = "schema:table_metadata"
+_REDIS_KEY_SEMANTIC_PREFIX = "schema:semantic_model:"
+_sync_redis_client = None
+
+
+def _get_sync_redis():
+    """获取同步 Redis 客户端（单例）。失败返回 None。"""
+    global _sync_redis_client
+    if _sync_redis_client is not None:
+        return _sync_redis_client
+    try:
+        import redis as _redis_mod
+        addr = settings.redis.addr
+        host, port = addr.rsplit(":", 1) if ":" in addr else (addr, "6379")
+        _sync_redis_client = _redis_mod.Redis(
+            host=host, port=int(port), db=settings.redis.db,
+            password=settings.redis.password or None,
+            decode_responses=True, socket_timeout=2,
+        )
+        _sync_redis_client.ping()
+        logger.info("Sync Redis client connected for schema cache")
+    except Exception as e:
+        logger.debug("Sync Redis not available: %s", e)
+        _sync_redis_client = None
+    return _sync_redis_client
+
+
+# ---------------------------------------------------------------------------
 # Metadata-based schema retrieval (for SQL React)
 # ---------------------------------------------------------------------------
 
-def load_full_table_metadata() -> list[dict]:
-    """Load table_name + table_comment from MySQL information_schema.
-
-    Returns [{"table_name": "t_order", "table_comment": "订单表"}, ...].
-    """
+def _load_table_metadata_from_mysql() -> list[dict]:
+    """从 MySQL information_schema 加载表元数据。"""
     import pymysql
 
     try:
@@ -505,11 +534,33 @@ def load_full_table_metadata() -> list[dict]:
              "table_comment": r.get("TABLE_COMMENT") or r.get("table_comment", "")}
             for r in rows if r.get("TABLE_NAME") or r.get("table_name")
         ]
-        logger.info("Loaded %d table metadata entries", len(result))
         return result
     except Exception as e:
-        logger.warning("load_full_table_metadata failed: %s", e)
+        logger.warning("_load_table_metadata_from_mysql failed: %s", e)
         return []
+
+
+def load_full_table_metadata() -> list[dict]:
+    """Load table_name + table_comment. Redis → MySQL fallback → 回填 Redis。"""
+    r = _get_sync_redis()
+    if r:
+        try:
+            cached = r.get(_REDIS_KEY_TABLE_META)
+            if cached:
+                result = json.loads(cached)
+                logger.info("Loaded %d table metadata from Redis", len(result))
+                return result
+        except Exception:
+            pass
+
+    result = _load_table_metadata_from_mysql()
+    if r and result:
+        try:
+            r.set(_REDIS_KEY_TABLE_META, json.dumps(result, ensure_ascii=False))
+        except Exception:
+            pass
+    logger.info("Loaded %d table metadata from MySQL", len(result))
+    return result
 
 
 def _milvus_vector_search(query: str, source: str, top_k: int) -> list[Document]:
@@ -664,11 +715,8 @@ def recall_agent_knowledge(query: str, top_k: int = 3) -> list[Document]:
     return filtered[:top_k]
 
 
-def get_semantic_model_by_tables(table_names: list[str]) -> dict[str, dict[str, dict]]:
-    """Load semantic model from MySQL for specific tables.
-
-    Returns {table_name: {column_name: row_dict}}.
-    """
+def _load_semantic_model_from_mysql(table_names: list[str]) -> dict[str, dict[str, dict]]:
+    """从 MySQL t_semantic_model 加载指定表的语义模型。"""
     if not table_names:
         return {}
 
@@ -701,11 +749,54 @@ def get_semantic_model_by_tables(table_names: list[str]) -> dict[str, dict[str, 
             tbl = row["table_name"]
             col = row["column_name"]
             result.setdefault(tbl, {})[col] = row
-        logger.info("Loaded semantic model for %d tables, %d entries", len(result), len(rows))
         return result
     except Exception as e:
-        logger.warning("Semantic model load failed: %s", e)
+        logger.warning("_load_semantic_model_from_mysql failed: %s", e)
         return {}
+
+
+def get_semantic_model_by_tables(table_names: list[str]) -> dict[str, dict[str, dict]]:
+    """Load semantic model. Redis per-table → MySQL fallback → 回填 Redis。"""
+    if not table_names:
+        return {}
+
+    r = _get_sync_redis()
+    result: dict[str, dict[str, dict]] = {}
+    missing = list(table_names)
+
+    # Redis pipeline 批量获取
+    if r:
+        try:
+            pipe = r.pipeline()
+            for t in table_names:
+                pipe.get(f"{_REDIS_KEY_SEMANTIC_PREFIX}{t}")
+            values = pipe.execute()
+            for t, v in zip(table_names, values):
+                if v:
+                    result[t] = json.loads(v)
+                    missing.remove(t)
+            if result:
+                logger.info("Loaded %d tables from Redis cache", len(result))
+        except Exception:
+            pass
+
+    # MySQL 补全缺失的表
+    if missing:
+        mysql_result = _load_semantic_model_from_mysql(missing)
+        result.update(mysql_result)
+        # 回填 Redis
+        if r and mysql_result:
+            try:
+                pipe = r.pipeline()
+                for t, cols in mysql_result.items():
+                    pipe.set(f"{_REDIS_KEY_SEMANTIC_PREFIX}{t}", json.dumps(cols, ensure_ascii=False))
+                pipe.execute()
+            except Exception:
+                pass
+
+    logger.info("Semantic model: %d tables, %d entries", len(result),
+                sum(len(v) for v in result.values()))
+    return result
 
 
 def get_table_relationships(table_names: list[str]) -> list[dict]:

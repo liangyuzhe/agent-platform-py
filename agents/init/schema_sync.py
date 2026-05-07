@@ -1,18 +1,21 @@
-"""Schema Sync：t_semantic_model 全量初始化 + binlog 增量同步。
+"""Schema Sync：t_semantic_model 全量初始化 + binlog 增量同步 + Redis 缓存。
 
 启动时：
 1. 检查 t_semantic_model 是否存在，不存在则建表
 2. 检查是否有数据，无数据则全量同步
-3. 启动后台任务监听 binlog DDL 事件，增量更新
+3. 全量同步后写入 Redis 缓存
+4. 启动后台任务监听 binlog DDL 事件，增量更新
 
 运行时：
 - binlog 监听 CREATE TABLE / ALTER TABLE / DROP TABLE
 - 定时轮询 information_schema 作为 fallback（binlog 不可用时）
+- 增量同步后更新 Redis 缓存
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -28,6 +31,61 @@ _DDL_KEYWORDS = ("CREATE TABLE", "ALTER TABLE", "DROP TABLE", "RENAME TABLE")
 
 # 轮询间隔（秒），binlog 不可用时的 fallback
 _POLL_INTERVAL = 300  # 5 分钟
+
+# Redis key（与 retriever.py 一致）
+_REDIS_KEY_TABLE_META = "schema:table_metadata"
+_REDIS_KEY_SEMANTIC_PREFIX = "schema:semantic_model:"
+
+
+def _get_sync_redis():
+    """获取同步 Redis 客户端（单例）。失败返回 None。"""
+    try:
+        from agents.rag.retriever import _get_sync_redis as _get
+        return _get()
+    except Exception:
+        return None
+
+
+def _refresh_redis_cache(table_names: list[str] | None = None) -> None:
+    """同步后刷新 Redis 缓存。
+
+    table_names=None: 全量刷新 table_metadata + 所有表的 semantic_model。
+    table_names=[...]: 只刷新指定表 + 更新 table_metadata。
+    """
+    r = _get_sync_redis()
+    if not r:
+        return
+
+    try:
+        # 刷新 table_metadata
+        from agents.rag.retriever import _load_table_metadata_from_mysql
+        meta = _load_table_metadata_from_mysql()
+        if meta:
+            r.set(_REDIS_KEY_TABLE_META, json.dumps(meta, ensure_ascii=False))
+            logger.info("Redis: refreshed table_metadata (%d tables)", len(meta))
+
+        # 刷新 semantic_model
+        if table_names is None:
+            # 全量：获取所有表名
+            conn = _get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT DISTINCT table_name FROM t_semantic_model")
+                    table_names = [_lower_keys(row)["table_name"] for row in cur.fetchall()]
+            finally:
+                conn.close()
+
+        if table_names:
+            from agents.rag.retriever import _load_semantic_model_from_mysql
+            semantic = _load_semantic_model_from_mysql(table_names)
+            if semantic:
+                pipe = r.pipeline()
+                for t, cols in semantic.items():
+                    pipe.set(f"{_REDIS_KEY_SEMANTIC_PREFIX}{t}", json.dumps(cols, ensure_ascii=False))
+                pipe.execute()
+                logger.info("Redis: refreshed semantic_model for %d tables", len(semantic))
+    except Exception as e:
+        logger.warning("Redis cache refresh failed: %s", e)
 
 
 def _get_conn() -> pymysql.Connection:
@@ -324,6 +382,7 @@ def _binlog_listener_sync(logger: logging.Logger) -> None:
                     try:
                         count = sync_tables(affected_tables)
                         logger.info("Incremental sync for %s: %d columns updated", affected_tables, count)
+                        _refresh_redis_cache(affected_tables)
                     except Exception as e:
                         logger.warning("Incremental sync failed for %s: %s", affected_tables, e)
 
@@ -382,6 +441,7 @@ async def _polling_fallback(logger: logging.Logger) -> None:
             if new_tables:
                 logger.info("Polling detected new tables: %s", new_tables)
                 sync_tables(list(new_tables))
+                _refresh_redis_cache(list(new_tables))
 
             if dropped_tables:
                 logger.info("Polling detected dropped tables: %s", dropped_tables)
@@ -393,6 +453,7 @@ async def _polling_fallback(logger: logging.Logger) -> None:
                     conn.commit()
                 finally:
                     conn.close()
+                _refresh_redis_cache()
 
             # TODO: 检查列变更（需要对比 column 信息）
 
@@ -433,6 +494,12 @@ async def start_schema_sync(logger: logging.Logger | None = None) -> asyncio.Tas
                 logger.info("Full sync result: %s", result)
             except Exception as e2:
                 logger.error("Full sync failed: %s", e2)
+
+        # 无论全量同步与否，都刷新 Redis 缓存（确保 Redis 有数据）
+        try:
+            await asyncio.to_thread(_refresh_redis_cache)
+        except Exception as e:
+            logger.warning("Redis cache refresh failed: %s", e)
 
     # 启动后台任务
     async def _background():

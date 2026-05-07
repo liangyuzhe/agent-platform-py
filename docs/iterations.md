@@ -1263,3 +1263,54 @@ def _filter_columns_by_keywords(docs, semantic_model, keywords):
 | 启动索引 | 启动时向量化所有表 schema 到 Milvus + ES | 仅生成 domain_summary（如缺失） |
 | Admin 功能 | 手动刷新 schema 索引 | 不再需要（schema 自动同步） |
 | 代码量 | 3 个 Milvus schema 函数 + 启动索引 + admin 端点 | 全部移除 |
+
+---
+
+## Iteration 18：Schema 元数据 Redis 缓存
+
+### 出现了什么问题
+
+`load_full_table_metadata` 和 `get_semantic_model_by_tables` 每次请求都查 MySQL。高频调用时（如 SQL Agent 每次对话都触发 select_tables → sql_retrieve），产生不必要的 DB 压力。
+
+### 为什么要解决
+
+- 表元数据变化频率低（仅 DDL 时变更），适合缓存
+- `start_schema_sync` 已有全量同步 + binlog 增量机制，可作为缓存维护者
+- Redis 读取延迟 ~1ms vs MySQL ~10ms，减少 SQL Agent 响应时间
+
+### 怎么解决
+
+**Redis Key 设计**
+
+| Key | 类型 | 内容 | TTL |
+|-----|------|------|-----|
+| `schema:table_metadata` | string (JSON) | `[{table_name, table_comment}, ...]` | 无（由 sync 任务维护） |
+| `schema:semantic_model:{table}` | string (JSON) | `{column_name: {col_type, is_pk, ...}}` | 无 |
+
+**Cache-Aside 模式**
+
+1. 查询时：Redis → MySQL fallback → 回填 Redis
+2. 同步时：更新 MySQL → 刷新 Redis
+
+**涉及文件**
+
+| 文件 | 改动 |
+|------|------|
+| `agents/rag/retriever.py` | 新增 `_get_sync_redis()` + Redis 常量；`load_full_table_metadata` 改为 Redis→MySQL→回填；`get_semantic_model_by_tables` 改为 Redis pipeline→MySQL→回填 |
+| `agents/init/schema_sync.py` | 新增 `_refresh_redis_cache()`；全量同步后刷新 Redis；binlog 增量同步后更新指定表缓存；轮询检测到新增/删除表后更新缓存 |
+
+**关键实现**
+
+- Sync Redis 客户端（非 async），因为 `retriever.py` 的函数通过 `asyncio.to_thread` 调用
+- Redis pipeline 批量操作（多个 `get` 或 `set` 一次 round-trip）
+- Per-table key 便于增量失效（binlog 只刷新受影响的表）
+- Redis 不可用时 graceful fallback 到 MySQL（try/except 兜底）
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| load_full_table_metadata | 每次查 MySQL information_schema (~10ms) | Redis hit ~1ms，miss 时回填 |
+| get_semantic_model_by_tables | 每次查 MySQL t_semantic_model (~5ms×N) | Redis pipeline 一次性取 (~1ms) |
+| DDL 变更后 | 立即生效（直查 MySQL） | binlog → 更新 MySQL → 刷新 Redis（秒级延迟） |
+| Redis 不可用 | N/A | 自动 fallback 到 MySQL，无影响 |
