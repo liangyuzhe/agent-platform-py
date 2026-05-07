@@ -13,7 +13,7 @@ from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.error_codes import is_retryable
-from agents.rag.retriever import get_schema_table_names, recall_business_knowledge, recall_agent_knowledge, search_schema_tables, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
+from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.rag.query_rewrite import rewrite_query
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
@@ -114,59 +114,31 @@ async def query_enhance(state: SQLReactState) -> dict:
     return {"enhanced_query": query}
 
 
-async def load_table_names(state: SQLReactState) -> dict:
-    """从 Milvus 加载所有已索引的表名列表（fallback 用）。"""
-    table_names = state.get("table_names", [])
-    if table_names:
-        return {}
-    try:
-        table_names = await asyncio.to_thread(get_schema_table_names)
-        logger.info("Loaded %d schema table names: %s", len(table_names), table_names)
-    except Exception as e:
-        logger.warning("Failed to load table names: %s", e)
-        table_names = []
-    return {"table_names": table_names}
-
-
 async def select_tables(state: SQLReactState) -> dict:
-    """两阶段表选择：向量粗筛 → LLM 精选。
+    """表选择：从 MySQL t_semantic_model 加载表名+描述 → LLM 精选。
 
-    Stage 1: 用户问题向量检索 top-K schema 文档，提取候选表名
-    Stage 2: 候选表 > 3 个时，LLM 从候选中精选；否则直接使用
+    不再依赖 Milvus 向量检索，直接从统一语义模型获取表元数据。
     """
     query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
 
-    # Stage 1: 向量粗筛（带超时）
-    candidate_tables = []
+    # Stage 1: 从 MySQL 加载全量表名 + 描述
+    metadata_list = []
     try:
-        candidate_tables = await asyncio.wait_for(
-            asyncio.to_thread(search_schema_tables, query, 10),
+        metadata_list = await asyncio.wait_for(
+            asyncio.to_thread(load_full_table_metadata),
             timeout=settings.resilience.milvus_timeout,
         )
     except Exception as e:
-        logger.warning("Vector search for tables failed: %s", e)
+        logger.warning("Failed to load table metadata: %s", e)
 
-    # Fallback: 向量检索无结果，加载全量表名（带超时）
-    if not candidate_tables:
-        table_names = state.get("table_names", [])
-        if not table_names:
-            try:
-                table_names = await asyncio.wait_for(
-                    asyncio.to_thread(get_schema_table_names),
-                    timeout=settings.resilience.milvus_timeout,
-                )
-            except Exception:
-                table_names = []
-        if table_names:
-            candidate_tables = table_names
-
-    if not candidate_tables:
+    if not metadata_list:
         return {"selected_tables": []}
+
+    candidate_tables = [m["table_name"] for m in metadata_list]
 
     # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
     if len(candidate_tables) <= 3:
         selected = candidate_tables
-        # 加载表关系
         relationships = []
         try:
             relationships = await asyncio.wait_for(
@@ -182,18 +154,7 @@ async def select_tables(state: SQLReactState) -> dict:
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
 
-    # 加载表描述信息
-    table_metadata = {}
-    try:
-        metadata_list = await asyncio.wait_for(
-            asyncio.to_thread(load_full_table_metadata),
-            timeout=settings.resilience.milvus_timeout,
-        )
-        table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
-    except Exception as e:
-        logger.warning("Failed to load table metadata: %s", e)
-
-    # 格式化表名: 描述
+    table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
     names_with_desc = []
     for t in candidate_tables:
         desc = table_metadata.get(t, "")
@@ -225,7 +186,6 @@ async def select_tables(state: SQLReactState) -> dict:
         if not selected:
             selected = candidate_tables
 
-    # 加载表关系
     relationships = []
     try:
         relationships = await asyncio.wait_for(

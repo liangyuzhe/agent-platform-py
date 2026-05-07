@@ -5,12 +5,14 @@
 ## 核心特性
 
 - **自然语言查数据**：自然语言 → SQL → 人工审批 → 执行，含 SQL 安全分析 + 自动纠错重试 + 自动补表
-- **多场景意图路由**：7 种财务场景自动分类（SQL 查询/异常归因/资金核对/报告/审计/知识库/闲聊）
-- **RAG 知识问答**：文档索引 + 混合检索（向量 + BM25）+ RRF 融合 + Cross-Encoder 重排序
-- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
+- **多场景意图路由**：意图分类 + 查询重写合并为一次 LLM 调用，自动路由到 SQL/RAG/闲聊
+- **统一语义模型**：`t_semantic_model` 表存储字段级业务映射（业务名/同义词/描述）+ 技术 schema（类型/注释/PK/FK），binlog 增量自动同步
+- **表关系自动发现**：从 `information_schema.key_column_usage` + 逻辑外键自动提取 JOIN 关系
+- **混合检索 RAG**：向量（Milvus）+ BM25（ES）+ RRF 融合 + Cross-Encoder 重排序
+- **业务知识 + 智能体知识**：公式/术语定义 + SQL few-shot 示例，并行检索注入 prompt
+- **查询增强**：用业务知识翻译术语（如 GMV → 已支付订单总额），提高检索命中率
 - **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成
-- **统一 Tool Registry**：工具按分类注册，LLM 动态发现和调用
-- **数据分析**：SQL 结果 → 统计分析 → 图表生成（ECharts）+ 文字报告
+- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
 - **SFT 数据管线**：自动采集训练数据 + 教师模型标注 + JSONL 导出
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
 
@@ -51,15 +53,19 @@ financial-copilot-platform/
 │   │   └── routers/                # 路由
 │   │       ├── chat.py             # Chat 测试
 │   │       ├── rag.py              # RAG 对话
-│   │       ├── final.py            # 主调度（支持中断/恢复）
-│   │       └── document.py         # 文档上传
+│   │       ├── query.py            # 主调度（支持中断/恢复）
+│   │       ├── document.py         # 文档上传
+│   │       └── admin.py            # 语义模型 + 业务知识 CRUD
 │   │
 │   ├── flow/                       # LangGraph 图编排
 │   │   ├── state.py                # 共享状态定义
 │   │   ├── rag_chat.py             # RAG Chat 图
 │   │   ├── sql_react.py            # SQL React 图（含 Human-in-the-Loop）
 │   │   ├── analyst.py              # 数据分析图
-│   │   └── final_graph.py          # 主调度图
+│   │   └── dispatcher.py           # 意图调度图
+│   │
+│   ├── init/                       # 系统初始化
+│   │   └── schema_sync.py          # t_semantic_model 自动同步（binlog + 轮询）
 │   │
 │   ├── model/                      # 模型抽象层
 │   │   ├── chat_model.py           # Chat Model 工厂
@@ -77,41 +83,27 @@ financial-copilot-platform/
 │   │   ├── retriever.py            # 混合检索（Milvus + ES BM25 + RRF）
 │   │   ├── parent_retriever.py     # Parent Document RAG
 │   │   ├── reranker.py             # Cross-Encoder 重排序
-│   │   └── query_rewrite.py        # 查询重写（指代消解）
+│   │   ├── query_rewrite.py        # 查询重写（指代消解）
+│   │   └── schema_indexer.py       # Schema 索引（seed 脚本用）
 │   │
 │   ├── tool/                       # 工具层
 │   │   ├── registry.py             # 统一 Tool Registry
 │   │   ├── memory/                 # 三级记忆系统
-│   │   │   ├── session.py          # Session 数据模型
-│   │   │   ├── store.py            # Session 存储（Redis + 内存）
-│   │   │   ├── compressor.py       # LLM 摘要压缩
-│   │   │   └── knowledge.py        # 知识记忆提取
 │   │   ├── storage/                # 存储层
 │   │   │   ├── redis_client.py     # Redis 连接
 │   │   │   ├── checkpoint.py       # LangGraph Checkpointer
 │   │   │   ├── domain_summary.py   # 领域摘要持久化
-│   │   │   └── retrieval_cache.py  # 检索结果缓存
+│   │   │   └── doc_metadata.py     # 文档元数据（MySQL）
 │   │   ├── document/               # 文档处理
-│   │   │   ├── loader.py           # 文件加载器
-│   │   │   ├── parser.py           # 文档解析
-│   │   │   └── splitter.py         # 文本分块
 │   │   ├── sql_tools/              # SQL 工具
 │   │   │   ├── mcp_client.py       # MCP 客户端
-│   │   │   ├── executor.py         # SQL 执行器
 │   │   │   ├── execute_tool.py     # @tool: execute_query
 │   │   │   ├── schema_tool.py      # @tool: list_tables, describe_table
-│   │   │   └── safety.py           # SQL 安全分析
+│   │   │   ├── safety.py           # SQL 安全分析
+│   │   │   └── error_codes.py      # 错误码分类 + is_retryable()
 │   │   ├── analyst_tools/          # 数据分析
-│   │   │   ├── parser.py           # SQL 结果解析
-│   │   │   ├── statistics.py       # 统计计算
-│   │   │   └── chart.py            # ECharts 图表生成
 │   │   ├── sft/                    # SFT 数据管线
-│   │   │   ├── callback.py         # 数据采集 Callback
-│   │   │   ├── annotator.py        # 教师模型标注
-│   │   │   └── storage.py          # 样本存储 + JSONL 导出
-│   │   ├── trace/                  # 可观测性
-│   │   │   └── callback.py         # 追踪 Callback
-│   │   └── token_counter.py        # Token 计数器
+│   │   └── trace/                  # 可观测性
 │   │
 │   ├── algorithm/                  # 算法
 │   │   ├── bm25.py                 # BM25 实现
@@ -120,8 +112,15 @@ financial-copilot-platform/
 │   └── static/                     # 前端
 │       └── index.html              # Chat + SQL Agent + 文档上传 UI
 │
+├── scripts/                        # 种子数据脚本
+│   ├── seed_semantic_model.py      # 语义模型初始化 + information_schema 同步
+│   ├── seed_business_knowledge.py  # 业务知识种子 + Milvus/ES 索引
+│   ├── seed_agent_knowledge.py     # 智能体知识种子 + Milvus/ES 索引
+│   └── seed_financial.py           # 财务测试数据
+│
 ├── tests/                          # 测试
 ├── docs/                           # 技术文档
+│   ├── iterations.md               # 迭代优化记录
 │   └── python_langchain_design.md  # Python 版设计文档
 │
 └── data/                           # 数据目录
@@ -202,9 +201,9 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 | 页面 | 路径 | 说明 |
 |------|------|------|
 | Chat UI | http://localhost:8080/ | RAG 对话（Tab 1） |
-| SQL Agent | http://localhost:8080/ | 多场景意图路由（Tab 2） |
+| SQL Agent | http://localhost:8080/ | 意图路由 + SQL 生成（Tab 2） |
 | 文档上传 | http://localhost:8080/ | 上传文档并索引到 RAG（Tab 3） |
-| Admin | http://localhost:8080/ | Schema 刷新、缓存管理（Tab 4） |
+| Admin | http://localhost:8080/ | 语义模型 / 业务知识 / 智能体知识管理（Tab 4） |
 | API 文档 | http://localhost:8080/docs | Swagger UI |
 | 健康检查 | http://localhost:8080/health | 服务状态 |
 
@@ -339,36 +338,35 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 
 检测模式：DROP TABLE、DELETE without WHERE、TRUNCATE、UPDATE with always-true WHERE 等。
 
-### 5. SQL ReAct 自纠错 + 自动补表
-
-**执行错误重试**：SQL 执行失败时，LLM 自动分析错误并重新生成 SQL，最多重试 3 次：
+### 5. SQL React 图流程
 
 ```
-generate_sql → execute_sql → FAIL → error_analysis → generate_sql (retry)
-                                     ↑                          |
-                                     └──────────────────────────┘
+contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → sql_generate
+     (代词消解)         (业务知识+few-shot)  (术语翻译)      (LLM选表)    (MySQL语义模型)              (SQL生成+补表)
 ```
 
-**自动补表发现**：当 LLM 发现缺少关键表时，自动 re-retrieve 补充缺失表的 schema：
+**核心流程**：
+1. **代词消解**：结合对话历史将"他"→"zhangsan01"
+2. **证据检索**：并行检索业务知识（公式/术语）+ 智能体知识（SQL 示例），RRF 融合
+3. **查询增强**：用业务知识翻译术语（GMV → 已支付订单总额）
+4. **表选择**：从 MySQL `t_semantic_model` 加载表名+描述，LLM 精选
+5. **Schema 加载**：从 `t_semantic_model` 构建含业务映射的 schema 文档
+6. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示
+7. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
+
+**自纠错**：执行失败时，`is_retryable()` 判断错误类型，连接类错误自动重试（最多 5 次），语法类错误直接返回。
+
+### 6. 意图路由 + 查询重写
+
+意图分类和查询重写合并为一次 LLM 调用，返回 `{intent, rewritten_query}`：
 
 ```
-generate_sql → needs_more_tables? → re-retrieve missing tables → generate_sql
-                 (最多 3 轮，直到 LLM 没有疑问)
+用户问题 + 对话历史 → classify_intent → sql_query → SQL React
+                                      → chat      → RAG Chat
 ```
 
-LLM 通过 `sql_format_response` 工具声明缺少的表名，系统自动检索并合并 schema 后重新生成。
-
-### 6. 多场景意图路由
-
-支持 7 种意图自动分类，路由到对应子图：
-
-```
-用户问题 → classify_intent → sql_query    → SQL React
-                           → anomaly_detect → (Phase 2)
-                           → report        → (Phase 2)
-                           → knowledge     → RAG Chat
-                           → chat          → RAG Chat
-```
+- 意图分类基于 `domain_summary`（自动生成的数据库领域摘要），不硬编码
+- 重写后的查询直接传递给下游，下游节点跳过重复的 LLM 调用
 
 ### 7. Human-in-the-Loop 审批
 

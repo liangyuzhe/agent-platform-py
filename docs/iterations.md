@@ -1195,3 +1195,71 @@ def _filter_columns_by_keywords(docs, semantic_model, keywords):
 | top_k 太小 | 有质量过滤时，top_k 要放大，否则过滤后可能为空 |
 | MySQL 版本兼容 | `SHOW MASTER STATUS` 在 8.0.22+ 废弃，用 `SHOW BINARY LOG STATUS` |
 | 系统 Python vs venv | 包装在 venv 里但用系统 Python 启动会找不到包 |
+
+---
+
+## 迭代 17：去除 Milvus Schema 索引依赖 ✅
+
+### 为什么优化
+
+统一 `t_semantic_model` 后，`sql_retrieve` 已经只从 MySQL 加载 schema，但 `select_tables` 仍然依赖 Milvus 做表发现（向量检索 schema 文档提取表名）。同时 admin 页面的"刷新 Schema"按钮、启动时的 `_index_schemas_background` 自动索引、`schema_indexer.py` 的 Milvus+ES 双写都已不再需要。
+
+**核心矛盾**：schema 数据已经统一到 MySQL `t_semantic_model`，但表发现仍在绕道 Milvus，增加了不必要的依赖和延迟。
+
+### 优化了什么
+
+**1. select_tables 去除 Milvus 依赖**
+
+- 移除 `search_schema_tables`（Milvus 向量检索 schema 文档返回候选表名）
+- 移除 `get_schema_table_names`（Milvus metadata 查询所有表名）
+- 移除 `load_table_names` 节点（已不在图中，但函数定义仍存在）
+- `select_tables` 改为直接从 `load_full_table_metadata()` 加载表名+描述（MySQL `information_schema.tables`）
+
+```
+优化前: query → Milvus 向量检索 top-10 schema docs → 提取候选表名 → LLM 精选
+优化后: query → MySQL information_schema.tables 加载全量表名+描述 → LLM 精选
+```
+
+**2. 移除 admin 刷新 Schema 功能**
+
+- 删除 `POST /api/admin/refresh-schemas` 端点（调用 `schema_indexer.index_mysql_schemas`）
+- 删除前端 Admin Tab 的"刷新 Schema"按钮和 `refreshSchemas()` 函数
+- Admin Tab 改为提示用户使用 seed 脚本管理语义模型
+
+**3. 移除启动时 schema 自动索引**
+
+- 删除 `_index_schemas_background`（向量化 schema 到 Milvus + ES）
+- 替换为 `_ensure_domain_summary`（仅在 domain_summary 为空时，从 MySQL 表元数据生成领域摘要）
+- 领域摘要仍用于意图分类，但不再依赖 Milvus schema 文档
+
+**4. 清理死代码**
+
+- 删除 `get_schema_table_names`（retriever.py）
+- 删除 `search_schema_tables`（retriever.py）
+- 删除 `get_schema_docs_by_tables`（retriever.py，零调用方）
+
+**保留的代码**
+
+- `schema_indexer.py`：保留，seed 脚本仍在使用（`seed_financial.py`、`seed_all.py`）
+- `VectorOnlyRetriever`：保留，eval runner 仍在使用
+- Milvus + ES：保留用于业务知识、智能体知识、用户文档的向量检索
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/sql_react.py` | `select_tables` 改为 MySQL-only；移除 `load_table_names`；移除 `search_schema_tables`/`get_schema_table_names` 导入 |
+| `agents/rag/retriever.py` | 删除 `get_schema_table_names`、`search_schema_tables`、`get_schema_docs_by_tables` |
+| `agents/api/routers/admin.py` | 删除 `POST /refresh-schemas` 端点和 `RefreshResponse` 模型 |
+| `agents/api/app.py` | `_index_schemas_background` → `_ensure_domain_summary` |
+| `agents/static/index.html` | 删除 Admin Tab 的刷新 Schema 按钮和 JS |
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| 表发现 | Milvus 向量检索 + embedding 计算（~200ms） | MySQL 直查（~10ms） |
+| 外部依赖 | select_tables 依赖 Milvus 可用 | select_tables 只依赖 MySQL |
+| 启动索引 | 启动时向量化所有表 schema 到 Milvus + ES | 仅生成 domain_summary（如缺失） |
+| Admin 功能 | 手动刷新 schema 索引 | 不再需要（schema 自动同步） |
+| 代码量 | 3 个 Milvus schema 函数 + 启动索引 + admin 端点 | 全部移除 |

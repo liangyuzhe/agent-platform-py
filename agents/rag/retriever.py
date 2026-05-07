@@ -473,27 +473,6 @@ def get_vector_only_retriever(
 # Metadata-based schema retrieval (for SQL React)
 # ---------------------------------------------------------------------------
 
-def get_schema_table_names(source: str = "mysql_schema") -> list[str]:
-    """Return all distinct table_names for schema documents in Milvus."""
-    from pymilvus import MilvusClient
-
-    uri = f"http://{settings.milvus.addr}"
-    client = MilvusClient(uri=uri)
-    try:
-        results = client.query(
-            collection_name=settings.milvus.collection_name,
-            filter=f'source == "{source}"',
-            output_fields=["table_name"],
-        )
-        names = sorted({r["table_name"] for r in results if r.get("table_name")})
-        return names
-    except Exception as e:
-        logger.warning("get_schema_table_names failed: %s", e)
-        return []
-    finally:
-        client.close()
-
-
 def load_full_table_metadata() -> list[dict]:
     """Load table_name + table_comment from MySQL information_schema.
 
@@ -520,48 +499,17 @@ def load_full_table_metadata() -> list[dict]:
             )
             rows = cur.fetchall()
         conn.close()
+        # information_schema returns UPPERCASE keys (TABLE_NAME, TABLE_COMMENT)
         result = [
-            {"table_name": r["table_name"], "table_comment": r.get("table_comment", "")}
-            for r in rows if r.get("table_name")
+            {"table_name": r.get("TABLE_NAME") or r.get("table_name", ""),
+             "table_comment": r.get("TABLE_COMMENT") or r.get("table_comment", "")}
+            for r in rows if r.get("TABLE_NAME") or r.get("table_name")
         ]
         logger.info("Loaded %d table metadata entries", len(result))
         return result
     except Exception as e:
         logger.warning("load_full_table_metadata failed: %s", e)
         return []
-
-
-def search_schema_tables(query: str, top_k: int = 10, source: str = "mysql_schema") -> list[str]:
-    """Vector search schema docs, return top-K unique table names (Stage 1 pre-filter)."""
-    from pymilvus import MilvusClient
-
-    embeddings = _get_embeddings()
-    uri = f"http://{settings.milvus.addr}"
-    client = MilvusClient(uri=uri)
-    try:
-        vector = embeddings.embed_query(query)
-        results = client.search(
-            collection_name=settings.milvus.collection_name,
-            data=[vector],
-            limit=top_k,
-            filter=f'source == "{source}"',
-            output_fields=["table_name"],
-        )
-        names = []
-        seen = set()
-        for hit in results[0]:
-            entity = hit.get("entity", {})
-            name = entity.get("table_name", "")
-            if name and name not in seen:
-                seen.add(name)
-                names.append(name)
-        logger.info("Vector search recalled %d tables for query '%s': %s", len(names), query[:50], names)
-        return names
-    except Exception as e:
-        logger.warning("search_schema_tables failed: %s", e)
-        return []
-    finally:
-        client.close()
 
 
 def _milvus_vector_search(query: str, source: str, top_k: int) -> list[Document]:
@@ -811,42 +759,3 @@ def get_table_relationships(table_names: list[str]) -> list[dict]:
         return []
 
 
-def get_schema_docs_by_tables(
-    table_names: list[str],
-    source: str = "mysql_schema",
-) -> list[Document]:
-    """Retrieve schema documents by exact table_name filter (no vector search)."""
-    if not table_names:
-        return []
-
-    from pymilvus import MilvusClient
-
-    uri = f"http://{settings.milvus.addr}"
-    client = MilvusClient(uri=uri)
-    try:
-        # Build IN filter: table_name in ["t_a", "t_b"]
-        names_literal = ", ".join(f'"{n}"' for n in table_names)
-        filter_expr = f'source == "{source}" && table_name in [{names_literal}]'
-        results = client.query(
-            collection_name=settings.milvus.collection_name,
-            filter=filter_expr,
-            output_fields=["text", "table_name", "doc_id"],
-        )
-        docs = [
-            Document(
-                page_content=r["text"],
-                metadata={
-                    "source": source,
-                    "table_name": r.get("table_name", ""),
-                    "doc_id": r.get("doc_id", ""),
-                },
-            )
-            for r in results
-        ]
-        logger.info("Metadata filter retrieved %d schema docs for tables: %s", len(docs), table_names)
-        return docs
-    except Exception as e:
-        logger.warning("get_schema_docs_by_tables failed: %s", e)
-        return []
-    finally:
-        client.close()

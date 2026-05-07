@@ -48,8 +48,8 @@ async def lifespan(app: FastAPI):
     # 初始化链路追踪
     init_tracing()
 
-    # 后台异步：检查领域摘要，按需索引 MySQL 表结构（不阻塞服务启动）
-    asyncio.create_task(_index_schemas_background(logger))
+    # 后台异步：检查领域摘要，按需生成（不阻塞服务启动）
+    asyncio.create_task(_ensure_domain_summary(logger))
 
     # 后台异步：t_semantic_model 全量初始化 + binlog 增量同步
     try:
@@ -118,48 +118,43 @@ def _create_knowledge_base_collection(client, coll: str, logger):
     logger.info("Created Milvus collection '%s' with schema (pk, text, vector, source, table_name, doc_id)", coll)
 
 
-async def _index_schemas_background(logger):
-    """后台任务：连接 MySQL 并将表结构向量化到 Milvus + ES。
-
-    如果 Milvus 集合为空或 domain_summary 表无数据，则执行索引。
-    """
+async def _ensure_domain_summary(logger):
+    """后台任务：如果 domain_summary 为空，从 t_semantic_model 生成领域摘要。"""
     try:
         from agents.tool.storage.domain_summary import (
             ensure_domain_summary_table,
             get_domain_summary,
         )
-        from agents.rag.schema_indexer import index_mysql_schemas
-        from pymilvus import MilvusClient
 
         await ensure_domain_summary_table()
 
-        # Check if schema docs exist in collection (not just row count, which can be stale)
-        uri = f"http://{settings.milvus.addr}"
-        client = MilvusClient(uri=uri)
-        try:
-            schema_docs = client.query(
-                collection_name=settings.milvus.collection_name,
-                filter='source == "mysql_schema"',
-                output_fields=["pk"],
-                limit=1,
-            )
-            has_schemas = len(schema_docs) > 0
-        except Exception:
-            has_schemas = False
-        finally:
-            client.close()
+        existing = await get_domain_summary()
+        if existing:
+            logger.info("Domain summary cached (%d chars), skipping generation", len(existing))
+            return
 
-        if has_schemas:
-            existing = await get_domain_summary()
-            if existing:
-                logger.info("Domain summary cached (%d chars), schema docs exist, skipping re-index", len(existing))
-                return
+        logger.info("No domain summary found, generating from semantic model...")
+        from agents.rag.schema_indexer import generate_domain_summary
+        from agents.rag.retriever import load_full_table_metadata
 
-        logger.info("No schema docs found, running schema indexing...")
-        result = await index_mysql_schemas()
-        logger.info("Schema auto-indexing done: %s", result)
+        metadata = load_full_table_metadata()
+        if not metadata:
+            logger.info("No tables found, skipping domain summary generation")
+            return
+
+        # Build schema docs from metadata for domain summary generation
+        from langchain_core.documents import Document
+        docs = []
+        for m in metadata:
+            content = f"表名: {m['table_name']}"
+            if m.get("table_comment"):
+                content += f" -- {m['table_comment']}"
+            docs.append(Document(page_content=content, metadata={"table_name": m["table_name"]}))
+
+        summary = await generate_domain_summary(docs)
+        logger.info("Domain summary generated (%d chars)", len(summary))
     except Exception as e:
-        logger.warning("Schema auto-indexing failed: %s", e)
+        logger.warning("Domain summary generation failed: %s", e)
 
 
 app = FastAPI(

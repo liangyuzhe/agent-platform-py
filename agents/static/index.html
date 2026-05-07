@@ -157,12 +157,11 @@
         <!-- Admin Tab -->
         <div id="tab-admin" class="tab-content">
             <div class="upload-box">
-                <h3 style="margin-bottom:16px; color:#333;">Schema 管理</h3>
+                <h3 style="margin-bottom:16px; color:#333;">管理面板</h3>
                 <p style="font-size:14px; color:#666; margin-bottom:16px;">
-                    全量刷新数据库表结构索引并重新生成领域摘要。通常在数据库表结构变更后使用。
+                    语义模型和业务知识通过 <code>scripts/seed_semantic_model.py</code> 和 <code>scripts/seed_business_knowledge.py</code> 管理。
+                    表结构变更由 <code>t_semantic_model</code> 自动同步（binlog 监听 + 轮询）。
                 </p>
-                <button class="upload-btn" id="refreshBtn" onclick="refreshSchemas()">刷新 Schema</button>
-                <div class="upload-result" id="refreshResult"></div>
             </div>
         </div>
     </div>
@@ -446,32 +445,6 @@
         }
 
         // --- Admin ---
-        async function refreshSchemas() {
-            const btn = document.getElementById('refreshBtn');
-            const result = document.getElementById('refreshResult');
-            btn.disabled = true;
-            btn.textContent = '刷新中...';
-            result.className = 'upload-result';
-
-            try {
-                const resp = await fetch('/api/admin/refresh-schemas', { method: 'POST' });
-                const data = await resp.json();
-                if (data.success) {
-                    result.className = 'upload-result success';
-                    result.textContent = data.message;
-                } else {
-                    result.className = 'upload-result error';
-                    result.textContent = data.message;
-                }
-            } catch (e) {
-                result.className = 'upload-result error';
-                result.textContent = '刷新失败: ' + e.message;
-            }
-
-            btn.textContent = '刷新 Schema';
-            btn.disabled = false;
-        }
-
         async function uploadFile() {
             if (!selectedFile) return;
             uploadBtn.disabled = true;
