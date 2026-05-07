@@ -1,4 +1,4 @@
-"""Final Graph 端点：支持中断/恢复的主调度。"""
+"""查询端点：意图分类 + 子图调用 + SQL 审批。"""
 
 import logging
 from fastapi import APIRouter
@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from langgraph.types import Command
 
-from agents.flow.final_graph import build_final_graph
+from agents.flow.dispatcher import build_final_graph
 from agents.tool.trace.tracing import get_trace_callbacks
 from agents.tool.memory.store import get_session, save_session
 from agents.tool.memory.session import Message
@@ -16,12 +16,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class FinalRequest(BaseModel):
+class QueryRequest(BaseModel):
     query: str
     session_id: str = "default_user"
+    intent: str = ""  # 前端预分类的意图，非空时跳过 LLM 分类
+    rewritten_query: str = ""  # 前端预重写的查询，非空时跳过上下文重写
 
 
-class FinalResponse(BaseModel):
+class QueryResponse(BaseModel):
     query: str
     answer: str
     status: str
@@ -32,6 +34,7 @@ class FinalResponse(BaseModel):
 
 class ClassifyResponse(BaseModel):
     intent: str
+    rewritten_query: str  # 重写后的独立查询
     session_id: str
 
 
@@ -109,36 +112,44 @@ def _extract_interrupt(result: dict) -> dict | None:
 
 
 @router.post("/classify", response_model=ClassifyResponse)
-async def classify_intent_endpoint(req: FinalRequest):
+async def classify_intent_endpoint(req: QueryRequest):
     """意图分类（非流式），前端据此选择流式端点。"""
-    from agents.flow.final_graph import classify_intent
+    from agents.flow.dispatcher import classify_intent
     chat_history = _load_chat_history(req.session_id)
     result = await classify_intent({"query": req.query, "chat_history": chat_history})
     return ClassifyResponse(
         intent=result.get("intent", "chat"),
+        rewritten_query=result.get("rewritten_query", req.query),
         session_id=req.session_id,
     )
 
 
-@router.post("/invoke", response_model=FinalResponse)
-async def final_invoke(req: FinalRequest):
-    """非流式 Final Graph 调用。"""
+@router.post("/invoke", response_model=QueryResponse)
+async def query_invoke(req: QueryRequest):
+    """查询调用：传入 intent 时跳过分类，直接路由到子图。"""
     graph = build_final_graph()
     config = _make_config(req.session_id)
     chat_history = _load_chat_history(req.session_id)
 
-    result = await graph.ainvoke({
+    initial_state = {
         "query": req.query,
         "session_id": req.session_id,
         "chat_history": chat_history,
-    }, config=config)
+    }
+    # 前端已分类+重写，传入后跳过 LLM 调用
+    if req.intent:
+        initial_state["intent"] = req.intent
+    if req.rewritten_query:
+        initial_state["rewritten_query"] = req.rewritten_query
+
+    result = await graph.ainvoke(initial_state, config=config)
 
     # 检查是否被 interrupt（等待审批）
     interrupt_val = _extract_interrupt(result)
     if interrupt_val:
         # 暂存原始 query，供 approve 后恢复
         _save_pending_query(req.session_id, req.query)
-        return FinalResponse(
+        return QueryResponse(
             query=req.query,
             answer=interrupt_val.get("message", "请确认是否执行该 SQL"),
             status="pending_approval",
@@ -152,7 +163,7 @@ async def final_invoke(req: FinalRequest):
     if answer:
         _save_qa_to_session(req.session_id, req.query, answer)
 
-    return FinalResponse(
+    return QueryResponse(
         query=req.query,
         answer=answer,
         status=result.get("status", "completed"),
@@ -177,7 +188,7 @@ async def approve_sql(req: ApproveRequest):
     # 审批后可能再次 interrupt（理论上不会，但防御性处理）
     interrupt_val = _extract_interrupt(result)
     if interrupt_val:
-        return FinalResponse(
+        return QueryResponse(
             query="",
             answer=interrupt_val.get("message", "请确认是否执行该 SQL"),
             status="pending_approval",
@@ -193,7 +204,7 @@ async def approve_sql(req: ApproveRequest):
     if answer and original_query:
         _save_qa_to_session(req.session_id, original_query, answer)
 
-    return FinalResponse(
+    return QueryResponse(
         query=original_query,
         answer=answer,
         status=result.get("status", "completed"),

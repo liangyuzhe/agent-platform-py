@@ -15,6 +15,11 @@ from agents.config.settings import settings
 from agents.algorithm.rrf import reciprocal_rank_fusion
 from agents.rag.reranker import CrossEncoderReranker
 
+try:
+    from elasticsearch import Elasticsearch
+except ImportError:
+    Elasticsearch = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,19 +98,16 @@ def build_milvus_retriever(
     collection: str | None = None,
     search_kwargs: dict | None = None,
     source_filter: str | None = None,
+    session_id_filter: str | None = None,
 ) -> BaseRetriever:
     """Build a dense vector retriever backed by Milvus.
 
     Parameters
     ----------
-    milvus_uri:
-        Milvus connection URI.  Falls back to ``settings.milvus.addr``.
-    collection:
-        Milvus collection name.  Defaults to ``settings.milvus.collection_name``.
-    search_kwargs:
-        Extra keyword arguments forwarded to ``as_retriever``.
     source_filter:
         If set, add ``source == "<value>"`` filter to Milvus search.
+    session_id_filter:
+        If set, add ``session_id == "<value>"`` filter (combined with source_filter).
     """
     uri = milvus_uri or f"http://{settings.milvus.addr}"
     coll = collection or settings.milvus.collection_name
@@ -117,8 +119,14 @@ def build_milvus_retriever(
         collection_name=coll,
     )
     kwargs = search_kwargs or {"search_type": "similarity", "k": 20}
+    # 构建过滤表达式
+    filters = []
     if source_filter:
-        kwargs["expr"] = f'source == "{source_filter}"'
+        filters.append(f'source == "{source_filter}"')
+    if session_id_filter:
+        filters.append(f'session_id == "{session_id_filter}"')
+    if filters:
+        kwargs["expr"] = " && ".join(filters)
     return store.as_retriever(**kwargs)
 
 
@@ -199,6 +207,7 @@ class HybridRetriever:
         reranker_top_k: int = 5,
         rerank_threshold: float = 0.1,
         source_filter: str | None = None,
+        session_id_filter: str | None = None,
     ) -> None:
         search_kwargs = {"search_type": "similarity", "k": retrieve_k}
         self._milvus = build_milvus_retriever(
@@ -206,6 +215,7 @@ class HybridRetriever:
             collection=milvus_collection,
             search_kwargs=search_kwargs,
             source_filter=source_filter,
+            session_id_filter=session_id_filter,
         )
         self._es = build_es_retriever(
             es_url=es_url,
@@ -386,15 +396,37 @@ def get_hybrid_retriever(
     reranker_top_k: int | None = None,
     rerank_threshold: float | None = None,
     source_filter: str | None = None,
+    session_id_filter: str | None = None,
 ) -> HybridRetriever:
-    """Return a cached HybridRetriever singleton.
+    """Return a HybridRetriever.
 
-    Parameters default to ``settings.rag.*`` values.  Pass explicit values
-    to override per-call.
+    Uses a singleton for shared retrievers (no session_id_filter).
+    Creates a new instance per call for session-scoped retrievers.
     """
     global _retriever_instance
+
+    # session-scoped retrievers: always create new instance
+    if session_id_filter:
+        if reranker_model is None:
+            rm = settings.rag.reranker_model
+            reranker_model = rm if rm else None
+        if reranker_top_k is None:
+            reranker_top_k = settings.rag.reranker_top_k
+        if rerank_threshold is None:
+            rerank_threshold = settings.rag.rerank_threshold
+        return HybridRetriever(
+            milvus_collection=milvus_collection,
+            es_index=es_index,
+            retrieve_k=retrieve_k,
+            reranker_model=reranker_model,
+            reranker_top_k=reranker_top_k,
+            rerank_threshold=rerank_threshold,
+            source_filter=source_filter,
+            session_id_filter=session_id_filter,
+        )
+
+    # Shared retrievers: use singleton
     if _retriever_instance is None:
-        # Resolve from settings when not explicitly provided
         if reranker_model is None:
             rm = settings.rag.reranker_model
             reranker_model = rm if rm else None
@@ -462,6 +494,43 @@ def get_schema_table_names(source: str = "mysql_schema") -> list[str]:
         client.close()
 
 
+def load_full_table_metadata() -> list[dict]:
+    """Load table_name + table_comment from MySQL information_schema.
+
+    Returns [{"table_name": "t_order", "table_comment": "订单表"}, ...].
+    """
+    import pymysql
+
+    try:
+        conn = pymysql.connect(
+            host=settings.mysql.host,
+            port=settings.mysql.port,
+            user=settings.mysql.username,
+            password=settings.mysql.password,
+            database=settings.mysql.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name, table_comment "
+                "FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() "
+                "ORDER BY table_name"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        result = [
+            {"table_name": r["table_name"], "table_comment": r.get("table_comment", "")}
+            for r in rows if r.get("table_name")
+        ]
+        logger.info("Loaded %d table metadata entries", len(result))
+        return result
+    except Exception as e:
+        logger.warning("load_full_table_metadata failed: %s", e)
+        return []
+
+
 def search_schema_tables(query: str, top_k: int = 10, source: str = "mysql_schema") -> list[str]:
     """Vector search schema docs, return top-K unique table names (Stage 1 pre-filter)."""
     from pymilvus import MilvusClient
@@ -495,8 +564,8 @@ def search_schema_tables(query: str, top_k: int = 10, source: str = "mysql_schem
         client.close()
 
 
-def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
-    """Vector search for business knowledge (terms, formulas, synonyms)."""
+def _milvus_vector_search(query: str, source: str, top_k: int) -> list[Document]:
+    """Vector search in Milvus with source filter."""
     from pymilvus import MilvusClient
 
     embeddings = _get_embeddings()
@@ -508,7 +577,7 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
             collection_name=settings.milvus.collection_name,
             data=[vector],
             limit=top_k,
-            filter='source == "business_knowledge"',
+            filter=f'source == "{source}"',
             output_fields=["text", "doc_id"],
         )
         docs = []
@@ -517,54 +586,229 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
             docs.append(Document(
                 page_content=entity.get("text", ""),
                 metadata={
-                    "source": "business_knowledge",
+                    "source": source,
                     "doc_id": entity.get("doc_id", ""),
                     "score": hit.get("distance", 0),
+                    "retriever_source": "milvus",
                 },
             ))
-        logger.info("Business knowledge recall: %d docs for query '%s'", len(docs), query[:50])
         return docs
     except Exception as e:
-        logger.warning("recall_business_knowledge failed: %s", e)
+        logger.warning("Milvus vector search failed for source=%s: %s", source, e)
         return []
     finally:
         client.close()
+
+
+def _es_bm25_search(query: str, source: str, top_k: int = 10) -> list[Document]:
+    """BM25 keyword search in Elasticsearch with source filter.
+
+    Uses raw ES client to match the indexing format from schema_indexer and seed scripts.
+    """
+    if Elasticsearch is None:
+        return []
+    try:
+        es_url = settings.es.address if settings.es.address.startswith("http") else f"http://{settings.es.address}"
+        es = Elasticsearch(es_url)
+        body = {
+            "size": top_k,
+            "query": {
+                "bool": {
+                    "must": [
+                        {"match": {"text": query}},
+                    ],
+                    "filter": [
+                        {"term": {"metadata.source.keyword": source}},
+                    ],
+                }
+            },
+        }
+        resp = es.search(index=settings.es.index, body=body)
+        docs = []
+        for hit in resp["hits"]["hits"]:
+            src = hit["_source"]
+            docs.append(Document(
+                page_content=src.get("text", ""),
+                metadata={
+                    "source": source,
+                    "doc_id": src.get("metadata", {}).get("doc_id", hit["_id"]),
+                    "score": hit["_score"],
+                    "retriever_source": "es",
+                },
+            ))
+        return docs
+    except Exception as e:
+        logger.warning("ES BM25 search failed for source=%s: %s", source, e)
+        return []
+
+
+def _filter_has_sql(docs: list[Document]) -> list[Document]:
+    """过滤：agent_knowledge 必须包含 SQL 语句才保留。"""
+    sql_keywords = ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER")
+    result = []
+    for doc in docs:
+        content_upper = doc.page_content.upper()
+        if any(kw in content_upper for kw in sql_keywords):
+            result.append(doc)
+        else:
+            logger.debug("Filtered out agent_knowledge (no SQL): %s", doc.page_content[:80])
+    return result
+
+
+def _filter_has_business_term(docs: list[Document]) -> list[Document]:
+    """过滤：business_knowledge 必须包含公式/定义/术语关系才保留。"""
+    formula_indicators = ("=", "/", "*", "SUM", "COUNT", "AVG", "公式", "定义", "计算", "比率", "率", "总额", "合计")
+    result = []
+    for doc in docs:
+        content = doc.page_content
+        if any(indicator in content for indicator in formula_indicators):
+            result.append(doc)
+        else:
+            logger.debug("Filtered out business_knowledge (no formula/term): %s", content[:80])
+    return result
+
+
+def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
+    """混合检索业务知识：向量 + BM25 + RRF，过滤无公式/术语的结果。"""
+    # 并行：向量检索 + BM25
+    vector_docs = _milvus_vector_search(query, "business_knowledge", top_k)
+    es_docs = _es_bm25_search(query, "business_knowledge", top_k)
+
+    # RRF 融合
+    if vector_docs and es_docs:
+        fused = reciprocal_rank_fusion([vector_docs, es_docs], k=60)
+    elif vector_docs:
+        fused = vector_docs
+    else:
+        fused = es_docs
+
+    # 质量过滤：必须包含公式/术语
+    filtered = _filter_has_business_term(fused)
+
+    logger.info(
+        "Business knowledge recall: vector=%d, es=%d, fused=%d, filtered=%d",
+        len(vector_docs), len(es_docs), len(fused), len(filtered),
+    )
+    return filtered[:top_k]
 
 
 def recall_agent_knowledge(query: str, top_k: int = 3) -> list[Document]:
-    """Vector search for agent knowledge (SQL Q&A few-shot pairs)."""
-    from pymilvus import MilvusClient
+    """混合检索智能体知识：向量 + BM25 + RRF，过滤无 SQL 的结果。"""
+    # 并行：向量检索 + BM25
+    vector_docs = _milvus_vector_search(query, "agent_knowledge", top_k)
+    es_docs = _es_bm25_search(query, "agent_knowledge", top_k)
 
-    embeddings = _get_embeddings()
-    uri = f"http://{settings.milvus.addr}"
-    client = MilvusClient(uri=uri)
+    # RRF 融合
+    if vector_docs and es_docs:
+        fused = reciprocal_rank_fusion([vector_docs, es_docs], k=60)
+    elif vector_docs:
+        fused = vector_docs
+    else:
+        fused = es_docs
+
+    # 质量过滤：必须包含 SQL
+    filtered = _filter_has_sql(fused)
+
+    logger.info(
+        "Agent knowledge recall: vector=%d, es=%d, fused=%d, filtered=%d",
+        len(vector_docs), len(es_docs), len(fused), len(filtered),
+    )
+    return filtered[:top_k]
+
+
+def get_semantic_model_by_tables(table_names: list[str]) -> dict[str, dict[str, dict]]:
+    """Load semantic model from MySQL for specific tables.
+
+    Returns {table_name: {column_name: row_dict}}.
+    """
+    if not table_names:
+        return {}
+
+    import pymysql
+
     try:
-        vector = embeddings.embed_query(query)
-        results = client.search(
-            collection_name=settings.milvus.collection_name,
-            data=[vector],
-            limit=top_k,
-            filter='source == "agent_knowledge"',
-            output_fields=["text", "doc_id"],
+        conn = pymysql.connect(
+            host=settings.mysql.host,
+            port=settings.mysql.port,
+            user=settings.mysql.username,
+            password=settings.mysql.password,
+            database=settings.mysql.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
         )
-        docs = []
-        for hit in results[0]:
-            entity = hit.get("entity", {})
-            docs.append(Document(
-                page_content=entity.get("text", ""),
-                metadata={
-                    "source": "agent_knowledge",
-                    "doc_id": entity.get("doc_id", ""),
-                    "score": hit.get("distance", 0),
-                },
-            ))
-        logger.info("Agent knowledge recall: %d docs for query '%s'", len(docs), query[:50])
-        return docs
+        placeholders = ", ".join(["%s"] * len(table_names))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT table_name, column_name, column_type, column_comment, "
+                f"is_pk, is_fk, ref_table, ref_column, "
+                f"business_name, synonyms, business_description "
+                f"FROM t_semantic_model WHERE table_name IN ({placeholders})",
+                table_names,
+            )
+            rows = cur.fetchall()
+        conn.close()
+
+        result: dict[str, dict[str, dict]] = {}
+        for row in rows:
+            tbl = row["table_name"]
+            col = row["column_name"]
+            result.setdefault(tbl, {})[col] = row
+        logger.info("Loaded semantic model for %d tables, %d entries", len(result), len(rows))
+        return result
     except Exception as e:
-        logger.warning("recall_agent_knowledge failed: %s", e)
+        logger.warning("Semantic model load failed: %s", e)
+        return {}
+
+
+def get_table_relationships(table_names: list[str]) -> list[dict]:
+    """获取表之间的外键关系。
+
+    Returns: [{"from_table": "t_order", "from_column": "user_id",
+               "to_table": "t_user", "to_column": "id"}, ...]
+    """
+    if not table_names:
         return []
-    finally:
-        client.close()
+
+    import pymysql
+
+    try:
+        conn = pymysql.connect(
+            host=settings.mysql.host,
+            port=settings.mysql.port,
+            user=settings.mysql.username,
+            password=settings.mysql.password,
+            database=settings.mysql.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        # 查找涉及这些表的外键关系（双向）
+        placeholders = ", ".join(["%s"] * len(table_names))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT table_name AS from_table, column_name AS from_column, "
+                f"referenced_table_name AS to_table, referenced_column_name AS to_column "
+                f"FROM information_schema.key_column_usage "
+                f"WHERE table_schema = DATABASE() "
+                f"AND referenced_table_name IS NOT NULL "
+                f"AND (table_name IN ({placeholders}) OR referenced_table_name IN ({placeholders}))",
+                table_names + table_names,
+            )
+            rows = cur.fetchall()
+        conn.close()
+
+        # 去重
+        seen = set()
+        result = []
+        for r in rows:
+            key = (r["from_table"], r["from_column"], r["to_table"], r["to_column"])
+            if key not in seen:
+                seen.add(key)
+                result.append(r)
+        logger.info("Found %d table relationships", len(result))
+        return result
+    except Exception as e:
+        logger.warning("get_table_relationships failed: %s", e)
+        return []
 
 
 def get_schema_docs_by_tables(

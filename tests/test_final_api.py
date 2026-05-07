@@ -1,9 +1,9 @@
-"""Tests for Final Graph API endpoints: invoke, approve, interrupt handling."""
+"""Tests for Query API endpoints: invoke, approve, interrupt handling."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agents.api.routers.final import _extract_interrupt
+from agents.api.routers.query import _extract_interrupt
 
 
 # ---------------------------------------------------------------------------
@@ -51,18 +51,18 @@ class TestExtractInterrupt:
 
 
 # ---------------------------------------------------------------------------
-# /api/final/invoke
+# /api/query/invoke
 # ---------------------------------------------------------------------------
 
-class TestFinalInvoke:
-    """Test POST /api/final/invoke."""
+class TestQueryInvoke:
+    """Test POST /api/query/invoke."""
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_invoke_returns_answer(self, mock_build_graph, mock_callbacks):
         """Normal completion should return answer."""
-        from agents.api.routers.final import final_invoke, FinalRequest
+        from agents.api.routers.query import query_invoke, QueryRequest
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke = AsyncMock(return_value={
@@ -71,19 +71,19 @@ class TestFinalInvoke:
         })
         mock_build_graph.return_value = mock_graph
 
-        req = FinalRequest(query="count users", session_id="s1")
-        result = await final_invoke(req)
+        req = QueryRequest(query="count users", session_id="s1")
+        result = await query_invoke(req)
 
         assert result.answer == "42 rows found"
         assert result.status == "completed"
         assert result.pending_approval is False
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_invoke_returns_pending_approval(self, mock_build_graph, mock_callbacks):
         """When graph returns interrupt, should return pending_approval."""
-        from agents.api.routers.final import final_invoke, FinalRequest
+        from agents.api.routers.query import query_invoke, QueryRequest
 
         interrupt_obj = MagicMock()
         interrupt_obj.value = {"sql": "SELECT * FROM users", "message": "请确认?"}
@@ -94,8 +94,8 @@ class TestFinalInvoke:
         })
         mock_build_graph.return_value = mock_graph
 
-        req = FinalRequest(query="查询用户", session_id="s1")
-        result = await final_invoke(req)
+        req = QueryRequest(query="查询用户", session_id="s1")
+        result = await query_invoke(req)
 
         assert result.pending_approval is True
         assert result.status == "pending_approval"
@@ -103,38 +103,56 @@ class TestFinalInvoke:
         assert "确认" in result.answer
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_invoke_passes_thread_id(self, mock_build_graph, mock_callbacks):
         """Should pass thread_id in config."""
-        from agents.api.routers.final import final_invoke, FinalRequest
+        from agents.api.routers.query import query_invoke, QueryRequest
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke = AsyncMock(return_value={"answer": "ok", "status": "completed"})
         mock_build_graph.return_value = mock_graph
 
-        req = FinalRequest(query="test", session_id="my-session")
-        await final_invoke(req)
+        req = QueryRequest(query="test", session_id="my-session")
+        await query_invoke(req)
 
         call_kwargs = mock_graph.ainvoke.call_args
         config = call_kwargs[1].get("config") or call_kwargs[0][1] if len(call_kwargs[0]) > 1 else call_kwargs[1].get("config")
         # Config should have thread_id
         assert config["configurable"]["thread_id"] == "my-session"
 
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_skips_classify_with_intent(self, mock_build_graph, mock_callbacks):
+        """When intent is provided, should pass it to graph (skip LLM classify)."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"answer": "ok", "status": "completed"})
+        mock_build_graph.return_value = mock_graph
+
+        req = QueryRequest(query="查用户", session_id="s1", intent="sql_query")
+        await query_invoke(req)
+
+        call_args = mock_graph.ainvoke.call_args
+        initial_state = call_args[0][0]
+        assert initial_state["intent"] == "sql_query"
+
 
 # ---------------------------------------------------------------------------
-# /api/final/approve
+# /api/query/approve
 # ---------------------------------------------------------------------------
 
-class TestFinalApprove:
-    """Test POST /api/final/approve."""
+class TestQueryApprove:
+    """Test POST /api/query/approve."""
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_approve_returns_result(self, mock_build_graph, mock_callbacks):
         """Approved SQL should return execution result."""
-        from agents.api.routers.final import approve_sql, ApproveRequest
+        from agents.api.routers.query import approve_sql, ApproveRequest
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke = AsyncMock(return_value={
@@ -150,11 +168,11 @@ class TestFinalApprove:
         assert result.status == "completed"
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_approve_sends_command_resume(self, mock_build_graph, mock_callbacks):
         """Should send Command(resume=...) to graph."""
-        from agents.api.routers.final import approve_sql, ApproveRequest
+        from agents.api.routers.query import approve_sql, ApproveRequest
         from langgraph.types import Command
 
         mock_graph = AsyncMock()
@@ -171,11 +189,11 @@ class TestFinalApprove:
         assert cmd.resume["feedback"] == "looks good"
 
     @pytest.mark.asyncio
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
-    @patch("agents.api.routers.final.build_final_graph")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_approve_reject_still_returns(self, mock_build_graph, mock_callbacks):
         """Rejection should still return a result."""
-        from agents.api.routers.final import approve_sql, ApproveRequest
+        from agents.api.routers.query import approve_sql, ApproveRequest
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke = AsyncMock(return_value={
@@ -197,26 +215,26 @@ class TestFinalApprove:
 class TestMakeConfig:
     """Test config construction."""
 
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
     def test_config_has_thread_id(self, mock_callbacks):
-        from agents.api.routers.final import _make_config
+        from agents.api.routers.query import _make_config
 
         config = _make_config("session-123")
 
         assert config["configurable"]["thread_id"] == "session-123"
 
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=["handler1"])
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=["handler1"])
     def test_config_has_callbacks(self, mock_callbacks):
-        from agents.api.routers.final import _make_config
+        from agents.api.routers.query import _make_config
 
         config = _make_config("s1")
 
         assert "callbacks" in config
         assert config["callbacks"] == ["handler1"]
 
-    @patch("agents.api.routers.final.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
     def test_config_no_empty_callbacks(self, mock_callbacks):
-        from agents.api.routers.final import _make_config
+        from agents.api.routers.query import _make_config
 
         config = _make_config("s1")
 

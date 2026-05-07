@@ -23,12 +23,15 @@ class SQLReactState(TypedDict):
     """SQL React 图的状态。"""
     query: str                                   # 当前用户问题（可能是代词化的）
     rewritten_query: str                         # 上下文化后的独立问题
+    enhanced_query: str                          # 业务术语增强后的查询
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     table_names: list[str]                       # 所有可用表名（启动时缓存）
     selected_tables: list[str]                   # LLM 选中的相关表名
+    table_relationships: list[dict]              # 表关系 [{from_table, from_column, to_table, to_column}]
     evidence: list[str]                          # 业务知识检索结果
     few_shot_examples: list[str]                 # SQL Q&A few-shot 参考
-    docs: list[Document]                         # 检索到的表结构
+    docs: list[Document]                         # 检索到的表结构（从 t_semantic_model 构建）
+    semantic_model: dict                         # {table_name: {column_name: row_dict}}
     sql: str                                     # 生成的 SQL
     is_sql: bool                                 # 是否为 SQL 输出
     answer: str                                  # 非 SQL 回答

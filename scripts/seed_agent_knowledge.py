@@ -125,7 +125,7 @@ def seed_data(conn):
 
 
 async def index_to_milvus():
-    """Vectorize agent knowledge Q&A pairs and store in Milvus."""
+    """Vectorize agent knowledge Q&A pairs and store in Milvus + ES."""
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT id, question, sql_text, description, category FROM t_agent_knowledge")
@@ -136,7 +136,6 @@ async def index_to_milvus():
         print("No agent knowledge to index")
         return
 
-    from langchain_core.documents import Document
     from agents.rag.retriever import _get_embeddings
     from pymilvus import MilvusClient
 
@@ -145,27 +144,24 @@ async def index_to_milvus():
         content = f"问题: {row['question']}\nSQL: {row['sql_text']}"
         if row.get("description"):
             content += f"\n说明: {row['description']}"
-        docs.append(Document(
-            page_content=content,
-            metadata={
-                "source": "agent_knowledge",
-                "question": row["question"],
-                "category": row.get("category", ""),
-                "doc_id": f"ak_{row['id']}",
-            },
-        ))
+        docs.append({
+            "content": content,
+            "question": row["question"],
+            "category": row.get("category", ""),
+            "doc_id": f"ak_{row['id']}",
+        })
 
     embeddings = _get_embeddings()
     milvus_uri = f"http://{settings.milvus.addr}"
     client = MilvusClient(uri=milvus_uri)
 
-    doc_ids = [d.metadata["doc_id"] for d in docs]
+    doc_ids = [d["doc_id"] for d in docs]
     try:
         client.delete(collection_name=settings.milvus.collection_name, ids=doc_ids)
     except Exception:
         pass
 
-    texts = [d.page_content for d in docs]
+    texts = [d["content"] for d in docs]
     vectors = []
     batch_size = 10
     for i in range(0, len(texts), batch_size):
@@ -175,7 +171,7 @@ async def index_to_milvus():
     for doc, doc_id, vector in zip(docs, doc_ids, vectors):
         records.append({
             "pk": doc_id,
-            "text": doc.page_content,
+            "text": doc["content"],
             "vector": vector,
             "source": "agent_knowledge",
             "table_name": "",
@@ -185,6 +181,29 @@ async def index_to_milvus():
     client.insert(collection_name=settings.milvus.collection_name, data=records)
     client.close()
     print(f"Indexed {len(docs)} agent knowledge entries into Milvus")
+
+    # --- Elasticsearch BM25 ---
+    try:
+        from elasticsearch import Elasticsearch
+        es_url = settings.es.address if settings.es.address.startswith("http") else f"http://{settings.es.address}"
+        es = Elasticsearch(es_url)
+        for doc, doc_id in zip(docs, doc_ids):
+            es.index(
+                index=settings.es.index,
+                id=doc_id,
+                document={
+                    "text": doc["content"],
+                    "metadata": {
+                        "source": "agent_knowledge",
+                        "question": doc["question"],
+                        "category": doc["category"],
+                        "doc_id": doc_id,
+                    },
+                },
+            )
+        print(f"Indexed {len(docs)} agent knowledge entries into Elasticsearch")
+    except Exception as e:
+        print(f"ES indexing failed (non-fatal): {e}")
 
 
 def main():

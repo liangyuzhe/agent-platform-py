@@ -528,3 +528,670 @@ def route_after_execute(state):
 | `agents/flow/sql_react.py` | `route_after_execute` 使用 `is_retryable`，超时从配置读取 |
 | `agents/flow/rag_chat.py` | 超时从 `settings.resilience` 读取 |
 | `agents/tool/sql_tools/mcp_client.py` | SQL 执行超时从配置读取 |
+
+---
+
+## Bug 修复记录
+
+### Bug 1：ConnectionNotExistException 文件上传失败
+
+**出现什么问题**：文件上传到 Milvus 时报 `ConnectionNotExistException`，langchain-milvus 内部调用 `Collection(alias=...)` 找不到连接。
+
+**什么原因**：pymilvus 2.6.x 的 `MilvusClient` 不再自动注册到全局 `pymilvus.connections` 注册表。langchain-milvus 0.3.x 内部使用 `Collection(alias=...)` 时依赖全局注册表，导致找不到连接句柄。
+
+**怎么解决的**：在 `agents/rag/retriever.py` 中实现 `_patch_milvus_connections()` 猴子补丁，拦截 `MilvusClient.__init__`，在创建后自动调用 `connections.add_connection()` 注册到全局注册表。补丁在应用启动时 (`app.py` 的 `_init_milvus()`) 执行一次。
+
+### Bug 2：DataNotMatchException Insert missed field table_name
+
+**出现什么问题**：用户文档上传时报 `DataNotMatchException: Insert missed field table_name`，Goagent2 集合的 `table_name` 字段为 NOT NULL。
+
+**什么原因**：旧集合 Goagent2 的 schema 定义了 `table_name` 为非空字段，但用户上传的文档（PDF/TXT）没有这个字段。schema 文档有 `table_name`，用户文档没有。
+
+**怎么解决的**：在 `agents/rag/indexing.py` 中，对所有非 schema 文档设置 `chunk.metadata["table_name"] = ""`。同时统一使用 `knowledge_base` 集合，通过 `source` 字段区分文档来源（mysql_schema / user_document / business_knowledge / agent_knowledge）。
+
+### Bug 3：MCP MySQL Server 只读，无法写入 domain_summary
+
+**出现什么问题**：`domain_summary` 表创建和写入操作静默失败，启动时无法保存领域摘要。
+
+**什么原因**：MCP MySQL Server 配置为只读模式（`--read-only`），所有 DDL/DML 操作都被拒绝。之前所有数据库操作都通过 MCP，写操作无法执行。
+
+**怎么解决的**：将 `agents/tool/storage/domain_summary.py` 中所有写操作改为 pymysql 直连（`ensure_domain_summary_table`、`save_domain_summary`），读操作保持通过 MCP。
+
+### Bug 4：启动时 schema 索引被错误跳过
+
+**出现什么问题**：启动后 Milvus 中没有 schema 文档，但 `_index_schemas_background` 认为已有数据而跳过索引。
+
+**什么原因**：使用 `get_collection_stats().row_count` 判断是否有数据，但 Milvus 删除数据后 `row_count` 不立即更新（compaction 前显示旧值）。`domain_summary` 表中也有旧数据，导致双重误判。
+
+**怎么解决的**：改为直接查询 `source == "mysql_schema"` 的文档是否存在，而不是依赖 `row_count`。同时检查 `domain_summary` 表中的摘要是否真正存在。
+
+### Bug 5：Qwen Embedding 批量大小超限
+
+**出现什么问题**：上传 PDF 文件时报 `Error code: 400 - batch size is invalid, it should not be larger than 10`。
+
+**什么原因**：Qwen Embedding API 限制每次请求最多处理 10 个文本。langchain_milvus 的 `add_documents()` 内部调用 `embed_documents()` 时默认批量大小为 32 或更大，超出 API 限制。
+
+**怎么解决的**：在所有 4 个 `_get_embeddings()` 函数中（`indexing.py`、`retriever.py`、`schema_indexer.py`、`parent_retriever.py`），为 Qwen provider 添加 `chunk_size=10` 参数传递给 `OpenAIEmbeddings`，强制限制批量大小。
+
+---
+
+## 迭代 9：RAG 知识体系重构 ✅
+
+### 为什么优化
+
+1. 意图识别做了两次（API `/classify` + Graph `classify_intent` 节点），浪费 LLM 调用
+2. `final_graph.py` 命名不清晰，实际是意图调度器
+3. 意图提示词中 `sql_query` 描述硬编码，不随数据库变化
+4. 文档入库无 LLM 预处理，直接切块向量化，信息密度低
+5. `recall_evidence` 串行检索，`select_tables` 输出冗余 `table_names`
+
+### 优化了什么
+
+#### 9.1 意图去重 + 文件重命名
+- `final_graph.py` → `dispatcher.py`，`final.py` → `query.py`
+- `classify_intent` 检测到 state 中已有 intent 时跳过 LLM 调用
+- 前端 invoke 请求携带 intent 参数，Graph 直接路由
+- API 路径 `/api/final/*` → `/api/query/*`
+
+#### 9.2 动态意图提示词
+- `sql_query` 描述从硬编码改为引用 `domain_summary`
+- 数据库表结构变化时，意图分类自动适应
+
+#### 9.3 LLM 文档预处理
+- 新建 `agents/rag/doc_preprocessor.py`：DocumentPreprocessor 类
+- 预处理流程：提取元数据（分类、标签、实体）→ 生成摘要 → 假设性问题 → 关键事实
+- 新建 `t_document_metadata` MySQL 表存储元数据
+- 每个 chunk 的 page_content 组合：`[摘要] + [原文] + [相关问题]`
+
+#### 9.4 user_document 父子分块 + session_id 隔离
+- 长文本（>3000 字）自动使用父子分块，短文本用普通分块
+- Milvus schema 新增 `session_id` 字段
+- 检索时按 `session_id` 过滤，用户文档互相隔离
+- `get_hybrid_retriever` 对 session-scoped 检索单独创建实例（不走单例）
+
+#### 9.5 recall_evidence 并行化
+- `recall_business_knowledge` 和 `recall_agent_knowledge` 改为 `asyncio.gather` 并行
+- 耗时从 sum(两个) 降为 max(单个)
+
+#### 9.6 select_tables 精简
+- 移除 `select_tables` 对 `table_names` 的输出，不再覆盖 state 中的全量表名
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/final_graph.py` → `dispatcher.py` | 重命名 + 跳过逻辑 + 动态 prompt |
+| `agents/api/routers/final.py` → `query.py` | 重命名 + intent 参数 |
+| `agents/rag/doc_preprocessor.py` | 新建：LLM 文档预处理 |
+| `agents/tool/storage/doc_metadata.py` | 新建：MySQL 元数据 CRUD |
+| `agents/rag/indexing.py` | 集成预处理 + 父子分块阈值判断 |
+| `agents/api/routers/document.py` | session_id 参数 + await 异步 |
+| `agents/flow/sql_react.py` | select_tables 精简 + recall_evidence 并行 |
+| `agents/flow/rag_chat.py` | session_id 检索过滤 |
+| `agents/rag/retriever.py` | session_id_filter 支持 |
+| `agents/api/app.py` | 路由注册 + schema 加 session_id + doc_metadata 表初始化 |
+| `agents/static/index.html` | API 路径更新 + invoke 带 intent |
+| `tests/test_final_api.py` | 适配新模块名 |
+| `tests/test_imports.py` | 适配新模块名 |
+
+---
+
+## 迭代 10：意图识别 + 上下文重写合并 ✅
+
+### 为什么优化
+
+原有流程需要 **3 次 LLM 调用**：
+
+```
+/api/query/classify → LLM 1: 意图分类
+/api/query/invoke   → LLM 2: 上下文重写（contextualize_query）
+                    → LLM 3: SQL 生成（sql_generate）
+```
+
+问题：
+1. 意图分类和上下文重写是独立的 LLM 调用，浪费 token
+2. 重写后的查询可能改变意图（如"一季度营收多少"→"贵州茅台2026年第一季度营收多少"），但重写在分类之后，意图已经定了
+3. 意图 prompt 中硬编码了示例（如 sql_query 的示例），导致 LLM 倾向于返回特定意图，而非根据实际数据库领域判断
+
+### 优化了什么
+
+**合并意图分类 + 上下文重写为一次 LLM 调用**，返回 JSON 结构：
+
+```json
+{
+  "intent": "sql_query",
+  "rewritten_query": "贵州茅台2026年第一季度营收多少"
+}
+```
+
+### 怎么优化的
+
+#### 1. 新 prompt 设计
+
+```
+你是一个智能助手，同时完成两个任务：
+
+1. **意图分类**：根据数据库领域摘要和用户问题，判断意图类别
+2. **查询重写**：结合对话历史，将代词化/省略的查询重写为独立完整的查询
+
+意图类别说明：
+- sql_query：用户想查询数据库中存储的结构化数据（必须与数据库领域摘要中的表/字段相关）
+- chat：闲聊、通用问答、或问题与数据库领域无关
+
+重要判断原则：
+- 只有当问题明确指向数据库中的数据时，才归类为 sql_query
+- 如果问题涉及的是公开信息、通用知识、股市行情等非数据库内容，应归类为 chat
+- 结合对话历史重写查询时，只补充对话中明确提到的上下文，不要添加对话中没有的信息
+```
+
+**关键改进**：
+- 移除硬编码示例，意图判断完全由 LLM 根据 domain_summary 决定
+- 明确 sql_query 的边界：只有指向数据库的问题才是 sql_query
+- 添加"不要添加对话中没有的信息"约束，防止 LLM 过度推断
+
+#### 2. 返回 JSON 结构
+
+classify 端点返回 `{intent, rewritten_query}`，前端捕获后：
+- SQL 路径：invoke 请求带上 `{intent, rewritten_query}`
+- Chat 路径：stream 请求直接用 `rewritten_query` 替代原始 query
+
+#### 3. 下游节点跳过 LLM
+
+- `classify_intent`：检测到 state 中有 intent + rewritten_query，跳过 LLM
+- `contextualize_query`：检测到 state 中有 rewritten_query，跳过 LLM
+
+#### 4. 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| LLM 调用次数 | 3 次（classify + rewrite + generate） | 2 次（classify+rewrite 合并 + generate） |
+| 意图准确性 | 硬编码示例导致偏见 | 纯 LLM 判断，结合 domain_summary |
+| 上下文重写 | 重写在分类之后，意图可能不准 | 重写和分类同时完成，意图基于重写后的查询 |
+| "一季度营收多少" | 可能误判为 sql_query | LLM 看到 domain_summary 中无此数据，归类为 chat |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/dispatcher.py` | classify_intent 合并重写，返回 JSON，prompt 去硬编码 |
+| `agents/api/routers/query.py` | ClassifyResponse 加 rewritten_query，QueryRequest 加 rewritten_query |
+| `agents/flow/sql_react.py` | contextualize_query 跳过逻辑 |
+| `agents/static/index.html` | 捕获 rewritten_query，传给 invoke 和 stream |
+
+---
+
+## 迭代 11：下游节点去除对话历史依赖 ✅
+
+### 为什么优化
+
+迭代 10 将意图分类 + 上下文重写合并为一次 LLM 调用，返回 `rewritten_query`。但发现：
+
+1. `dispatcher.py` 的 `sql_react` 节点仍然将 `chat_history` 传递给 SQL React 子图，子图中 `contextualize_query` 虽然检测到 `rewritten_query` 后跳过 LLM，但 `chat_history` 作为 state 字段被白白传递
+2. `chat_direct` 节点将 `rewritten_query` 作为 `query` 传给 RAG Chat 子图，但未传递 `rewritten_query` 标记，导致 RAG Chat 的 `rewrite` 节点再次调用 LLM 重写（浪费 token）
+3. 对话历史只在意图分析和查询重写两个阶段有价值，之后的节点（表选择、证据检索、SQL 生成、RAG 对话）都应该直接使用重写后的查询
+
+### 优化了什么
+
+**核心原则**：对话历史只在最外层 `classify_intent` 使用一次，之后所有下游节点只使用 `rewritten_query`。
+
+1. `dispatcher.py` 的 `sql_react` 节点：移除 `chat_history` 传递，只传 `query` + `rewritten_query`
+2. `dispatcher.py` 的 `chat_direct` 节点：将 `rewritten_query` 传入 RAG Chat 的 input dict
+3. `rag_chat.py` 的 `preprocess` 节点：从 input 中读取 `rewritten_query`
+4. `rag_chat.py` 的 `rewrite` 节点：检测到 `rewritten_query` 已存在时跳过 LLM 调用
+
+### 怎么优化的
+
+#### dispatcher.py 变更
+
+```python
+# 优化前：传递 chat_history
+result = await sql_graph.ainvoke({
+    "query": state["query"],
+    "rewritten_query": state.get("rewritten_query", ""),
+    "chat_history": state.get("chat_history", []),  # 多余
+})
+
+# 优化后：只传必要字段
+result = await sql_graph.ainvoke({
+    "query": state["query"],
+    "rewritten_query": state.get("rewritten_query", ""),
+})
+```
+
+```python
+# 优化前：rag_chat 没有 rewritten_query 标记
+result = await rag_graph.ainvoke({
+    "input": {"session_id": ..., "query": rewritten or state["query"]},
+})
+
+# 优化后：明确传递 rewritten_query
+result = await rag_graph.ainvoke({
+    "input": {
+        "session_id": ...,
+        "query": rewritten or state["query"],
+        "rewritten_query": rewritten,  # 标记已重写
+    },
+})
+```
+
+#### rag_chat.py 变更
+
+```python
+# preprocess: 读取 rewritten_query
+return {
+    "session": session.model_dump(),
+    "query": inp["query"],
+    "rewritten_query": inp.get("rewritten_query", ""),  # 新增
+    ...
+}
+
+# rewrite: 跳过逻辑
+async def rewrite(state):
+    existing = state.get("rewritten_query", "")
+    if existing:
+        return {"rewritten_query": existing}  # 跳过 LLM
+    # ... 原有重写逻辑
+```
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| SQL 路径 LLM 调用 | 3 次（classify+rewrite + contextualize 跳过 + generate） | 2 次（classify+rewrite + generate） |
+| Chat 路径 LLM 调用 | 3 次（classify+rewrite + rag_rewrite + chat） | 2 次（classify+rewrite + chat） |
+| chat_history 传递 | 从 API → dispatcher → sql_react 全链路携带 | 只在 API → dispatcher 使用，下游不传 |
+| Token 消耗 | chat_history 占用 prompt token（3 轮 ≈ 500 token） | 下游节点无历史，prompt 更精简 |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/dispatcher.py` | sql_react 移除 chat_history 传递；chat_direct 传递 rewritten_query |
+| `agents/flow/rag_chat.py` | preprocess 读取 rewritten_query；rewrite 跳过逻辑 |
+| `agents/flow/sql_react.py` | 无变更（contextualize_query 跳过逻辑已有） |
+
+---
+
+## 迭代 12：recall_evidence 混合检索 + 质量过滤 ✅
+
+### 为什么优化
+
+`recall_evidence` 节点检索业务知识和智能体知识库，但存在两个问题：
+
+1. **只用向量检索，不用 ES BM25**：`recall_business_knowledge` 和 `recall_agent_knowledge` 只查 Milvus 向量，缺少关键词精确匹配。当用户用精确业务术语提问时（如"预算执行率"），向量检索可能召回语义相似但内容无关的文档。
+2. **无质量过滤**：智能体知识库（agent_knowledge）的核心价值是 SQL 示例（few-shot），但向量检索可能召回没有 SQL 的纯文本描述。业务知识（business_knowledge）的核心价值是公式和术语定义，但可能召回无公式的一般性描述。
+3. **seed 脚本不索引到 ES**：`seed_business_knowledge.py` 和 `seed_agent_knowledge.py` 只存 Milvus，ES 中没有这些数据，BM25 检索无结果。
+
+### 优化了什么
+
+1. `recall_business_knowledge` 和 `recall_agent_knowledge` 改为混合检索：向量 + ES BM25 + RRF 融合
+2. 新增质量过滤：`_filter_has_sql`（agent_knowledge 必须含 SQL）、`_filter_has_business_term`（business_knowledge 必须含公式/术语）
+3. seed 脚本新增 ES 索引，Milvus + ES 双写
+4. 抽取 `_milvus_vector_search` 和 `_es_bm25_search` 公共函数
+
+### 怎么优化的
+
+#### 混合检索流程
+
+```
+recall_business_knowledge / recall_agent_knowledge:
+  query → Milvus 向量检索 (source filter) → vector_docs
+  query → ES BM25 关键词检索 (metadata.source filter) → es_docs
+  ↓
+  RRF 融合 [vector_docs, es_docs] → fused_docs
+  ↓
+  质量过滤 → filtered_docs
+```
+
+#### ES BM25 检索
+
+```python
+def _es_bm25_search(query, source, top_k=10):
+    body = {
+        "size": top_k,
+        "query": {
+            "bool": {
+                "must": [{"match": {"text": query}}],
+                "filter": [{"term": {"metadata.source": source}}],
+            }
+        },
+    }
+    resp = es.search(index=settings.es.index, body=body)
+```
+
+使用 raw ES client（与 schema_indexer 和 seed 脚本格式一致），搜索 `text` 字段，过滤 `metadata.source`。
+
+#### 质量过滤
+
+```python
+def _filter_has_sql(docs):
+    """agent_knowledge 必须包含 SELECT/INSERT/UPDATE 等 SQL 关键词。"""
+    sql_keywords = ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER")
+    return [d for d in docs if any(kw in d.page_content.upper() for kw in sql_keywords)]
+
+def _filter_has_business_term(docs):
+    """business_knowledge 必须包含公式/定义/术语关系。"""
+    formula_indicators = ("=", "/", "*", "SUM", "COUNT", "公式", "定义", "计算", "比率", "率")
+    return [d for d in docs if any(ind in d.page_content for ind in formula_indicators)]
+```
+
+#### Seed 脚本 ES 索引
+
+```python
+# seed_agent_knowledge.py / seed_business_knowledge.py
+# 新增 ES 索引（与 Milvus 并行）
+es = Elasticsearch(es_url)
+for doc, doc_id in zip(docs, doc_ids):
+    es.index(
+        index=settings.es.index,
+        id=doc_id,
+        document={
+            "text": doc["content"],
+            "metadata": {"source": "agent_knowledge", "doc_id": doc_id},
+        },
+    )
+```
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "预算执行率怎么算" | 向量检索可能召回相关但无公式的描述 | BM25 精确匹配"预算执行率" + 向量语义匹配，RRF 融合 |
+| agent_knowledge 召回 | 可能召回无 SQL 的纯文本描述（浪费 token） | 质量过滤丢弃无 SQL 结果，只保留 few-shot 示例 |
+| business_knowledge 召回 | 可能召回无公式的一般性描述 | 质量过滤丢弃无公式/术语结果，只保留定义和公式 |
+| seed 数据 ES 检索 | ES 中无 business/agent knowledge 数据 | seed 脚本双写 Milvus + ES |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/rag/retriever.py` | 新增 `_milvus_vector_search`、`_es_bm25_search`、`_filter_has_sql`、`_filter_has_business_term`；重写 `recall_business_knowledge`、`recall_agent_knowledge` |
+| `scripts/seed_business_knowledge.py` | 新增 ES 索引 |
+| `scripts/seed_agent_knowledge.py` | 新增 ES 索引 |
+
+---
+
+## 迭代 13：SQL React 图流程重构（证据前置 + 查询增强 + 语义模型） ✅
+
+### 为什么优化
+
+原流程 `select_tables → recall_evidence → sql_retrieve`，业务知识在选表之后才召回，导致：
+
+1. **选表不准确**：用户问"GMV是多少"，向量检索 schema 文档时"GMV"无法匹配到 `orders` 表，因为 schema 中没有"GMV"这个词。但业务知识中有"GMV = 已支付订单总额"，如果先召回业务知识，就能用"已支付订单总额"去匹配 schema。
+2. **缺少查询增强**：用户用业务术语提问（如"华东区GMV"），但数据库字段是物理名（如 `region`, `amount`），向量检索匹配度低。
+3. **语义模型只在索引时使用**：`t_semantic_model` 的字段业务映射在 schema_indexer 索引时嵌入文档，但查询时无法直接访问结构化的语义模型数据来辅助 SQL 生成。
+
+### 优化了什么
+
+1. **流程重排**：`recall_evidence` 移到 `select_tables` 之前，业务知识先于选表
+2. **新增 `query_enhance` 节点**：用证据翻译业务术语，增强向量检索命中率
+3. **语义模型查询时加载**：`sql_retrieve` 阶段从 MySQL 加载选中表的语义模型，注入 `sql_generate` prompt
+
+### 怎么优化的
+
+#### 新流程
+
+```
+优化前: START → contextualize_query → select_tables → recall_evidence → sql_retrieve → ...
+优化后: START → contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve (+ semantic model) → ...
+```
+
+#### 新增 `query_enhance` 节点
+
+```
+输入: rewritten_query + evidence + few_shot_examples
+输出: enhanced_query
+
+示例:
+  Query: "华东区上月GMV是多少"
+  Evidence: "GMV = 已支付订单总额", "华东包含上海、江苏、浙江..."
+  Enhanced: "华东区（上海、江苏、浙江）上月已支付订单总额是多少"
+```
+
+- 无证据时跳过（返回原查询）
+- LLM 失败时 graceful degradation（返回原查询）
+- 超时复用 `llm_rewrite_timeout`（15s）
+
+#### `select_tables` 查询源变更
+
+```python
+# 优化前
+query = state.get("rewritten_query") or state.get("query", "")
+
+# 优化后
+query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+```
+
+#### `sql_retrieve` 扩展：加载语义模型
+
+```python
+# 新增：从 MySQL 加载选中表的字段业务映射
+semantic = await asyncio.wait_for(
+    asyncio.to_thread(get_semantic_model_by_tables, selected),
+    timeout=settings.resilience.milvus_timeout,
+)
+return {"docs": docs, "semantic_model": semantic}
+```
+
+#### `sql_generate` prompt 增强
+
+```python
+# 语义模型文本格式
+语义模型（字段业务映射）:
+表 t_orders:
+  amount | 业务名: 订单金额 | 同义词: 交易金额, GMV | 描述: 已支付订单的总金额
+  region | 业务名: 区域 | 同义词: 地区 | 描述: 订单所属区域
+```
+
+prompt 新增要求："语义模型中提供了字段的业务名称和同义词，生成 SQL 时优先使用物理字段名，但可参考业务名称理解字段含义"
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| "GMV是多少" | 向量检索匹配不到相关表 | 业务知识翻译 → "已支付订单总额" → 精准匹配 |
+| "华东区费用" | 向量检索"华东"匹配度低 | 查询增强补充省份列表 → 更好的匹配 |
+| SQL 字段映射 | LLM 只看 schema 文档中的 COMMENT | 语义模型提供结构化的业务名、同义词、描述 |
+| 无业务知识 | 正常工作 | query_enhance 跳过，降级为原流程 |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/state.py` | SQLReactState 新增 `enhanced_query`、`semantic_model` |
+| `agents/flow/sql_react.py` | 新增 `query_enhance` 节点；修改 `select_tables`/`sql_retrieve`/`sql_generate`/`_build_sql_messages`；更新图拓扑 |
+| `agents/rag/retriever.py` | 新增 `get_semantic_model_by_tables()` |
+| `tests/test_sql_react.py` | 新增 `query_enhance` 测试；更新 graph 节点断言 |
+
+## 迭代 14：表描述 + 统一语义模型 + 表关系
+
+### 为什么优化
+
+1. **select_tables 只传英文表名**：LLM 看到 `t_order, t_user, t_payment` 无法判断哪个表与"订单金额"相关
+2. **schema docs 与 semantic_model 重复**：Milvus 向量检索的 schema 文档和 MySQL 的 semantic_model 包含重叠信息
+3. **缺少表关系信息**：sql_generate 不知道表之间如何 JOIN
+
+### 优化了什么
+
+**1. select_tables 表名带描述**
+
+加载 `information_schema.tables` 的 TABLE_COMMENT，LLM prompt 格式：
+```
+候选表名:
+- t_order: 订单主表
+- t_user: 用户信息表
+- t_payment: 支付记录表
+```
+
+**2. 统一到 t_semantic_model，去掉 Milvus schema 向量检索**
+
+- 扩展 `t_semantic_model` 表，新增字段：`column_type`, `column_comment`, `is_pk`, `is_fk`, `ref_table`, `ref_column`
+- 种子脚本自动从 `information_schema.columns` + `information_schema.key_column_usage` 同步技术 schema
+- `sql_retrieve` 改为只查 MySQL `t_semantic_model`，不再从 Milvus 拉取 schema docs
+- 从 semantic_model 构建 schema 文档（`_build_schema_docs_from_semantic`）
+
+**3. select_tables 返回表关系**
+
+- 新增 `get_table_relationships()` 函数，从 MySQL `information_schema.key_column_usage` 提取外键关系
+- `select_tables` 返回 `selected_tables` + `table_relationships`
+- `sql_generate` prompt 中加入表关系信息，帮助 LLM 生成正确的 JOIN 条件
+
+**4. 关键词过滤字段**
+
+- 新增 `_extract_keywords(query)` 使用 Jieba 分词提取关键词
+- 新增 `_filter_columns_by_keywords()` 根据关键词过滤 schema 文档中的字段
+- 保留匹配字段 + 时间字段 + PK/FK，精简 prompt
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/state.py` | SQLReactState 新增 `table_relationships` |
+| `agents/flow/sql_react.py` | `select_tables` 加载表描述+表关系；`sql_retrieve` 改为 MySQL-only；新增 `_build_schema_docs_from_semantic`、`_extract_keywords`、`_filter_columns_by_keywords` |
+| `agents/rag/retriever.py` | `get_semantic_model_by_tables` 返回完整 schema 字段；新增 `get_table_relationships()` |
+| `scripts/seed_semantic_model.py` | 扩展表结构；新增 `sync_schema_from_information_schema()` |
+| `pyproject.toml` | 添加 `jieba>=0.42` 依赖 |
+| `tests/test_sql_react.py` | 更新 `test_generate_retrieves_missing_tables` 使用 semantic_model mock |
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| 表选择准确度 | LLM 只看英文表名 | 表名+描述，更易判断 |
+| schema 信息来源 | Milvus 向量检索 + MySQL semantic_model | 统一 MySQL semantic_model |
+| 表关联 | LLM 自己猜 JOIN 条件 | 提供外键关系信息 |
+| prompt 大小 | 全量字段 | 关键词过滤后只保留 5-10 个核心字段 |
+
+## 迭代 15：t_semantic_model 自动同步（全量初始化 + binlog 增量）
+
+### 为什么优化
+
+手动执行 `seed_semantic_model.py` 容易遗忘，新增表或字段后 semantic_model 不会自动更新。
+
+### 优化了什么
+
+新增 `agents/init/schema_sync.py` 模块，应用启动时自动同步：
+
+**1. 全量初始化**
+- 启动时检查 `t_semantic_model` 是否有数据
+- 无数据则自动全量同步：从 `information_schema.tables` + `information_schema.columns` + `information_schema.key_column_usage` 读取所有表结构
+
+**2. binlog 增量同步**
+- 使用 `python-mysql-replication` 监听 MySQL binlog
+- 检测 DDL 事件（CREATE TABLE / ALTER TABLE / DROP TABLE / RENAME TABLE）
+- 自动增量更新 `t_semantic_model`
+
+**3. 定时轮询 fallback**
+- binlog 不可用时（权限、配置等），每 5 分钟轮询 `information_schema`
+- 检测新增/删除的表，增量同步
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/init/__init__.py` | 新建 init 模块 |
+| `agents/init/schema_sync.py` | 全量同步 + binlog 监听 + 轮询 fallback |
+| `agents/api/app.py` | lifespan 中启动 schema_sync 后台任务 |
+| `pyproject.toml` | 添加 `python-mysql-replication>=1.0` |
+
+## 迭代 16：Bug 修复 + Jieba 过滤踩坑回顾
+
+### Bug 1：ES BM25 检索返回无关结果
+
+**现象**：`recall_agent_knowledge` 搜索 "毛利率" 时，ES 返回的全是财务报告摘要（贵州茅台一季报），而非 SQL 示例。
+
+**原因**：ES 索引中 `metadata.source` 是 `text` 类型，`term` 查询无法精确匹配。财务报告被错误索引为 `agent_knowledge`，BM25 匹配到 "毛利" 关键词后返回。
+
+**修复**：`_es_bm25_search` 的过滤条件从 `metadata.source` 改为 `metadata.source.keyword`（keyword 子字段支持精确匹配）。
+
+### Bug 2：few_shot_examples 检索不到
+
+**现象**：用户问 "查询上周毛利率" 时，`few_shot_examples` 返回空。
+
+**原因**：
+1. ES 返回无关结果（Bug 1）
+2. `_recall_agent` 的 `top_k=3` 太小，向量检索返回的 3 个结果中，财务报告占了位置，过滤后无 SQL 示例
+
+**修复**：
+1. 修复 ES 精确匹配（Bug 1）
+2. `_recall_agent` 的 `top_k` 从 3 增加到 10，确保过滤后仍有足够 SQL 示例
+
+### Bug 3：逻辑外键未同步
+
+**现象**：`t_journal_item.account_code` 在语义模型中 `is_fk=0`，schema 文档中没有 `REFERENCES` 标记。
+
+**原因**：`sync_schema_from_information_schema` 只从 `information_schema.key_column_usage` 同步 FK，但数据库中未定义外键约束（业务逻辑上的关联，非数据库 FK）。
+
+**修复**：在 `seed_semantic_model.py` 新增 `seed_logical_foreign_keys()` 函数，手动更新 6 个逻辑外键：
+- `t_journal_item.entry_id` → `t_journal_entry.id`
+- `t_journal_item.account_code` → `t_account.account_code`
+- `t_journal_item.cost_center_id` → `t_cost_center.id`
+- `t_budget.cost_center_id` → `t_cost_center.id`
+- `t_budget.account_code` → `t_account.account_code`
+- `t_expense_claim.cost_center_id` → `t_cost_center.id`
+
+### Bug 4：MySQL 8.0 SHOW MASTER STATUS 废弃
+
+**现象**：binlog 监听启动时报 SQL 语法错误。
+
+**原因**：MySQL 8.0.22+ 废弃了 `SHOW MASTER STATUS`，改用 `SHOW BINARY LOG STATUS`。
+
+**修复**：先尝试 `SHOW BINARY LOG STATUS`，失败则 fallback 到 `SHOW MASTER STATUS`。
+
+### Bug 5：服务用系统 Python 启动
+
+**现象**：`mysql-replication not installed, binlog listener disabled`。
+
+**原因**：服务用 `/opt/homebrew/Cellar/python@3.14/...` 启动（系统 Python），但包装在 venv 里。
+
+**修复**：用 venv Python 启动：`/path/to/.venv/bin/python -m agents.main`。
+
+### 踩坑：Jieba 关键词过滤字段（已废弃）
+
+**方案**：用 Jieba 分词提取查询关键词，过滤 schema 文档中不匹配的字段，精简 prompt。
+
+**实现**：
+```python
+def _extract_keywords(query: str) -> list[str]:
+    import jieba
+    words = jieba.cut(query)
+    return [w.strip() for w in words if len(w.strip()) >= 2]
+
+def _filter_columns_by_keywords(docs, semantic_model, keywords):
+    # 只保留匹配字段 + 时间字段 + PK/FK
+    ...
+```
+
+**遇到的问题**：
+
+1. **派生指标无法匹配**：用户问 "上周毛利率"，Jieba 切成 `["上周", "毛利率"]`。但 `毛利率` 的计算公式是 `(SUM(credit_amount) - SUM(debit_amount)) / SUM(credit_amount)`，字段名 `credit_amount` 和 `debit_amount` 不包含 "毛利率" 关键词，被错误过滤掉。
+
+2. **业务术语到物理字段的映射只有业务知识能桥接**：关键词匹配是字符串层面的，无法理解 "毛利率 = (借方 - 贷方) / 借方" 这种业务定义。
+
+**结论**：参考 DataAgent 项目，**不做字段级过滤**。DataAgent 的做法是：
+- 选中表后返回全部字段（最多 50 列/表）
+- 靠业务知识（evidence）+ 语义模型（semantic_model）+ SQL 生成 LLM 自己判断用哪些列
+- 字段选择的负担放在 LLM 上，而非关键词匹配
+
+**最终方案**：删除 `_extract_keywords` 和 `_filter_columns_by_keywords`，移除 `jieba` 依赖。`sql_retrieve` 直接返回选中表的全部字段。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/sql_react.py` | 删除 `_extract_keywords`、`_filter_columns_by_keywords`；`_recall_agent` top_k 3→10 |
+| `agents/rag/retriever.py` | `_es_bm25_search` 过滤条件改用 `metadata.source.keyword` |
+| `agents/init/schema_sync.py` | binlog 兼容 MySQL 8.0.22+；线程池执行阻塞操作 |
+| `scripts/seed_semantic_model.py` | 新增 `seed_logical_foreign_keys()`；修复 DictCursor |
+| `pyproject.toml` | 移除 `jieba>=0.42`；修正 `mysql-replication>=1.0` 包名 |
+| `tests/test_sql_react.py` | 新增 `TestContextualizeQuery` 测试 |
+
+### 教训总结
+
+| 问题 | 教训 |
+|------|------|
+| Jieba 过滤字段 | 关键词匹配无法处理派生指标，业务术语到物理字段的映射需要业务知识桥接 |
+| ES 精确匹配 | `text` 字段用 `term` 查询会匹配失败，要用 `keyword` 子字段 |
+| top_k 太小 | 有质量过滤时，top_k 要放大，否则过滤后可能为空 |
+| MySQL 版本兼容 | `SHOW MASTER STATUS` 在 8.0.22+ 废弃，用 `SHOW BINARY LOG STATUS` |
+| 系统 Python vs venv | 包装在 venv 里但用系统 Python 启动会找不到包 |

@@ -94,8 +94,8 @@ class TestFlowImports:
         from agents.flow.analyst import build_analyst_graph
         assert callable(build_analyst_graph)
 
-    def test_final_graph_import(self):
-        from agents.flow.final_graph import build_final_graph
+    def test_dispatcher_import(self):
+        from agents.flow.dispatcher import build_final_graph
         assert callable(build_final_graph)
 
 
@@ -148,7 +148,7 @@ class TestAPIImports:
         assert app is not None
 
     def test_routers_import(self):
-        from agents.api.routers import chat, rag, final, document
+        from agents.api.routers import chat, rag, query, document
 
     def test_sse_import(self):
         from agents.api.sse import sse_response

@@ -89,7 +89,6 @@ async def index_to_milvus():
         print("No business knowledge to index")
         return
 
-    from langchain_core.documents import Document
     from agents.rag.retriever import _get_embeddings
     from pymilvus import MilvusClient
 
@@ -100,26 +99,23 @@ async def index_to_milvus():
             content += f"\n同义词: {row['synonyms']}"
         if row.get("related_tables"):
             content += f"\n关联表: {row['related_tables']}"
-        docs.append(Document(
-            page_content=content,
-            metadata={
-                "source": "business_knowledge",
-                "term": row["term"],
-                "doc_id": f"bk_{row['term']}",
-            },
-        ))
+        docs.append({
+            "content": content,
+            "term": row["term"],
+            "doc_id": f"bk_{row['term']}",
+        })
 
     embeddings = _get_embeddings()
     milvus_uri = f"http://{settings.milvus.addr}"
     client = MilvusClient(uri=milvus_uri)
 
-    doc_ids = [d.metadata["doc_id"] for d in docs]
+    doc_ids = [d["doc_id"] for d in docs]
     try:
         client.delete(collection_name=settings.milvus.collection_name, ids=doc_ids)
     except Exception:
         pass
 
-    texts = [d.page_content for d in docs]
+    texts = [d["content"] for d in docs]
     vectors = []
     batch_size = 10
     for i in range(0, len(texts), batch_size):
@@ -129,7 +125,7 @@ async def index_to_milvus():
     for doc, doc_id, vector in zip(docs, doc_ids, vectors):
         records.append({
             "pk": doc_id,
-            "text": doc.page_content,
+            "text": doc["content"],
             "vector": vector,
             "source": "business_knowledge",
             "table_name": "",
@@ -139,6 +135,28 @@ async def index_to_milvus():
     client.insert(collection_name=settings.milvus.collection_name, data=records)
     client.close()
     print(f"Indexed {len(docs)} business knowledge entries into Milvus")
+
+    # --- Elasticsearch BM25 ---
+    try:
+        from elasticsearch import Elasticsearch
+        es_url = settings.es.address if settings.es.address.startswith("http") else f"http://{settings.es.address}"
+        es = Elasticsearch(es_url)
+        for doc, doc_id in zip(docs, doc_ids):
+            es.index(
+                index=settings.es.index,
+                id=doc_id,
+                document={
+                    "text": doc["content"],
+                    "metadata": {
+                        "source": "business_knowledge",
+                        "term": doc["term"],
+                        "doc_id": doc_id,
+                    },
+                },
+            )
+        print(f"Indexed {len(docs)} business knowledge entries into Elasticsearch")
+    except Exception as e:
+        print(f"ES indexing failed (non-fatal): {e}")
 
 
 def main():

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from agents.api.routers import chat, rag, final, document, admin
+from agents.api.routers import chat, rag, query, document, admin
 from agents.config.settings import settings
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -31,6 +31,13 @@ async def lifespan(app: FastAPI):
     # 初始化 Milvus 连接（pymilvus 兼容 patch + 连接验证）
     _init_milvus(logger)
 
+    # 确保 MySQL 表存在
+    try:
+        from agents.tool.storage.doc_metadata import ensure_doc_metadata_table
+        ensure_doc_metadata_table()
+    except Exception as e:
+        logger.warning("Failed to ensure doc_metadata table: %s", e)
+
     # 初始化模型
     init_chat_models()
     init_embedding_models()
@@ -43,6 +50,13 @@ async def lifespan(app: FastAPI):
 
     # 后台异步：检查领域摘要，按需索引 MySQL 表结构（不阻塞服务启动）
     asyncio.create_task(_index_schemas_background(logger))
+
+    # 后台异步：t_semantic_model 全量初始化 + binlog 增量同步
+    try:
+        from agents.init.schema_sync import start_schema_sync
+        asyncio.create_task(start_schema_sync(logger))
+    except Exception as e:
+        logger.warning("Schema sync init failed: %s", e)
 
     yield
 
@@ -84,6 +98,7 @@ def _create_knowledge_base_collection(client, coll: str, logger):
         FieldSchema("source", DataType.VARCHAR, max_length=65535),
         FieldSchema("table_name", DataType.VARCHAR, max_length=65535),
         FieldSchema("doc_id", DataType.VARCHAR, max_length=65535),
+        FieldSchema("session_id", DataType.VARCHAR, max_length=255),
     ], enable_dynamic_field=True)
 
     index_params = client.prepare_index_params()
@@ -166,7 +181,7 @@ app.add_middleware(
 # 路由注册
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
-app.include_router(final.router, prefix="/api/final", tags=["final"])
+app.include_router(query.router, prefix="/api/query", tags=["query"])
 app.include_router(document.router, prefix="/api/document", tags=["document"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 

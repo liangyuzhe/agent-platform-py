@@ -34,6 +34,46 @@ def _mock_llm_text_response(content="I don't know how to write SQL for that."):
 # check_docs node
 # ---------------------------------------------------------------------------
 
+class TestContextualizeQuery:
+    """Test contextualize_query node."""
+
+    @pytest.mark.asyncio
+    async def test_existing_rewritten_query_skips(self):
+        """When rewritten_query already exists, should skip LLM call."""
+        from agents.flow.sql_react import contextualize_query
+
+        state = {"query": "它多少钱", "rewritten_query": "iPhone 15 价格"}
+        result = await contextualize_query(state)
+        assert result["rewritten_query"] == "iPhone 15 价格"
+
+    @pytest.mark.asyncio
+    async def test_no_history_returns_original(self):
+        """Without chat history, should return original query."""
+        from agents.flow.sql_react import contextualize_query
+
+        state = {"query": "查询订单", "chat_history": []}
+        result = await contextualize_query(state)
+        assert result["rewritten_query"] == "查询订单"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.rewrite_query")
+    async def test_with_history_rewrites(self, mock_rewrite):
+        """With chat history, should call rewrite_query."""
+        from agents.flow.sql_react import contextualize_query
+
+        mock_rewrite.return_value = "张三的订单金额"
+        state = {
+            "query": "他的订单金额",
+            "chat_history": [
+                {"role": "user", "content": "查询张三的信息"},
+                {"role": "assistant", "content": "张三，男，28岁"},
+            ],
+        }
+        result = await contextualize_query(state)
+        assert result["rewritten_query"] == "张三的订单金额"
+        mock_rewrite.assert_called_once()
+
+
 class TestCheckDocs:
     """Test check_docs node."""
 
@@ -69,6 +109,67 @@ class TestCheckDocs:
 
         assert result["is_sql"] is False
         assert "未找到" in result["answer"]
+
+
+# ---------------------------------------------------------------------------
+# query_enhance node
+# ---------------------------------------------------------------------------
+
+class TestQueryEnhance:
+    """Test query_enhance node."""
+
+    @pytest.mark.asyncio
+    async def test_no_evidence_skips(self):
+        """Without evidence, should return original query unchanged."""
+        from agents.flow.sql_react import query_enhance
+
+        result = await query_enhance({
+            "query": "查询GMV",
+            "rewritten_query": "查询GMV",
+            "evidence": [],
+            "few_shot_examples": [],
+        })
+
+        assert result["enhanced_query"] == "查询GMV"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_with_evidence_enhances(self, mock_get_model):
+        """With evidence, should call LLM to enhance query."""
+        from agents.flow.sql_react import query_enhance
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="查询已支付订单总额"))
+        mock_get_model.return_value = mock_model
+
+        result = await query_enhance({
+            "query": "查询GMV",
+            "rewritten_query": "查询GMV",
+            "evidence": ["GMV = 已支付订单总额"],
+            "few_shot_examples": [],
+        })
+
+        assert result["enhanced_query"] == "查询已支付订单总额"
+        mock_model.ainvoke.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_llm_failure_fallback(self, mock_get_model):
+        """On LLM failure, should fallback to original query."""
+        from agents.flow.sql_react import query_enhance
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(side_effect=Exception("timeout"))
+        mock_get_model.return_value = mock_model
+
+        result = await query_enhance({
+            "query": "查询GMV",
+            "rewritten_query": "查询GMV",
+            "evidence": ["GMV = 已支付订单总额"],
+            "few_shot_examples": [],
+        })
+
+        assert result["enhanced_query"] == "查询GMV"
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +378,7 @@ class TestSqlGenerate:
         assert "t_role schema" in system_msg
 
     @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.get_schema_docs_by_tables")
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
     @patch("agents.flow.sql_react.create_format_tool")
     @patch("agents.flow.sql_react.get_chat_model")
     async def test_generate_retrieves_missing_tables(
@@ -286,12 +387,13 @@ class TestSqlGenerate:
         """When LLM says tables are missing, should re-retrieve and retry."""
         from agents.flow.sql_react import sql_generate
 
-        mock_filter.return_value = [
-            Document(
-                page_content="t_user: id, username, real_name",
-                metadata={"table_name": "t_user"},
-            ),
-        ]
+        mock_filter.return_value = {
+            "t_user": {
+                "id": {"column_name": "id", "column_type": "bigint", "column_comment": "主键", "is_pk": 1, "is_fk": 0, "business_name": "用户ID", "synonyms": "", "business_description": ""},
+                "username": {"column_name": "username", "column_type": "varchar(64)", "column_comment": "用户名", "is_pk": 0, "is_fk": 0, "business_name": "用户名", "synonyms": "账号", "business_description": "登录账号"},
+                "real_name": {"column_name": "real_name", "column_type": "varchar(64)", "column_comment": "真实姓名", "is_pk": 0, "is_fk": 0, "business_name": "真实姓名", "synonyms": "姓名", "business_description": ""},
+            },
+        }
 
         # First call: needs more tables; second call: has enough
         first_resp = MagicMock()
@@ -414,6 +516,8 @@ class TestBuildSqlReactGraph:
         assert "approve" in node_names
         assert "execute_sql" in node_names
         assert "error_analysis" in node_names
+        assert "query_enhance" in node_names
+        assert "recall_evidence" in node_names
 
     @patch("agents.flow.sql_react.get_checkpointer")
     def test_graph_compiles(self, mock_cp):

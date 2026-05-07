@@ -23,6 +23,7 @@ def get_conn():
         password=settings.mysql.password,
         database=settings.mysql.database,
         charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
     )
 
 
@@ -33,16 +34,94 @@ def create_table(conn):
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 table_name VARCHAR(128) NOT NULL COMMENT '物理表名',
                 column_name VARCHAR(128) NOT NULL COMMENT '物理字段名',
+                column_type VARCHAR(128) COMMENT '字段类型（如 varchar(64), decimal(20,2)）',
+                column_comment VARCHAR(512) COMMENT '字段注释（来自 information_schema）',
+                is_pk TINYINT DEFAULT 0 COMMENT '是否主键',
+                is_fk TINYINT DEFAULT 0 COMMENT '是否外键',
+                ref_table VARCHAR(128) COMMENT '外键引用表',
+                ref_column VARCHAR(128) COMMENT '外键引用字段',
                 business_name VARCHAR(256) COMMENT '业务名称',
                 synonyms TEXT COMMENT '同义词，逗号分隔',
                 business_description TEXT COMMENT '业务描述（枚举值、状态码、计算逻辑等）',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uk_table_col (table_name, column_name)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='语义模型：字段级业务映射'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='语义模型：字段级业务映射+技术schema'
         """)
+        # 兼容旧表：添加新列
+        for col, col_def in [
+            ("column_type", "VARCHAR(128) COMMENT '字段类型'"),
+            ("column_comment", "VARCHAR(512) COMMENT '字段注释'"),
+            ("is_pk", "TINYINT DEFAULT 0 COMMENT '是否主键'"),
+            ("is_fk", "TINYINT DEFAULT 0 COMMENT '是否外键'"),
+            ("ref_table", "VARCHAR(128) COMMENT '外键引用表'"),
+            ("ref_column", "VARCHAR(128) COMMENT '外键引用字段'"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE t_semantic_model ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass  # 列已存在
     conn.commit()
-    print("t_semantic_model table created")
+    print("t_semantic_model table created/updated")
+
+
+def sync_schema_from_information_schema(conn):
+    """从 information_schema 自动同步字段类型、注释、主键、外键信息。"""
+    db = settings.mysql.database
+
+    def _lower_keys(row: dict) -> dict:
+        return {k.lower(): v for k, v in row.items()}
+
+    # 1. 获取所有表的字段信息
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_name, column_name, column_type, column_comment, column_key "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s "
+            "ORDER BY table_name, ordinal_position",
+            (db,),
+        )
+        columns = [_lower_keys(r) for r in cur.fetchall()]
+
+    # 2. 获取外键信息
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_name, column_name, referenced_table_name, referenced_column_name "
+            "FROM information_schema.key_column_usage "
+            "WHERE table_schema = %s AND referenced_table_name IS NOT NULL",
+            (db,),
+        )
+        fk_rows = [_lower_keys(r) for r in cur.fetchall()]
+    fk_map = {}
+    for r in fk_rows:
+        fk_map[(r["table_name"], r["column_name"])] = (
+            r["referenced_table_name"], r["referenced_column_name"]
+        )
+
+    # 3. 批量更新 t_semantic_model
+    updated = 0
+    with conn.cursor() as cur:
+        for col in columns:
+            tbl, col_name = col["table_name"], col["column_name"]
+            is_pk = 1 if col.get("column_key") == "PRI" else 0
+            ref_tbl, ref_col = fk_map.get((tbl, col_name), (None, None))
+            is_fk = 1 if ref_tbl else 0
+            cur.execute(
+                """INSERT INTO t_semantic_model (table_name, column_name, column_type, column_comment, is_pk, is_fk, ref_table, ref_column)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE
+                       column_type=VALUES(column_type),
+                       column_comment=VALUES(column_comment),
+                       is_pk=VALUES(is_pk),
+                       is_fk=VALUES(is_fk),
+                       ref_table=VALUES(ref_table),
+                       ref_column=VALUES(ref_column)""",
+                (tbl, col_name, col.get("column_type"), col.get("column_comment"),
+                 is_pk, is_fk, ref_tbl, ref_col),
+            )
+            updated += 1
+    conn.commit()
+    print(f"Synced {updated} columns from information_schema")
 
 
 def seed_data(conn):
@@ -175,14 +254,50 @@ def seed_data(conn):
                 (table_name, column_name, business_name, synonyms, description),
             )
     conn.commit()
-    print(f"Seeded {len(records)} semantic model entries")
+    print(f"Seeded {len(records)} semantic model business entries")
+
+
+def seed_logical_foreign_keys(conn):
+    """更新逻辑外键关系（数据库未定义 FK 但业务上存在的关联）。
+
+    格式：(table_name, column_name, ref_table, ref_column)
+    """
+    logical_fks = [
+        # t_journal_item
+        ("t_journal_item", "entry_id", "t_journal_entry", "id"),
+        ("t_journal_item", "account_code", "t_account", "account_code"),
+        ("t_journal_item", "cost_center_id", "t_cost_center", "id"),
+
+        # t_budget
+        ("t_budget", "cost_center_id", "t_cost_center", "id"),
+        ("t_budget", "account_code", "t_account", "account_code"),
+
+        # t_expense_claim
+        ("t_expense_claim", "cost_center_id", "t_cost_center", "id"),
+
+        # t_receivable_payable (如果有外键)
+        # t_invoice (如果有外键)
+    ]
+
+    with conn.cursor() as cur:
+        for table_name, column_name, ref_table, ref_column in logical_fks:
+            cur.execute(
+                """UPDATE t_semantic_model
+                   SET is_fk = 1, ref_table = %s, ref_column = %s
+                   WHERE table_name = %s AND column_name = %s""",
+                (ref_table, ref_column, table_name, column_name),
+            )
+    conn.commit()
+    print(f"Updated {len(logical_fks)} logical foreign keys")
 
 
 def main():
     conn = get_conn()
     try:
         create_table(conn)
+        sync_schema_from_information_schema(conn)
         seed_data(conn)
+        seed_logical_foreign_keys(conn)
     finally:
         conn.close()
 

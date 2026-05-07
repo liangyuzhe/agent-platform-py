@@ -25,13 +25,22 @@ async def preprocess(state: RAGChatState) -> dict:
     return {
         "session": session.model_dump(),
         "query": inp["query"],
+        "rewritten_query": inp.get("rewritten_query", ""),
         "session_id": inp["session_id"],
         "rag_mode": inp.get("rag_mode", settings.rag.mode),
     }
 
 
 async def rewrite(state: RAGChatState) -> dict:
-    """查询重写：利用记忆上下文化查询。"""
+    """查询重写：利用记忆上下文化查询。
+
+    如果 rewritten_query 已由外层 classify 提供，直接复用，跳过 LLM 调用。
+    """
+    # 外层已重写，跳过
+    existing = state.get("rewritten_query", "")
+    if existing:
+        return {"rewritten_query": existing}
+
     session = state.get("session", {})
     history = session.get("history", [])
     summary = session.get("summary", "")
@@ -62,6 +71,7 @@ async def retrieve(state: RAGChatState, config=None) -> dict:
     """双路检索 + RRF 融合 + Cross-Encoder 重排序。"""
     query = state.get("rewritten_query", state["query"])
     mode = state.get("rag_mode", settings.rag.mode)
+    session_id = state.get("session_id", "")
     callbacks = (config or {}).get("callbacks", [])
 
     try:
@@ -69,7 +79,11 @@ async def retrieve(state: RAGChatState, config=None) -> dict:
             from agents.rag.parent_retriever import ParentDocumentRetriever
             retriever = ParentDocumentRetriever()
         else:
-            retriever = get_hybrid_retriever(source_filter="user_document")
+            # user_document 按 session_id 隔离检索
+            retriever = get_hybrid_retriever(
+                source_filter="user_document",
+                session_id_filter=session_id if session_id else None,
+            )
 
         # Run sync retrieval in thread pool with timeout
         docs = await asyncio.wait_for(

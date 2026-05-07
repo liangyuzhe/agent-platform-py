@@ -136,7 +136,13 @@
                 <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx">
                 <div class="file-info" id="fileInfo"></div>
                 <div class="upload-options">
-                    <label>索引模式:</label>
+                    <label>知识库类型:</label>
+                    <select id="sourceType">
+                        <option value="user_document">用户文档 (个人)</option>
+                        <option value="business_knowledge">业务知识 (共享)</option>
+                        <option value="agent_knowledge">智能体知识 (共享)</option>
+                    </select>
+                    <label style="margin-left:12px;">索引模式:</label>
                     <select id="ragMode">
                         <option value="">默认</option>
                         <option value="traditional">Traditional RAG</option>
@@ -271,7 +277,7 @@
             bubble.textContent = '思考中...';
             try {
                 // Step 1: Classify intent
-                const clsResp = await fetch('/api/final/classify', {
+                const clsResp = await fetch('/api/query/classify', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
@@ -281,7 +287,8 @@
                     agentBtn.disabled = false;
                     return;
                 }
-                const {intent} = await clsResp.json();
+                const {intent, rewritten_query} = await clsResp.json();
+                const effectiveQuery = rewritten_query || query;
 
                 if (intent === 'sql_query') {
                     // SQL path: non-streaming (needs approval flow)
@@ -290,10 +297,10 @@
                         dots = (dots + 1) % 4;
                         bubble.textContent = '生成 SQL' + '.'.repeat(dots);
                     }, 500);
-                    const resp = await fetch('/api/final/invoke', {
+                    const resp = await fetch('/api/query/invoke', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query, session_id: sessionId}),
+                        body: JSON.stringify({query, session_id: sessionId, intent, rewritten_query: effectiveQuery}),
                     });
                     clearInterval(loading);
                     if (!resp.ok) {
@@ -303,11 +310,11 @@
                         renderAgentResponse(div, data);
                     }
                 } else {
-                    // Chat/Knowledge path: streaming
+                    // Chat/Knowledge path: streaming (用重写后的查询)
                     const resp = await fetch('/api/rag/chat/stream', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query, session_id: sessionId}),
+                        body: JSON.stringify({query: effectiveQuery, session_id: sessionId}),
                     });
                     if (!resp.ok) {
                         bubble.textContent = '请求失败: HTTP ' + resp.status;
@@ -376,7 +383,7 @@
             const resultDiv = addAgentMessage('assistant', '处理中...');
 
             try {
-                const resp = await fetch('/api/final/approve', {
+                const resp = await fetch('/api/query/approve', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
@@ -473,6 +480,8 @@
 
             const formData = new FormData();
             formData.append('file', selectedFile);
+            const source = document.getElementById('sourceType').value;
+            formData.append('source', source);
             const mode = document.getElementById('ragMode').value;
             if (mode) formData.append('rag_mode', mode);
 

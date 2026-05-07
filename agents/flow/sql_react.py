@@ -6,13 +6,14 @@ import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.documents import Document
 
 from agents.flow.state import SQLReactState
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.error_codes import is_retryable
-from agents.rag.retriever import get_schema_table_names, get_schema_docs_by_tables, recall_business_knowledge, recall_agent_knowledge, search_schema_tables
+from agents.rag.retriever import get_schema_table_names, recall_business_knowledge, recall_agent_knowledge, search_schema_tables, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.rag.query_rewrite import rewrite_query
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.config.settings import settings
@@ -28,8 +29,13 @@ logger = logging.getLogger(__name__)
 async def contextualize_query(state: SQLReactState) -> dict:
     """利用对话历史将代词化查询重写为独立查询。
 
-    例如 "他在哪个部门" → "zhangsan01 在哪个部门"
+    如果 rewritten_query 已由外层 classify 提供，直接复用，跳过 LLM 调用。
     """
+    # 外层已重写，跳过
+    existing = state.get("rewritten_query", "")
+    if existing:
+        return {"rewritten_query": existing}
+
     query = state.get("query", "")
     chat_history = state.get("chat_history", [])
 
@@ -64,6 +70,50 @@ async def contextualize_query(state: SQLReactState) -> dict:
         return {"rewritten_query": query}
 
 
+async def query_enhance(state: SQLReactState) -> dict:
+    """用证据（业务知识）翻译查询中的业务术语，增强向量检索命中率。
+
+    示例：
+        Query: "华东区上月GMV是多少"
+        Evidence: "GMV = 已支付订单总额", "华东包含上海、江苏、浙江..."
+        Enhanced: "华东区（上海、江苏、浙江）上月已支付订单总额是多少"
+    """
+    query = state.get("rewritten_query") or state.get("query", "")
+    evidence = state.get("evidence", [])
+
+    if not evidence:
+        return {"enhanced_query": query}
+
+    evidence_text = "\n".join(evidence)
+
+    try:
+        model = get_chat_model(settings.chat_model_type)
+        response = await asyncio.wait_for(
+            model.ainvoke([
+                SystemMessage(content=(
+                    "你是一个查询增强助手。根据业务知识，将用户查询中的业务术语、缩写、"
+                    "隐含条件翻译/展开为数据库字段或通用表达，使查询更适合数据库检索。\n\n"
+                    "规则：\n"
+                    "1. 只翻译/展开查询中出现的业务术语，不要添加查询中没有的条件\n"
+                    "2. 保持查询的原始意图不变\n"
+                    "3. 如果知识中有区域/维度的映射（如华东包含哪些省），用括号补充\n"
+                    "4. 如果知识中有术语定义（如GMV=已支付订单总额），替换为更明确的表达\n"
+                    "5. 只输出增强后的查询，不要解释"
+                )),
+                HumanMessage(content=f"业务知识:\n{evidence_text}\n\n用户查询: {query}"),
+            ]),
+            timeout=settings.resilience.llm_rewrite_timeout,
+        )
+        enhanced = response.content.strip()
+        if enhanced:
+            logger.info("query_enhance: '%s' -> '%s'", query[:80], enhanced[:80])
+            return {"enhanced_query": enhanced}
+    except Exception as e:
+        logger.warning("query_enhance failed, using original: %s", e)
+
+    return {"enhanced_query": query}
+
+
 async def load_table_names(state: SQLReactState) -> dict:
     """从 Milvus 加载所有已索引的表名列表（fallback 用）。"""
     table_names = state.get("table_names", [])
@@ -84,7 +134,7 @@ async def select_tables(state: SQLReactState) -> dict:
     Stage 1: 用户问题向量检索 top-K schema 文档，提取候选表名
     Stage 2: 候选表 > 3 个时，LLM 从候选中精选；否则直接使用
     """
-    query = state.get("rewritten_query") or state.get("query", "")
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
 
     # Stage 1: 向量粗筛（带超时）
     candidate_tables = []
@@ -111,21 +161,53 @@ async def select_tables(state: SQLReactState) -> dict:
             candidate_tables = table_names
 
     if not candidate_tables:
-        return {"selected_tables": [], "table_names": state.get("table_names", [])}
+        return {"selected_tables": []}
 
     # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
     if len(candidate_tables) <= 3:
-        logger.info("select_tables: %d candidates, using directly: %s", len(candidate_tables), candidate_tables)
-        return {"selected_tables": candidate_tables, "table_names": candidate_tables}
+        selected = candidate_tables
+        # 加载表关系
+        relationships = []
+        try:
+            relationships = await asyncio.wait_for(
+                asyncio.to_thread(get_table_relationships, selected),
+                timeout=settings.resilience.milvus_timeout,
+            )
+        except Exception as e:
+            logger.warning("Failed to load table relationships: %s", e)
+        logger.info("select_tables: %d candidates, using directly: %s, %d relationships",
+                    len(candidate_tables), selected, len(relationships))
+        return {"selected_tables": selected, "table_relationships": relationships}
 
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
-    names_text = ", ".join(candidate_tables)
+
+    # 加载表描述信息
+    table_metadata = {}
+    try:
+        metadata_list = await asyncio.wait_for(
+            asyncio.to_thread(load_full_table_metadata),
+            timeout=settings.resilience.milvus_timeout,
+        )
+        table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
+    except Exception as e:
+        logger.warning("Failed to load table metadata: %s", e)
+
+    # 格式化表名: 描述
+    names_with_desc = []
+    for t in candidate_tables:
+        desc = table_metadata.get(t, "")
+        if desc:
+            names_with_desc.append(f"- {t}: {desc}")
+        else:
+            names_with_desc.append(f"- {t}")
+    names_text = "\n".join(names_with_desc)
 
     response = await model.ainvoke([
         SystemMessage(content=f"""你是一个数据库专家。根据用户的问题，从候选表名中选出需要用到的表。
 
-候选表名: {names_text}
+候选表名:
+{names_text}
 
 要求：
 1. 只返回需要用到的表名，用逗号分隔
@@ -137,78 +219,137 @@ async def select_tables(state: SQLReactState) -> dict:
 
     raw = response.content.strip()
     if not raw:
-        return {"selected_tables": candidate_tables, "table_names": candidate_tables}
-
-    selected = [n.strip() for n in raw.split(",") if n.strip() in candidate_tables]
-    if not selected:
         selected = candidate_tables
+    else:
+        selected = [n.strip() for n in raw.split(",") if n.strip() in candidate_tables]
+        if not selected:
+            selected = candidate_tables
 
-    logger.info("select_tables: LLM selected %d from %d candidates: %s", len(selected), len(candidate_tables), selected)
-    return {"selected_tables": selected, "table_names": candidate_tables}
+    # 加载表关系
+    relationships = []
+    try:
+        relationships = await asyncio.wait_for(
+            asyncio.to_thread(get_table_relationships, selected),
+            timeout=settings.resilience.milvus_timeout,
+        )
+    except Exception as e:
+        logger.warning("Failed to load table relationships: %s", e)
+
+    logger.info("select_tables: LLM selected %d from %d candidates: %s, %d relationships",
+                len(selected), len(candidate_tables), selected, len(relationships))
+    return {"selected_tables": selected, "table_relationships": relationships}
 
 
 async def recall_evidence(state: SQLReactState) -> dict:
-    """向量检索业务知识 + 智能体知识库，注入 SQL 生成上下文。"""
+    """并行检索业务知识 + 智能体知识库，注入 SQL 生成上下文。"""
     query = state.get("rewritten_query") or state.get("query", "")
     if not query:
         return {"evidence": [], "few_shot_examples": []}
 
-    evidence = []
-    few_shot = []
+    async def _recall_business():
+        try:
+            docs = await asyncio.wait_for(
+                asyncio.to_thread(recall_business_knowledge, query, 5),
+                timeout=settings.resilience.milvus_timeout,
+            )
+            result = [d.page_content for d in docs if d.metadata.get("score", 0) > 0.3]
+            logger.info("recall_evidence: %d business knowledge entries", len(result))
+            return result
+        except Exception as e:
+            logger.warning("Business knowledge recall failed: %s", e)
+            return []
 
-    # 业务知识（术语、公式）— 带超时
-    try:
-        bk_docs = await asyncio.wait_for(
-            asyncio.to_thread(recall_business_knowledge, query, 5),
-            timeout=settings.resilience.milvus_timeout,
-        )
-        evidence = [d.page_content for d in bk_docs if d.metadata.get("score", 0) > 0.3]
-        logger.info("recall_evidence: %d business knowledge entries", len(evidence))
-    except Exception as e:
-        logger.warning("Business knowledge recall failed: %s", e)
+    async def _recall_agent():
+        try:
+            # 增加 top_k 以确保过滤后仍有足够的 SQL 示例
+            docs = await asyncio.wait_for(
+                asyncio.to_thread(recall_agent_knowledge, query, 10),
+                timeout=settings.resilience.milvus_timeout,
+            )
+            result = [d.page_content for d in docs if d.metadata.get("score", 0) > 0.3]
+            logger.info("recall_evidence: %d agent knowledge entries", len(result))
+            return result
+        except Exception as e:
+            logger.warning("Agent knowledge recall failed: %s", e)
+            return []
 
-    # 智能体知识库（SQL Q&A few-shot）— 带超时
-    try:
-        ak_docs = await asyncio.wait_for(
-            asyncio.to_thread(recall_agent_knowledge, query, 3),
-            timeout=settings.resilience.milvus_timeout,
-        )
-        few_shot = [d.page_content for d in ak_docs if d.metadata.get("score", 0) > 0.3]
-        logger.info("recall_evidence: %d agent knowledge entries", len(few_shot))
-    except Exception as e:
-        logger.warning("Agent knowledge recall failed: %s", e)
+    # 并行检索，耗时 = max(单个) 而非 sum
+    evidence, few_shot = await asyncio.gather(_recall_business(), _recall_agent())
 
     return {"evidence": evidence, "few_shot_examples": few_shot}
 
 
+
+
+def _build_schema_docs_from_semantic(semantic_model: dict) -> list[Document]:
+    """从语义模型构建 schema 文档（替代 Milvus 向量检索）。"""
+    docs = []
+    for table_name, columns in semantic_model.items():
+        lines = [f"表名: {table_name}"]
+        for col_name, meta in columns.items():
+            col_type = meta.get("column_type", "")
+            col_comment = meta.get("column_comment", "")
+            business_name = meta.get("business_name", "")
+            synonyms = meta.get("synonyms", "")
+            description = meta.get("business_description", "")
+            is_pk = meta.get("is_pk", 0)
+            is_fk = meta.get("is_fk", 0)
+            ref_table = meta.get("ref_table", "")
+            ref_column = meta.get("ref_column", "")
+
+            parts = [col_name]
+            if col_type:
+                parts.append(col_type)
+            if is_pk:
+                parts.append("PRIMARY KEY")
+            if is_fk and ref_table:
+                parts.append(f"REFERENCES {ref_table}({ref_column})")
+            if col_comment:
+                parts.append(f"-- {col_comment}")
+            if business_name:
+                parts.append(f"[业务名: {business_name}]")
+            if synonyms:
+                parts.append(f"[同义词: {synonyms}]")
+            if description:
+                parts.append(f"[描述: {description}]")
+
+            lines.append(" ".join(parts))
+
+        doc = Document(
+            page_content="\n".join(lines),
+            metadata={"table_name": table_name, "source": "semantic_model"},
+        )
+        docs.append(doc)
+    return docs
+
+
 async def sql_retrieve(state: SQLReactState, config=None) -> dict:
-    """按选中的表名精确拉取 schema 文档（metadata 过滤，非向量检索）。"""
+    """从 MySQL t_semantic_model 按表名加载完整 schema + 业务映射。"""
     selected = state.get("selected_tables", [])
+    tables = selected or state.get("table_names", [])
+    result = {}
 
-    if selected:
+    # 1. 加载语义模型（包含完整 schema + 业务映射）
+    if tables:
         try:
-            docs = await asyncio.wait_for(
-                asyncio.to_thread(get_schema_docs_by_tables, selected),
+            semantic = await asyncio.wait_for(
+                asyncio.to_thread(get_semantic_model_by_tables, tables),
                 timeout=settings.resilience.milvus_timeout,
             )
-            if docs:
-                return {"docs": docs}
+            result["semantic_model"] = semantic
         except Exception as e:
-            logger.warning("sql_retrieve by selected tables failed: %s", e)
+            logger.warning("Semantic model load failed: %s", e)
+            result["semantic_model"] = {}
+    else:
+        result["semantic_model"] = {}
 
-    # Fallback: LLM 没选出表或过滤无结果，拉取全部 schema
-    table_names = state.get("table_names", [])
-    if table_names:
-        try:
-            docs = await asyncio.wait_for(
-                asyncio.to_thread(get_schema_docs_by_tables, table_names),
-                timeout=settings.resilience.milvus_timeout,
-            )
-            return {"docs": docs}
-        except Exception as e:
-            logger.warning("sql_retrieve by all tables failed: %s", e)
+    # 2. 从语义模型构建 schema 文档（不做过滤，靠业务知识+语义模型让 LLM 判断字段）
+    if result["semantic_model"]:
+        result["docs"] = _build_schema_docs_from_semantic(result["semantic_model"])
+    else:
+        result["docs"] = []
 
-    return {"docs": []}
+    return result
 
 
 async def check_docs(state: SQLReactState) -> dict:
@@ -226,20 +367,23 @@ _MAX_TABLE_SEARCH_ROUNDS = 3
 
 
 async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: list) -> list:
-    """Re-retrieve schema docs for missing table names via metadata filter."""
-    new_docs = await asyncio.to_thread(get_schema_docs_by_tables, missing_tables)
+    """Re-retrieve schema docs for missing table names from t_semantic_model."""
+    semantic = await asyncio.to_thread(get_semantic_model_by_tables, missing_tables)
+    if not semantic:
+        return []
+    new_docs = _build_schema_docs_from_semantic(semantic)
     existing_names = {d.metadata.get("table_name", "") for d in existing_docs}
     unique_new = [d for d in new_docs if d.metadata.get("table_name", "") not in existing_names]
     return unique_new
 
 
-def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str, evidence_text: str, few_shot_text: str) -> list:
+def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str, evidence_text: str, few_shot_text: str, relationships_text: str = "") -> list:
     """Build messages for sql_generate LLM call."""
     return [
         SystemMessage(content=f"""你是一个 SQL 专家。根据用户的问题和数据库表结构信息，生成正确的 SQL 查询。
 
 表结构信息:
-        {docs_text}{evidence_text}{few_shot_text}{refine_context}{history_context}
+        {docs_text}{relationships_text}{evidence_text}{few_shot_text}{refine_context}{history_context}
 
 要求：
 1. 使用 MySQL 语法
@@ -248,7 +392,9 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
 4. 如果现有表结构不足以生成正确的 SQL（例如缺少关联表、缺少字段所在的表），
    请设置 needs_more_tables=true 并在 missing_tables 中列出你需要的表名
 5. 参考相似问题的 SQL 示例，但要根据实际表结构调整
-6. 使用 format_response 工具输出结果"""),
+6. 表结构中已包含字段的业务名称、同义词和描述，生成 SQL 时优先使用物理字段名，但可参考业务信息理解字段含义
+7. 使用表关系信息来确定正确的 JOIN 条件
+8. 使用 format_response 工具输出结果"""),
         HumanMessage(content=query),
     ]
 
@@ -289,6 +435,18 @@ async def sql_generate(state: SQLReactState) -> dict:
     if few_shot:
         few_shot_text = "\n\n相似问题参考:\n" + "\n---\n".join(few_shot)
 
+    # Semantic model (字段级业务映射) - 已合并到 docs 中，不再单独构建
+    # 保留 semantic_model 用于其他用途（如关键词过滤）
+
+    # Table relationships
+    relationships = state.get("table_relationships", [])
+    relationships_text = ""
+    if relationships:
+        lines = ["\n\n表关系（外键关联）:"]
+        for rel in relationships:
+            lines.append(f"  {rel['from_table']}.{rel['from_column']} -> {rel['to_table']}.{rel['to_column']}")
+        relationships_text = "\n".join(lines)
+
     # Accumulate docs across re-retrieval rounds
     all_docs = list(state.get("docs", []))
 
@@ -302,7 +460,7 @@ async def sql_generate(state: SQLReactState) -> dict:
     for round_idx in range(_MAX_TABLE_SEARCH_ROUNDS):
         docs_text = "\n\n".join([d.page_content for d in all_docs])
 
-        messages = _build_sql_messages(query_for_sql, docs_text, refine_context, history_context, evidence_text, few_shot_text)
+        messages = _build_sql_messages(query_for_sql, docs_text, refine_context, history_context, evidence_text, few_shot_text, relationships_text)
         response = await model_with_tools.ainvoke(messages)
 
         if not response.tool_calls:
@@ -453,15 +611,14 @@ async def error_analysis(state: SQLReactState) -> dict:
 def build_sql_react_graph():
     """构建 SQL React 图，支持自动纠错重试。
 
-    流程: load_table_names → select_tables → sql_retrieve → check_docs → generate → ...
-                                                  ↓
-                                        (metadata 精确过滤)
+    流程: contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → generate → ...
     """
     graph = StateGraph(SQLReactState)
 
     graph.add_node("contextualize_query", contextualize_query)
-    graph.add_node("select_tables", select_tables)
     graph.add_node("recall_evidence", recall_evidence)
+    graph.add_node("query_enhance", query_enhance)
+    graph.add_node("select_tables", select_tables)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
     graph.add_node("sql_generate", sql_generate)
@@ -471,9 +628,10 @@ def build_sql_react_graph():
     graph.add_node("error_analysis", error_analysis)
 
     graph.add_edge(START, "contextualize_query")
-    graph.add_edge("contextualize_query", "select_tables")
-    graph.add_edge("select_tables", "recall_evidence")
-    graph.add_edge("recall_evidence", "sql_retrieve")
+    graph.add_edge("contextualize_query", "recall_evidence")
+    graph.add_edge("recall_evidence", "query_enhance")
+    graph.add_edge("query_enhance", "select_tables")
+    graph.add_edge("select_tables", "sql_retrieve")
     graph.add_edge("sql_retrieve", "check_docs")
 
     def route_after_check(state: SQLReactState) -> str:
