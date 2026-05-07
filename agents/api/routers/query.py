@@ -142,7 +142,16 @@ async def query_invoke(req: QueryRequest):
     if req.rewritten_query:
         initial_state["rewritten_query"] = req.rewritten_query
 
-    result = await graph.ainvoke(initial_state, config=config)
+    try:
+        result = await graph.ainvoke(initial_state, config=config)
+    except Exception as e:
+        logger.error("query_invoke failed: %s", e, exc_info=True)
+        return QueryResponse(
+            query=req.query,
+            answer=f"系统错误: {e}",
+            status="error",
+            session_id=req.session_id,
+        )
 
     # 检查是否被 interrupt（等待审批）
     interrupt_val = _extract_interrupt(result)
@@ -177,13 +186,22 @@ async def approve_sql(req: ApproveRequest):
     graph = build_final_graph()
     config = _make_config(req.session_id)
 
-    result = await graph.ainvoke(
-        Command(resume={
-            "approved": req.approved,
-            "feedback": req.feedback,
-        }),
-        config=config,
-    )
+    try:
+        result = await graph.ainvoke(
+            Command(resume={
+                "approved": req.approved,
+                "feedback": req.feedback,
+            }),
+            config=config,
+        )
+    except Exception as e:
+        logger.error("approve_sql failed: %s", e, exc_info=True)
+        return QueryResponse(
+            query="",
+            answer=f"系统错误: {e}",
+            status="error",
+            session_id=req.session_id,
+        )
 
     # 审批后可能再次 interrupt（理论上不会，但防御性处理）
     interrupt_val = _extract_interrupt(result)

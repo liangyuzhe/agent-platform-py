@@ -78,9 +78,15 @@ async def execute_sql(sql: str, timeout: float | None = None) -> str:
     -------
     str
         The result payload returned by the MCP server (JSON-encoded).
+
+    Raises
+    ------
+    Exception
+        Re-raises after logging if the MCP call fails or returns an error.
     """
     session = await _connect()
     effective_timeout = timeout if timeout is not None else settings.resilience.sql_execution_timeout
+    logger.info("MCP execute_sql: %s", sql[:200])
     result = await asyncio.wait_for(
         session.call_tool("mysql_query", {"sql": sql}),
         timeout=effective_timeout,
@@ -90,7 +96,15 @@ async def execute_sql(sql: str, timeout: float | None = None) -> str:
     for block in result.content:
         if hasattr(block, "text"):
             parts.append(block.text)
-    return "".join(parts) if parts else str(result)
+    raw = "".join(parts) if parts else str(result)
+
+    # Check if MCP returned an error
+    if result.isError:
+        logger.error("MCP execute_sql error: %s", raw[:500])
+        raise RuntimeError(raw)
+
+    logger.info("MCP execute_sql OK: %s", raw[:200])
+    return raw
 
 
 async def list_tables() -> str:
