@@ -8,6 +8,7 @@ from agents.eval.nl2sql_runner import (
     _canonical_result,
     evaluate_nl2sql_case,
     run_nl2sql_evaluation,
+    write_nl2sql_template,
 )
 
 
@@ -53,3 +54,15 @@ def test_run_nl2sql_evaluation_writes_report(tmp_path):
     assert report["report_type"] == "nl2sql_end_to_end"
     assert report["metrics"]["result_exact_match"] == 1.0
     assert json.loads(output.read_text(encoding="utf-8"))["num_queries"] == 1
+
+
+def test_write_nl2sql_template_creates_jsonl(tmp_path):
+    output = tmp_path / "cases.jsonl"
+
+    write_nl2sql_template(output)
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["query"]
+    assert "generated_sql" in rows[0]
+    assert "actual_result" in rows[0]
+    assert "expected_result" in rows[0]

@@ -270,7 +270,10 @@ python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dat
 # 运行召回评测并生成报告
 python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
 
-# 离线运行 NL2SQL 端到端结果评测
+# 首次准备 NL2SQL 端到端回放样本模板
+python -m agents.eval.cli run-nl2sql --dataset data/eval/nl2sql_cases.jsonl --init-template
+
+# 填写真实 generated_sql / actual_result / expected_result 后运行端到端结果评测
 python -m agents.eval.cli run-nl2sql --dataset data/eval/nl2sql_cases.jsonl --output data/eval/nl2sql_eval_report.json
 ```
 
@@ -316,7 +319,15 @@ python -m agents.eval.cli generate \
   --no-knowledge-labels
 ```
 
-`run-nl2sql` 不会调用线上 Agent，也不会执行数据库，只评测已记录样本。样本格式：
+`run-nl2sql` 不会调用线上 Agent，也不会执行数据库，只评测已记录样本。如果样本文件还不存在，先执行：
+
+```bash
+python -m agents.eval.cli run-nl2sql \
+  --dataset data/eval/nl2sql_cases.jsonl \
+  --init-template
+```
+
+然后把模板里的 `generated_sql`、`actual_result`、`expected_result` 替换为真实回放 case。样本格式：
 
 ```json
 {"query":"去年亏损多少","generated_sql":"SELECT ...;","actual_result":[{"loss_amount":"100.00"}],"expected_result":[{"loss_amount":"100.00"}],"latency_ms":1200,"first_token_latency_ms":350}

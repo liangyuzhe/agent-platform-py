@@ -256,7 +256,15 @@ http://localhost:8080
 
 离线端到端评测用于生产回放或人工标注 case，不会调用线上 Agent，也不会执行数据库。它评测的是“已经生成/记录下来的 SQL 和执行结果是否符合预期”。
 
-运行：
+首次使用时先生成 JSONL 模板：
+
+```bash
+python -m agents.eval.cli run-nl2sql \
+  --dataset data/eval/nl2sql_cases.jsonl \
+  --init-template
+```
+
+填写真实 `generated_sql`、`actual_result`、`expected_result` 后运行：
 
 ```bash
 python -m agents.eval.cli run-nl2sql \

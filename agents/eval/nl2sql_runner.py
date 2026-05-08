@@ -17,6 +17,18 @@ from agents.eval.reporting import percentile
 from agents.model.format_tool import normalize_sql_answer
 
 
+NL2SQL_TEMPLATE_CASES = [
+    {
+        "query": "去年亏损多少",
+        "generated_sql": "SELECT 0 AS loss_amount;",
+        "actual_result": [{"loss_amount": "0.00"}],
+        "expected_result": [{"loss_amount": "0.00"}],
+        "latency_ms": 1200,
+        "first_token_latency_ms": 350,
+    }
+]
+
+
 @dataclass
 class NL2SQLCaseResult:
     query: str
@@ -38,6 +50,16 @@ def _load_jsonl(path: str | Path) -> list[dict]:
             if line:
                 items.append(json.loads(line))
     return items
+
+
+def write_nl2sql_template(output_path: str | Path) -> Path:
+    """Write a small JSONL template for offline NL2SQL evaluation cases."""
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        for item in NL2SQL_TEMPLATE_CASES:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return output
 
 
 def _canonical_result(value: Any) -> Any:

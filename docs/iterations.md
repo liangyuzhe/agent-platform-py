@@ -1848,3 +1848,30 @@ pytest -q
 ```
 
 结果：`236 passed`。LangSmith 网络上报失败为本地网络限制，不影响测试结论。
+
+---
+
+## Iteration 30：NL2SQL 离线评测 CLI 体验修复
+
+### 背景
+
+`run-nl2sql` 需要读取已经记录好的回放样本，但文档示例里的 `data/eval/nl2sql_cases.jsonl` 不一定存在。直接运行会触发 `FileNotFoundError` traceback，用户无法判断是命令错误、代码错误，还是缺少输入样本。
+
+### 解决方案
+
+- `run-nl2sql` 在 dataset 缺失时输出明确提示并以退出码 2 结束，不再展示 Python traceback。
+- 新增 `--init-template`，可生成一份 JSONL 样本模板：
+
+```bash
+python -m agents.eval.cli run-nl2sql \
+  --dataset data/eval/nl2sql_cases.jsonl \
+  --init-template
+```
+
+- README 和评测设计文档改为先初始化模板，再填写真实 `generated_sql` / `actual_result` / `expected_result`，最后运行评测。
+
+### 验证
+
+- 缺失 dataset 场景返回可读错误和模板生成命令。
+- `--init-template` 可生成 JSONL 模板。
+- 使用模板可成功生成 `nl2sql_eval_report.json`。

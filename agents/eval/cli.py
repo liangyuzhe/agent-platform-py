@@ -73,10 +73,28 @@ def cmd_detail(args):
 
 def cmd_run_nl2sql(args):
     """Run offline NL2SQL end-to-end evaluation."""
-    from agents.eval.nl2sql_runner import run_nl2sql_evaluation
+    from pathlib import Path
+
+    from agents.eval.nl2sql_runner import run_nl2sql_evaluation, write_nl2sql_template
+
+    dataset_path = Path(args.dataset)
+    if args.init_template:
+        output = write_nl2sql_template(dataset_path)
+        print(f"Wrote NL2SQL evaluation template -> {output}")
+        print("Fill generated_sql/actual_result/expected_result with recorded cases, then rerun without --init-template.")
+        return
+
+    if not dataset_path.exists():
+        print(
+            f"NL2SQL dataset not found: {dataset_path}\n"
+            "This command evaluates recorded NL2SQL cases; it does not generate them automatically.\n"
+            f"Create a template first with: python -m agents.eval.cli run-nl2sql --dataset {dataset_path} --init-template",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     report = run_nl2sql_evaluation(
-        dataset_path=args.dataset,
+        dataset_path=dataset_path,
         output_path=args.output,
     )
     print(f"Evaluated {report['num_queries']} NL2SQL cases -> {args.output}")
@@ -118,6 +136,11 @@ def main():
     p_nl2sql = sub.add_parser("run-nl2sql", help="Run offline NL2SQL end-to-end evaluation")
     p_nl2sql.add_argument("--dataset", required=True, help="JSONL cases with generated_sql/result labels")
     p_nl2sql.add_argument("--output", default="data/eval/nl2sql_eval_report.json", help="Report output path")
+    p_nl2sql.add_argument(
+        "--init-template",
+        action="store_true",
+        help="Write a starter NL2SQL JSONL dataset template and exit",
+    )
 
     args = parser.parse_args()
 
