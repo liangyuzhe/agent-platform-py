@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,7 +34,7 @@ class StrategyConfig:
     reranker_top_k: int = 10
     rerank_threshold: float = 0.1
     # Which retriever class to use
-    mode: str = "traditional"  # "traditional" or "parent"
+    mode: str = "schema_lexical"  # schema_lexical, schema_table_name, traditional, parent, vector_only, es_only
 
 
 @dataclass
@@ -84,9 +86,68 @@ class _ESOnlyRetriever:
         return docs[: self._top_k]
 
 
+def _tokenize_for_eval(text: str) -> set[str]:
+    """Tokenize Chinese/English schema text for lightweight local evaluation."""
+    normalized = text.lower()
+    tokens = set(re.findall(r"[a-z0-9_]+", normalized))
+    tokens.update(ch for ch in normalized if "\u4e00" <= ch <= "\u9fff")
+    for size in (2, 3):
+        for i in range(0, max(0, len(normalized) - size + 1)):
+            chunk = normalized[i : i + size]
+            if any("\u4e00" <= ch <= "\u9fff" for ch in chunk):
+                tokens.add(chunk)
+    return tokens
+
+
+class _SchemaMetadataRetriever:
+    """Local schema retriever based on t_semantic_model-rendered documents.
+
+    This mirrors the current NL2SQL architecture more closely than the legacy
+    Milvus ``mysql_schema`` retrieval path: schema authority is MySQL/Redis,
+    and evaluation labels are ``schema_<table>`` doc IDs.
+    """
+
+    def __init__(self, include_fields: bool = True, top_k: int = 10):
+        from agents.eval.dataset_generator import _fetch_all_schema_docs
+
+        self._top_k = top_k
+        self._docs = _fetch_all_schema_docs()
+        self._indexed = []
+        for doc in self._docs:
+            table_name = doc.get("table_name", "")
+            text = doc.get("text", "") if include_fields else table_name
+            self._indexed.append((doc, _tokenize_for_eval(f"{table_name}\n{text}")))
+
+    def retrieve(self, query: str) -> list[Document]:
+        query_terms = _tokenize_for_eval(query)
+        ranked = []
+        for doc, terms in self._indexed:
+            overlap = query_terms & terms
+            if not overlap:
+                continue
+            score = len(overlap) / max(len(query_terms), 1)
+            ranked.append((score, doc))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [
+            Document(
+                page_content=doc.get("text", ""),
+                metadata={
+                    "doc_id": doc.get("doc_id", doc.get("pk", "")),
+                    "table_name": doc.get("table_name", ""),
+                    "retriever_source": "schema_metadata",
+                },
+            )
+            for _, doc in ranked[: self._top_k]
+        ]
+
+
 def _build_retriever(config: StrategyConfig):
     """Build a retriever instance from strategy config."""
-    if config.mode == "parent":
+    if config.mode == "schema_lexical":
+        return _SchemaMetadataRetriever(include_fields=True, top_k=config.reranker_top_k)
+    elif config.mode == "schema_table_name":
+        return _SchemaMetadataRetriever(include_fields=False, top_k=config.reranker_top_k)
+    elif config.mode == "parent":
         from agents.rag.parent_retriever import ParentDocumentRetriever
         return ParentDocumentRetriever(reranker_top_k=config.reranker_top_k)
     elif config.mode == "vector_only":
@@ -216,48 +277,53 @@ def run_evaluation(
 
     logger.info("Loaded %d evaluation queries from %s", len(dataset), dataset_path)
 
-    # Default strategies to compare
+    # Default strategies to compare. Schema datasets use schema_<table> labels,
+    # so default to current NL2SQL schema metadata retrieval instead of legacy
+    # document-vector retrievers that may load heavy rerankers.
     if strategies is None:
         strategies = [
             StrategyConfig(
-                name="hybrid_rerank",
-                description="Hybrid (Milvus + ES BM25) + RRF + Cross-Encoder rerank",
+                name="schema_lexical",
+                description="Local lexical schema retrieval over t_semantic_model fields/business metadata",
                 retrieve_k=20,
-                reranker_model="BAAI/bge-reranker-v2-m3",
                 reranker_top_k=10,
-                rerank_threshold=0.1,
-                mode="traditional",
+                mode="schema_lexical",
             ),
             StrategyConfig(
-                name="hybrid_no_rerank",
-                description="Hybrid (Milvus + ES BM25) + RRF, no reranker",
+                name="schema_table_name",
+                description="Local lexical schema retrieval over table names only",
                 retrieve_k=20,
-                reranker_model=None,
                 reranker_top_k=10,
-                mode="traditional",
-            ),
-            StrategyConfig(
-                name="vector_only",
-                description="Milvus vector search only (dense)",
-                retrieve_k=20,
-                reranker_model=None,
-                reranker_top_k=10,
-                mode="vector_only",
-            ),
-            StrategyConfig(
-                name="es_only",
-                description="Elasticsearch BM25 only (sparse)",
-                retrieve_k=20,
-                reranker_model=None,
-                reranker_top_k=10,
-                mode="es_only",
-            ),
-            StrategyConfig(
-                name="parent_doc",
-                description="Parent document retriever (child→parent expansion)",
-                mode="parent",
+                mode="schema_table_name",
             ),
         ]
+        if os.environ.get("ENABLE_LEGACY_EVAL_RETRIEVERS") == "1":
+            strategies.extend([
+                StrategyConfig(
+                    name="hybrid_no_rerank",
+                    description="Legacy document Hybrid (Milvus + ES BM25) + RRF, no reranker",
+                    retrieve_k=20,
+                    reranker_model=None,
+                    reranker_top_k=10,
+                    mode="traditional",
+                ),
+                StrategyConfig(
+                    name="vector_only",
+                    description="Legacy Milvus vector search only (dense)",
+                    retrieve_k=20,
+                    reranker_model=None,
+                    reranker_top_k=10,
+                    mode="vector_only",
+                ),
+                StrategyConfig(
+                    name="es_only",
+                    description="Legacy Elasticsearch BM25 only (sparse)",
+                    retrieve_k=20,
+                    reranker_model=None,
+                    reranker_top_k=10,
+                    mode="es_only",
+                ),
+            ])
 
     # Run evaluation for each strategy
     reports = []

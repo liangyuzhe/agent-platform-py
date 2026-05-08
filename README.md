@@ -261,6 +261,25 @@ python -m scripts.cleanup_schema_indexes
 
 `scripts.seed_financial` 会额外写入一组 `LOSS-YYYY-*` 凭证，用于稳定验证“去年亏损”“亏损多少”等 NL2SQL 场景。脚本每次执行都会先清理同年度旧的 `LOSS-YYYY-*` 凭证，再重新插入上一年度 12 个月的已过账收入、成本、费用分录，避免重复累加。该数据只用于测试库造数，不参与运行时 SQL 生成逻辑。
 
+### 评测数据与报告
+
+```bash
+# 从 t_semantic_model 生成 schema 评测数据集
+python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dataset.jsonl
+
+# 运行当前 schema metadata 召回评测并生成报告
+python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
+```
+
+两个命令的区别：
+
+| 命令 | 作用 | 输出 |
+|------|------|------|
+| `generate` | 基于 MySQL `t_semantic_model` 和 LLM 生成自然语言 query，并标注标准相关表 `relevant_doc_ids` | `eval_dataset.jsonl` |
+| `run` | 对数据集里的 query 执行召回策略，把实际召回表和标准相关表对比，计算 Accuracy、Recall、MRR、NDCG、延迟等指标 | `eval_report.json` |
+
+`run` 默认评测 `schema_lexical` 和 `schema_table_name` 两个策略，不再默认加载旧版 Milvus/ES 文档检索和 CrossEncoder reranker。完整原理、指标解释和报告格式见 [评测体系设计](docs/evaluation_design.md)。
+
 ### 业务知识配置
 
 默认业务知识来自：

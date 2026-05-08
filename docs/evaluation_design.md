@@ -85,17 +85,126 @@ Schema 评测数据从 MySQL `t_semantic_model` 生成，不再依赖历史 Milv
 
 ## 使用方式
 
+### 两个命令分别做什么
+
+评测流程分两步：
+
+```text
+generate：生成评测数据集
+run：使用评测数据集运行评测并生成报告
+```
+
+这两个命令的职责不同，不能互相替代。
+
+| 命令 | 做什么 | 输入 | 输出 | 是否计算指标 |
+|------|--------|------|------|--------------|
+| `generate` | 让 LLM 基于 `t_semantic_model` 生成自然语言问题和标准相关表 | MySQL `t_semantic_model` | `eval_dataset.jsonl` | 否 |
+| `run` | 用数据集里的 query 执行召回策略，并和标准相关表对比 | `eval_dataset.jsonl` + MySQL `t_semantic_model` | `eval_report.json` | 是 |
+
+### 1. 生成评测数据集
+
 生成数据集：
 
 ```bash
 python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dataset.jsonl
 ```
 
+这一步的原理：
+
+```text
+MySQL t_semantic_model
+  ↓
+渲染为 schema 文本（表名、字段、业务名、同义词、字段描述、主外键）
+  ↓
+LLM 根据 schema 生成自然语言问题
+  ↓
+LLM 同时标注回答该问题需要哪些表
+  ↓
+写入 JSONL 数据集
+```
+
+生成的数据格式：
+
+```json
+{"query": "去年亏损多少？", "relevant_doc_ids": ["schema_t_journal_entry", "schema_t_journal_item", "schema_t_account"]}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+|------|------|
+| `query` | 模拟用户自然语言问题 |
+| `relevant_doc_ids` | 标准答案：回答该问题必须召回的表，格式为 `schema_<table_name>` |
+
+`--num-per-table 3` 表示每张表让 LLM 生成 3 条问题。假设 `t_semantic_model` 里有 20 张表，理论上约生成 60 条样本；代码会按 query 去重，所以最终数量可能略少。
+
+注意：这是 LLM 生成的 synthetic dataset，适合冷启动和覆盖 schema，但仍建议后续人工审核一批高价值样本，并逐步加入真实用户问题。
+
+### 2. 运行评测
+
 运行评测：
 
 ```bash
 python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
 ```
+
+这一步的原理：
+
+```text
+读取 eval_dataset.jsonl
+  ↓
+对每条 query 运行一个或多个召回策略
+  ↓
+得到 retrieved_doc_ids
+  ↓
+和 relevant_doc_ids 对比
+  ↓
+计算 Accuracy / Precision / Recall / MRR / NDCG / 延迟
+  ↓
+写入 eval_report.json
+```
+
+`run` 会再次读取 MySQL `t_semantic_model` 构建本地 schema 检索器，然后用数据集中的 `query` 和 `relevant_doc_ids` 计算指标。默认策略对齐当前 NL2SQL 架构：
+
+| 策略 | 说明 | 用途 |
+|------|------|------|
+| `schema_lexical` | 基于表名、字段名、字段注释、业务名、同义词、业务描述做本地词法召回 | 当前 schema metadata 质量基线 |
+| `schema_table_name` | 只基于表名做召回 | 对照组，用于判断字段业务描述是否带来收益 |
+
+旧版通用文档检索策略（Milvus/ES/RRF）默认不再运行，因为 schema 评测集标注的是 `schema_<table>`，当前线上 schema 权威来源也是 MySQL/Redis。如果需要兼容测试旧链路，可显式开启：
+
+```bash
+ENABLE_LEGACY_EVAL_RETRIEVERS=1 \
+  python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
+```
+
+评测报告会包含两层信息：
+
+| 层级 | 内容 | 用途 |
+|------|------|------|
+| 策略汇总 | 每个策略的平均指标、P50/P95 延迟 | 判断哪种策略整体更好 |
+| Query 明细 | 每条 query 的标准相关表、实际召回表、单条指标、耗时 | 回溯失败样本，定位是漏召回、排序差还是标注问题 |
+
+举例：
+
+```json
+{
+  "query": "去年亏损多少？",
+  "relevant_doc_ids": ["schema_t_journal_entry", "schema_t_journal_item", "schema_t_account"],
+  "retrieved_doc_ids": ["schema_t_journal_entry", "schema_t_account", "schema_t_invoice"],
+  "metrics": {
+    "accuracy@5": 0.0,
+    "recall@5": 0.6667
+  }
+}
+```
+
+这个例子表示 Top5 召回了 3 张标准表中的 2 张：
+
+- `Recall@5 = 2/3 = 0.6667`
+- `Accuracy@5 = 0`，因为没有完整命中全部标准相关表
+
+### 3. 页面查看
 
 查看页面：
 
