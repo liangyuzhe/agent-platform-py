@@ -50,6 +50,47 @@ class TestExtractInterrupt:
         assert result is None
 
 
+class TestSessionSqlContext:
+    """Test SQL context memory for follow-up queries."""
+
+    @patch("agents.api.routers.query.save_session")
+    @patch("agents.api.routers.query.get_session")
+    def test_save_sql_context_to_session(self, mock_get_session, mock_save_session):
+        from agents.api.routers.query import _save_sql_context_to_session
+        from agents.tool.memory.session import Session
+
+        session = Session(id="s1")
+        mock_get_session.return_value = session
+
+        _save_sql_context_to_session(
+            "s1",
+            "去年亏损",
+            "SELECT * FROM t WHERE status = '已过账'",
+            "净利润：0.00",
+        )
+
+        context = session.preferences["_last_sql_context"]
+        assert "去年亏损" in context
+        assert "status = '已过账'" in context
+        assert "净利润：0.00" in context
+        mock_save_session.assert_called_once()
+
+    @patch("agents.api.routers.query.get_session")
+    def test_load_chat_history_includes_last_sql_context(self, mock_get_session):
+        from agents.api.routers.query import _load_chat_history
+        from agents.tool.memory.session import Session
+
+        session = Session(id="s1")
+        session.preferences["_last_sql_context"] = "生成SQL:\nSELECT 1"
+        mock_get_session.return_value = session
+
+        history = _load_chat_history("s1")
+
+        assert history[0]["role"] == "system"
+        assert history[0]["content"].startswith("[上一轮SQL上下文]")
+        assert "SELECT 1" in history[0]["content"]
+
+
 # ---------------------------------------------------------------------------
 # /api/query/invoke
 # ---------------------------------------------------------------------------
@@ -206,6 +247,36 @@ class TestQueryApprove:
         result = await approve_sql(req)
 
         assert "拒绝" in result.answer
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_approve_stream_returns_progress_and_result(self, mock_build_graph, mock_callbacks):
+        """Streaming approval should emit user-friendly progress and final result."""
+        from agents.api.routers.query import approve_sql_stream, ApproveRequest
+
+        interrupt_obj = MagicMock()
+        interrupt_obj.value = {
+            "sql": "SELECT COALESCE(SUM(x), 0) FROM t;",
+            "message": "上次执行结果疑似异常，系统已反思并生成修正后的 SQL。请确认是否执行修正后的 SQL？",
+            "reflection": True,
+        }
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"__interrupt__": [interrupt_obj]})
+        mock_build_graph.return_value = mock_graph
+
+        req = ApproveRequest(session_id="s1", approved=True)
+        response = await approve_sql_stream(req, MagicMock())
+        events = []
+        async for event in response.body_iterator:
+            events.append(event)
+
+        assert any(e.get("event") == "status" and "反思" in e.get("data", "") for e in events)
+        result_events = [e for e in events if e.get("event") == "result"]
+        assert result_events
+        assert "pending_approval" in result_events[0]["data"]
+        assert "COALESCE" in result_events[0]["data"]
 
 
 # ---------------------------------------------------------------------------

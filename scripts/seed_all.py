@@ -1,17 +1,15 @@
-"""Unified seed script: create all tables, seed all data, index into Milvus.
+"""Unified seed script: create all tables and seed all data.
 
 Runs in order:
   1. Business tables + data (seed_financial)
   2. Semantic model (seed_semantic_model)
   3. Business knowledge + Milvus index (seed_business_knowledge)
   4. Agent knowledge + Milvus index (seed_agent_knowledge)
-  5. Schema re-index into Milvus + ES (schema_indexer)
 
 Usage:
     python -m scripts.seed_all
 """
 
-import asyncio
 import sys
 from pathlib import Path
 
@@ -24,39 +22,31 @@ def main():
 
     # Step 1: Business tables + data
     print("=" * 60)
-    print("Step 1/5: Creating business tables and seeding data")
+    print("Step 1/4: Creating business tables and seeding data")
     print("=" * 60)
     from scripts.seed_financial import main as seed_financial_main
     seed_financial_main()
 
     # Step 2: Semantic model
     print("=" * 60)
-    print("Step 2/5: Seeding semantic model")
+    print("Step 2/4: Seeding semantic model")
     print("=" * 60)
     from scripts.seed_semantic_model import main as seed_semantic_main
     seed_semantic_main()
 
     # Step 3: Business knowledge
     print("=" * 60)
-    print("Step 3/5: Seeding business knowledge + Milvus index")
+    print("Step 3/4: Seeding business knowledge + Milvus index")
     print("=" * 60)
     from scripts.seed_business_knowledge import main as seed_bk_main
     seed_bk_main()
 
     # Step 4: Agent knowledge
     print("=" * 60)
-    print("Step 4/5: Seeding agent knowledge + Milvus index")
+    print("Step 4/4: Seeding agent knowledge + Milvus index")
     print("=" * 60)
     from scripts.seed_agent_knowledge import main as seed_ak_main
     seed_ak_main()
-
-    # Step 5: Schema re-index (after semantic model is loaded)
-    print("=" * 60)
-    print("Step 5/5: Re-indexing schemas into Milvus + ES")
-    print("=" * 60)
-    from agents.rag.schema_indexer import index_mysql_schemas
-    result = asyncio.run(index_mysql_schemas())
-    print(f"Schema index result: {result}")
 
     print("\n" + "=" * 60)
     print("All seeding complete!")

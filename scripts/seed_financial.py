@@ -1,4 +1,4 @@
-"""Seed financial business tables into MySQL, then re-index into Milvus + ES.
+"""Seed financial business tables into MySQL.
 
 Generates data relative to current date so queries like "last month" always work.
 
@@ -9,6 +9,7 @@ Usage:
 import random
 import sys
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pymysql
@@ -56,6 +57,144 @@ def _recent_months(n=6):
             y -= 1
         months.append((y, m))
     return months
+
+
+def _insert_journal_entry(cursor, entry_no, entry_date, entry_type, period, items, memo):
+    """Insert a balanced journal entry and its line items."""
+    total_debit = sum(item["debit"] for item in items)
+    total_credit = sum(item["credit"] for item in items)
+    cursor.execute(
+        """
+        INSERT INTO t_journal_entry (
+            entry_no, entry_date, entry_type, period,
+            total_debit, total_credit, attachment_count, status,
+            prepared_by, reviewed_by, posted_at, memo
+        )
+        VALUES (
+            %s, %s, %s, %s,
+            %s, %s, 1, '已过账',
+            '系统初始化', '系统审核', %s, %s
+        )
+        """,
+        (
+            entry_no,
+            entry_date,
+            entry_type,
+            period,
+            total_debit,
+            total_credit,
+            f"{entry_date} 10:00:00",
+            memo,
+        ),
+    )
+    entry_id = cursor.lastrowid
+
+    for line_no, item in enumerate(items, 1):
+        cursor.execute(
+            """
+            INSERT INTO t_journal_item (
+                entry_id, line_no, account_code, summary,
+                debit_amount, credit_amount, cost_center_id, project_code
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
+            """,
+            (
+                entry_id,
+                line_no,
+                item["account_code"],
+                item["summary"],
+                item["debit"],
+                item["credit"],
+                item.get("cost_center_id"),
+            ),
+        )
+
+
+def seed_prior_year_loss_scenario(conn, cursor):
+    """Seed deterministic prior-year P&L vouchers for NL2SQL loss tests."""
+    loss_year = date.today().year - 1
+    entry_prefix = f"LOSS-{loss_year}-%"
+
+    cursor.execute(
+        """
+        DELETE ji
+        FROM t_journal_item ji
+        INNER JOIN t_journal_entry je ON ji.entry_id = je.id
+        WHERE je.entry_no LIKE %s
+        """,
+        (entry_prefix,),
+    )
+    cursor.execute("DELETE FROM t_journal_entry WHERE entry_no LIKE %s", (entry_prefix,))
+
+    monthly_scenarios = [
+        (1, Decimal("80000.00"), Decimal("85000.00"), Decimal("38000.00")),
+        (2, Decimal("92000.00"), Decimal("98000.00"), Decimal("41000.00")),
+        (3, Decimal("105000.00"), Decimal("112000.00"), Decimal("43000.00")),
+        (4, Decimal("118000.00"), Decimal("124000.00"), Decimal("45000.00")),
+        (5, Decimal("126000.00"), Decimal("135000.00"), Decimal("47000.00")),
+        (6, Decimal("132000.00"), Decimal("141000.00"), Decimal("50000.00")),
+        (7, Decimal("128000.00"), Decimal("139000.00"), Decimal("48000.00")),
+        (8, Decimal("121000.00"), Decimal("131000.00"), Decimal("46000.00")),
+        (9, Decimal("116000.00"), Decimal("126000.00"), Decimal("44000.00")),
+        (10, Decimal("110000.00"), Decimal("119000.00"), Decimal("42000.00")),
+        (11, Decimal("98000.00"), Decimal("106000.00"), Decimal("39000.00")),
+        (12, Decimal("90000.00"), Decimal("97000.00"), Decimal("37000.00")),
+    ]
+
+    totals = {"income": Decimal("0.00"), "cost": Decimal("0.00"), "expense": Decimal("0.00")}
+    for month, income, cost, expense in monthly_scenarios:
+        period = f"{loss_year}-{month:02d}"
+        entry_date = f"{period}-25"
+        totals["income"] += income
+        totals["cost"] += cost
+        totals["expense"] += expense
+
+        _insert_journal_entry(
+            cursor,
+            f"LOSS-{loss_year}{month:02d}-INC",
+            entry_date,
+            "收款",
+            period,
+            [
+                {"account_code": "1002", "summary": "确认主营业务收入", "debit": income, "credit": Decimal("0.00"), "cost_center_id": 4},
+                {"account_code": "6001", "summary": "确认主营业务收入", "debit": Decimal("0.00"), "credit": income, "cost_center_id": 4},
+            ],
+            "上一年度亏损场景-收入",
+        )
+        _insert_journal_entry(
+            cursor,
+            f"LOSS-{loss_year}{month:02d}-COST",
+            entry_date,
+            "转账",
+            period,
+            [
+                {"account_code": "6401", "summary": "结转主营业务成本", "debit": cost, "credit": Decimal("0.00"), "cost_center_id": 6},
+                {"account_code": "1002", "summary": "结转主营业务成本", "debit": Decimal("0.00"), "credit": cost, "cost_center_id": 6},
+            ],
+            "上一年度亏损场景-成本",
+        )
+        _insert_journal_entry(
+            cursor,
+            f"LOSS-{loss_year}{month:02d}-EXP",
+            entry_date,
+            "付款",
+            period,
+            [
+                {"account_code": "5401", "summary": "确认期间费用", "debit": expense, "credit": Decimal("0.00"), "cost_center_id": 2},
+                {"account_code": "1002", "summary": "确认期间费用", "debit": Decimal("0.00"), "credit": expense, "cost_center_id": 2},
+            ],
+            "上一年度亏损场景-费用",
+        )
+
+    conn.commit()
+    net_profit = totals["income"] - totals["cost"] - totals["expense"]
+    loss_amount = abs(net_profit) if net_profit < 0 else Decimal("0.00")
+    print(
+        "  [OK] prior-year loss scenario "
+        f"({loss_year}): income={totals['income']:.2f}, "
+        f"cost={totals['cost']:.2f}, expense={totals['expense']:.2f}, "
+        f"net_profit={net_profit:.2f}, loss_amount={loss_amount:.2f}"
+    )
 
 
 def create_tables(cursor):
@@ -385,6 +524,8 @@ def seed_data(conn, cursor):
     conn.commit()
     print(f"  [OK] {len(months) * 10} journal entries with items")
 
+    seed_prior_year_loss_scenario(conn, cursor)
+
     # -- 资金划转 (每月 5 条) --
     ft_no = 1
     transfer_purposes = [
@@ -591,18 +732,6 @@ def seed_data(conn, cursor):
     print()
 
 
-def reindex():
-    """Re-index schemas into Milvus + ES."""
-    import asyncio
-    print("=== Re-indexing schemas into Milvus + ES ===")
-    from agents.model.chat_model import init_chat_models
-    init_chat_models()
-    from agents.rag.schema_indexer import index_mysql_schemas
-    result = asyncio.run(index_mysql_schemas())
-    print(f"Result: {result}")
-    print("Done.\n")
-
-
 def main():
     conn = get_conn()
     cursor = conn.cursor()
@@ -613,7 +742,6 @@ def main():
         cursor.close()
         conn.close()
 
-    reindex()
     print("=== All done! ===")
 
 

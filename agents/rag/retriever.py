@@ -667,6 +667,83 @@ def _filter_has_business_term(docs: list[Document]) -> list[Document]:
     return result
 
 
+def _business_knowledge_content(row: dict) -> str:
+    """Render one t_business_knowledge row as retriever evidence text."""
+    content = f"术语: {row.get('term', '')}\n公式: {row.get('formula', '')}"
+    if row.get("synonyms"):
+        content += f"\n同义词: {row['synonyms']}"
+    if row.get("related_tables"):
+        content += f"\n关联表: {row['related_tables']}"
+    return content
+
+
+def _load_business_knowledge_from_mysql() -> list[dict]:
+    """Load business terms from MySQL for lexical fallback recall."""
+    import pymysql
+
+    try:
+        conn = pymysql.connect(
+            host=settings.mysql.host,
+            port=settings.mysql.port,
+            user=settings.mysql.username,
+            password=settings.mysql.password,
+            database=settings.mysql.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT term, formula, synonyms, related_tables FROM t_business_knowledge")
+            rows = cur.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning("Load business knowledge from MySQL failed: %s", e)
+        return []
+
+
+def _split_synonyms(value: str | None) -> list[str]:
+    if not value:
+        return []
+    normalized = value.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def _lexical_business_knowledge_search(query: str, top_k: int) -> list[Document]:
+    """Fallback business recall by matching query against configured term/synonyms."""
+    if not query:
+        return []
+
+    docs = []
+    for row in _load_business_knowledge_from_mysql():
+        term = (row.get("term") or "").strip()
+        synonyms = _split_synonyms(row.get("synonyms"))
+        matched = []
+
+        if term and (term in query or query in term):
+            matched.append(term)
+        for synonym in synonyms:
+            if synonym and (synonym in query or query in synonym):
+                matched.append(synonym)
+
+        if not matched:
+            continue
+
+        score = 1.0 if term in matched else 0.8
+        docs.append(Document(
+            page_content=_business_knowledge_content(row),
+            metadata={
+                "source": "business_knowledge",
+                "doc_id": f"bk_{term}",
+                "score": score,
+                "retriever_source": "mysql_lexical",
+                "matched_terms": matched,
+            },
+        ))
+
+    docs.sort(key=lambda d: (d.metadata.get("score", 0), len(d.metadata.get("matched_terms", []))), reverse=True)
+    return docs[:top_k]
+
+
 def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
     """混合检索业务知识：向量 + BM25 + RRF，过滤无公式/术语的结果。"""
     # 并行：向量检索 + BM25
@@ -683,6 +760,13 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
 
     # 质量过滤：必须包含公式/术语
     filtered = _filter_has_business_term(fused)
+    if len(filtered) < top_k:
+        existing_ids = {d.metadata.get("doc_id", "") for d in filtered}
+        lexical_docs = [
+            d for d in _lexical_business_knowledge_search(query, top_k)
+            if d.metadata.get("doc_id", "") not in existing_ids
+        ]
+        filtered.extend(lexical_docs[: top_k - len(filtered)])
 
     logger.info(
         "Business knowledge recall: vector=%d, es=%d, fused=%d, filtered=%d",
@@ -848,5 +932,4 @@ def get_table_relationships(table_names: list[str]) -> list[dict]:
     except Exception as e:
         logger.warning("get_table_relationships failed: %s", e)
         return []
-
 

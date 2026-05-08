@@ -1,8 +1,11 @@
 """查询端点：意图分类 + 子图调用 + SQL 审批。"""
 
 import logging
-from fastapi import APIRouter
+from typing import AsyncGenerator
+
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from langgraph.types import Command
 
@@ -50,6 +53,9 @@ def _load_chat_history(session_id: str) -> list[dict]:
     history = [{"role": m.role, "content": m.content} for m in session.history]
     if session.summary:
         history.insert(0, {"role": "system", "content": f"[对话摘要] {session.summary}"})
+    sql_context = session.preferences.get("_last_sql_context", "")
+    if sql_context:
+        history.insert(0, {"role": "system", "content": f"[上一轮SQL上下文]\n{sql_context}"})
     logger.info("Loaded chat history for session %s: %d messages", session_id, len(history))
     return history
 
@@ -64,6 +70,23 @@ def _save_qa_to_session(session_id: str, query: str, answer: str) -> None:
         logger.info("Saved Q&A to session %s, history length: %d", session_id, len(session.history))
     except Exception as e:
         logger.warning("Failed to save Q&A to session: %s", e)
+
+
+def _save_sql_context_to_session(session_id: str, query: str, sql: str, answer: str) -> None:
+    """保存最近一次 SQL 查询口径，供追问沿用。"""
+    if not sql:
+        return
+    try:
+        session = get_session(session_id)
+        context = (
+            f"用户问题: {query}\n"
+            f"生成SQL:\n{sql}\n"
+            f"展示结果: {answer}"
+        )
+        session.preferences["_last_sql_context"] = context[:4000]
+        save_session(session_id, session)
+    except Exception as e:
+        logger.warning("Failed to save SQL context to session: %s", e)
 
 
 def _save_pending_query(session_id: str, query: str) -> None:
@@ -84,6 +107,15 @@ def _pop_pending_query(session_id: str) -> str:
         if query:
             save_session(session_id, session)
         return query
+    except Exception:
+        return ""
+
+
+def _get_pending_query(session_id: str) -> str:
+    """读取中断时暂存的 query，不删除。"""
+    try:
+        session = get_session(session_id)
+        return session.preferences.get("_pending_query", "")
     except Exception:
         return ""
 
@@ -109,6 +141,46 @@ def _extract_interrupt(result: dict) -> dict | None:
     if isinstance(value, list) and value:
         value = value[0]
     return value if isinstance(value, dict) else None
+
+
+async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
+    """Resume the graph after SQL approval and convert the result to API response."""
+    graph = build_final_graph()
+    config = _make_config(req.session_id)
+
+    result = await graph.ainvoke(
+        Command(resume={
+            "approved": req.approved,
+            "feedback": req.feedback,
+        }),
+        config=config,
+    )
+
+    interrupt_val = _extract_interrupt(result)
+    if interrupt_val:
+        return QueryResponse(
+            query="",
+            answer=interrupt_val.get("message", "请确认是否执行该 SQL"),
+            status="pending_approval",
+            session_id=req.session_id,
+            pending_approval=True,
+            sql=interrupt_val.get("sql", ""),
+        )
+
+    answer = result.get("answer", "")
+    original_query = _pop_pending_query(req.session_id) or result.get("query", "")
+    sql = result.get("sql", "")
+    if answer and original_query:
+        _save_qa_to_session(req.session_id, original_query, answer)
+        _save_sql_context_to_session(req.session_id, original_query, sql, answer)
+
+    return QueryResponse(
+        query=original_query,
+        answer=answer,
+        status=result.get("status", "completed"),
+        session_id=req.session_id,
+        sql=sql,
+    )
 
 
 @router.post("/classify", response_model=ClassifyResponse)
@@ -168,32 +240,26 @@ async def query_invoke(req: QueryRequest):
         )
 
     answer = result.get("answer", "")
+    sql = result.get("sql", "")
     # 保存本轮 Q&A 到 session
     if answer:
         _save_qa_to_session(req.session_id, req.query, answer)
+        _save_sql_context_to_session(req.session_id, req.query, sql, answer)
 
     return QueryResponse(
         query=req.query,
         answer=answer,
         status=result.get("status", "completed"),
         session_id=req.session_id,
+        sql=sql,
     )
 
 
 @router.post("/approve")
 async def approve_sql(req: ApproveRequest):
     """审批 SQL：继续执行被中断的图。"""
-    graph = build_final_graph()
-    config = _make_config(req.session_id)
-
     try:
-        result = await graph.ainvoke(
-            Command(resume={
-                "approved": req.approved,
-                "feedback": req.feedback,
-            }),
-            config=config,
-        )
+        return await _approve_sql_result(req)
     except Exception as e:
         logger.error("approve_sql failed: %s", e, exc_info=True)
         return QueryResponse(
@@ -203,28 +269,38 @@ async def approve_sql(req: ApproveRequest):
             session_id=req.session_id,
         )
 
-    # 审批后可能再次 interrupt（理论上不会，但防御性处理）
-    interrupt_val = _extract_interrupt(result)
-    if interrupt_val:
-        return QueryResponse(
-            query="",
-            answer=interrupt_val.get("message", "请确认是否执行该 SQL"),
-            status="pending_approval",
-            session_id=req.session_id,
-            pending_approval=True,
-            sql=interrupt_val.get("sql", ""),
-        )
 
-    answer = result.get("answer", "")
-    # 恢复中断时暂存的原始 query
-    original_query = _pop_pending_query(req.session_id) or result.get("query", "")
-    # 保存本轮 Q&A 到 session
-    if answer and original_query:
-        _save_qa_to_session(req.session_id, original_query, answer)
+@router.post("/approve/stream")
+async def approve_sql_stream(req: ApproveRequest, request: Request):
+    """审批 SQL：SSE 返回执行、反思、等待确认等阶段。"""
 
-    return QueryResponse(
-        query=original_query,
-        answer=answer,
-        status=result.get("status", "completed"),
-        session_id=req.session_id,
-    )
+    async def generate() -> AsyncGenerator[dict, None]:
+        try:
+            if not req.approved:
+                yield {"event": "status", "data": "正在提交拒绝意见..."}
+            else:
+                yield {"event": "status", "data": "已确认，正在执行 SQL..."}
+                yield {"event": "status", "data": "如果执行结果异常，系统会自动反思并生成修正 SQL..."}
+
+            result = await _approve_sql_result(req)
+
+            if result.pending_approval:
+                yield {"event": "status", "data": "检测到执行结果异常，已完成反思并生成修正 SQL。"}
+                yield {"event": "status", "data": "请确认是否执行修正后的 SQL。"}
+            else:
+                yield {"event": "status", "data": "SQL 执行完成。"}
+
+            yield {"event": "result", "data": result.model_dump_json()}
+        except Exception as e:
+            logger.error("approve_sql_stream failed: %s", e, exc_info=True)
+            payload = QueryResponse(
+                query="",
+                answer=f"系统错误: {e}",
+                status="error",
+                session_id=req.session_id,
+            )
+            yield {"event": "result", "data": payload.model_dump_json()}
+        finally:
+            yield {"event": "done", "data": "[DONE]"}
+
+    return EventSourceResponse(generate())

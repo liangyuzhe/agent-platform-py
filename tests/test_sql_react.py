@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.documents import Document
 from langchain_core.tools import tool
+from langgraph.graph import END, START, StateGraph
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,32 @@ def _mock_llm_text_response(content="I don't know how to write SQL for that."):
     resp.tool_calls = []
     resp.content = content
     return resp
+
+
+class TestStateReducers:
+    """Test state reducers for parent/child graph merge safety."""
+
+    def test_query_accepts_duplicate_step_updates(self):
+        """Duplicate query writes in one LangGraph step should not fail."""
+        from agents.flow.state import SQLReactState
+
+        def node_a(state):
+            return {"query": "node a query"}
+
+        def node_b(state):
+            return {"query": "node b query"}
+
+        graph = StateGraph(SQLReactState)
+        graph.add_node("node_a", node_a)
+        graph.add_node("node_b", node_b)
+        graph.add_edge(START, "node_a")
+        graph.add_edge(START, "node_b")
+        graph.add_edge("node_a", END)
+        graph.add_edge("node_b", END)
+
+        result = graph.compile().invoke({"query": "去年亏损"})
+
+        assert result["query"] == "去年亏损"
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +158,41 @@ class TestQueryEnhance:
         })
 
         assert result["enhanced_query"] == "查询GMV"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_empty_llm_response_uses_business_knowledge_fallback(self, mock_get_model):
+        """Empty LLM output should still enhance from matched business evidence."""
+        from agents.flow.sql_react import query_enhance
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content=""))
+        mock_get_model.return_value = mock_model
+
+        result = await query_enhance({
+            "query": "去年亏损",
+            "rewritten_query": "去年亏损",
+            "evidence": ["术语: 净利润\n公式: 收入 - 成本 - 费用；亏损表示净利润 < 0\n同义词: 净收益, 盈利, 亏损, 净亏损, 赔钱, 赚钱"],
+            "few_shot_examples": [],
+        })
+
+        assert "净利润" in result["enhanced_query"]
+        assert "收入 - 成本 - 费用" in result["enhanced_query"]
+
+    @pytest.mark.asyncio
+    async def test_no_evidence_returns_original_query(self):
+        """Without evidence, query_enhance should not hard-code business terms."""
+        from agents.flow.sql_react import query_enhance
+
+        result = await query_enhance({
+            "query": "去年亏损",
+            "rewritten_query": "去年亏损",
+            "evidence": [],
+            "few_shot_examples": [],
+        })
+
+        assert result["enhanced_query"] == "去年亏损"
+        assert "净利润" not in result["enhanced_query"]
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.get_chat_model")
@@ -304,6 +366,83 @@ class TestSqlGenerate:
 
         assert result["is_sql"] is True
         assert "SELECT" in result["sql"]
+        assert result["sql"].endswith(";")
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_normalizes_sql_artifacts(self, mock_get_model, mock_format):
+        """sql_generate should strip sentinel tokens and SQL fences."""
+        from agents.flow.sql_react import sql_generate
+
+        raw_sql = """<text_never_used_51bce0c785ca2f68081bfa7d91973934>```sql
+SELECT
+  id
+FROM users
+```"""
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response(raw_sql, True))
+        mock_get_model.return_value = mock_model
+
+        result = await sql_generate({"query": "查询用户", "docs": [_mock_doc()]})
+
+        assert result["is_sql"] is True
+        assert result["sql"].startswith("SELECT")
+        assert "text_never_used" not in result["sql"]
+        assert "```" not in result["sql"]
+        assert result["sql"].endswith(";")
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_strips_closing_sentinel_artifact(self, mock_get_model, mock_format):
+        """sql_generate should strip closing sentinel artifacts after SQL."""
+        from agents.flow.sql_react import sql_generate
+
+        raw_sql = """SELECT SUM(ji.credit_amount - ji.debit_amount) AS 净利润
+FROM t_journal_entry je
+INNER JOIN t_journal_item ji ON je.id = ji.entry_id
+INNER JOIN t_account a ON ji.account_code = a.account_code
+WHERE je.status = '已过账'
+AND je.period >= '2025-01'
+AND je.period <= '2025-12'
+AND a.account_type = '损益'
+HAVING 净利润 < 0;</text_never_used_51bce0c785ca2f68081bfa7d91973934>;"""
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response(raw_sql, True))
+        mock_get_model.return_value = mock_model
+
+        result = await sql_generate({"query": "去年亏损", "docs": [_mock_doc()]})
+
+        assert result["is_sql"] is True
+        assert "text_never_used" not in result["sql"]
+        assert result["sql"].endswith("HAVING 净利润 < 0;")
+        assert not result["sql"].endswith(";;")
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_rejects_truncated_sql(self, mock_get_model, mock_format):
+        """Truncated SQL should not proceed to approval/execution."""
+        from agents.flow.sql_react import sql_generate
+
+        raw_sql = """<text_never_used_51bce0c785ca2f68081bfa7d91973934>SELECT
+  (SUM(credit_amount) - SUM(debit_amount)) AS net_profit
+FROM t_journal_item
+HAVIN"""
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response(raw_sql, True))
+        mock_get_model.return_value = mock_model
+
+        result = await sql_generate({"query": "去年亏损", "docs": [_mock_doc()]})
+
+        assert result["is_sql"] is False
+        assert result["error"] == "invalid_sql_format"
+        assert "不完整" in result["answer"]
+        assert "text_never_used" not in result["answer"]
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.create_format_tool")
@@ -376,6 +515,81 @@ class TestSqlGenerate:
         assert "t_user schema" in system_msg
         assert "t_department schema" in system_msg
         assert "t_role schema" in system_msg
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_uses_enhanced_query(self, mock_get_model, mock_format):
+        """sql_generate should pass enhanced_query to the LLM when present."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response("SELECT 1;", True))
+        mock_get_model.return_value = mock_model
+
+        state = {
+            "query": "去年亏损",
+            "rewritten_query": "去年亏损",
+            "enhanced_query": "去年亏损（净利润），即净利润为负",
+            "docs": [_mock_doc()],
+        }
+        await sql_generate(state)
+
+        call_args = mock_model.ainvoke.call_args[0][0]
+        human_msg = call_args[1].content
+        assert "净利润为负" in human_msg
+
+    def test_sql_prompt_contains_profit_loss_boundary_rules(self):
+        """SQL prompt should prevent classifying zero net profit as loss."""
+        from agents.flow.sql_react import _build_sql_messages
+
+        messages = _build_sql_messages("亏损多少", "schema", "", "", "", "")
+        system_msg = messages[0].content
+
+        assert "等于 0" in system_msg
+        assert "不要用 ELSE 把 0 归为亏损或盈利" in system_msg
+        assert "亏损金额" in system_msg
+        assert "ABS(净利润)" in system_msg
+
+    def test_sql_prompt_requires_followup_to_reuse_prior_sql_context(self):
+        """Follow-up queries should be instructed to reuse prior SQL semantics."""
+        from agents.flow.sql_react import _build_sql_messages
+
+        messages = _build_sql_messages("亏损多少", "schema", "", "上一轮SQL上下文", "", "")
+        system_msg = messages[0].content
+
+        assert "上一轮 SQL" in system_msg
+        assert "时间范围" in system_msg
+        assert "状态过滤" in system_msg
+        assert "指标计算口径" in system_msg
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_includes_prior_sql_context(self, mock_get_model, mock_format):
+        """SQL generation prompt should include saved prior SQL context."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response("SELECT 1;", True))
+        mock_get_model.return_value = mock_model
+
+        state = {
+            "query": "亏损多少",
+            "rewritten_query": "去年亏损多少",
+            "docs": [_mock_doc()],
+            "chat_history": [{
+                "role": "system",
+                "content": "[上一轮SQL上下文]\n用户问题: 去年亏损\n生成SQL:\nSELECT ... WHERE status = '已过账'\n展示结果: 净利润：0.00",
+            }],
+        }
+        await sql_generate(state)
+
+        system_msg = mock_model.ainvoke.call_args[0][0][0].content
+        assert "上一轮SQL上下文" in system_msg
+        assert "status = '已过账'" in system_msg
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.get_semantic_model_by_tables")
@@ -459,7 +673,7 @@ class TestExecuteSql:
         result = await exec_node({"sql": "SELECT * FROM users"})
 
         assert '[{"id": 1' in result["result"]
-        assert result["answer"] == result["result"]
+        assert result["answer"] == "查询已执行完成。\nid：1\nname：Alice"
 
     @pytest.mark.asyncio
     @patch("agents.tool.sql_tools.mcp_client.execute_sql")
@@ -491,6 +705,84 @@ class TestExecuteSql:
         assert len(result["execution_history"]) == 1
         assert result["execution_history"][0]["error"] is None
 
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_execute_summarizes_result_with_context(self, mock_mcp_execute):
+        """SQL results should be summarized locally using query/schema/evidence context."""
+        from agents.flow.sql_react import execute_sql as exec_node
+
+        mock_mcp_execute.return_value = '[{"is_net_profit_positive":0,"net_profit":"0.00"}]Query execution time: 10.97 ms'
+
+        result = await exec_node({
+            "query": "去年亏损",
+            "sql": "SELECT ...",
+            "docs": [_mock_doc("net_profit [业务名: 净利润] [同义词: 亏损, 净亏损]")],
+            "evidence": ["术语: 净利润\n公式: 亏损表示净利润 < 0\n同义词: 亏损, 净亏损"],
+            "execution_history": [],
+        })
+
+        assert result["result"].startswith('[{"is_net_profit_positive"')
+        assert result["answer"] == "查询已执行完成。\n是否亏损：否\n净利润：0.00"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_execute_quantity_followup_uses_query_term_label(self, mock_mcp_execute):
+        """Quantity follow-up should use the matched user term instead of stale SQL alias."""
+        from agents.flow.sql_react import execute_sql as exec_node
+
+        mock_mcp_execute.return_value = '[{"去年净利润":"0.00"}]Query execution time: 10.97 ms'
+
+        result = await exec_node({
+            "query": "亏损多少",
+            "rewritten_query": "去年亏损多少",
+            "sql": "SELECT ROUND(SUM(x), 2) AS 去年净利润 FROM t;",
+            "docs": [_mock_doc("net_profit [业务名: 净利润] [同义词: 亏损, 净亏损]")],
+            "evidence": ["术语: 净利润\n公式: 亏损表示净利润 < 0\n同义词: 亏损, 净亏损"],
+            "execution_history": [],
+        })
+
+        assert result["answer"] == "查询已执行完成。\n亏损金额：0.00"
+
+
+class TestResultAnomaly:
+    """Test suspicious execution result detection and reflection."""
+
+    def test_detect_empty_and_null_results(self):
+        from agents.flow.sql_react import _result_anomaly_reason
+
+        assert "空集" in _result_anomaly_reason("[]")
+        assert "空集" in _result_anomaly_reason('{"rows": []}')
+        assert "空集" in _result_anomaly_reason('{"columns": ["net_profit"], "rows": []}')
+        assert "空集" in _result_anomaly_reason('{"data": []}')
+        assert "空集" in _result_anomaly_reason('{"result": []}')
+        assert "NULL" in _result_anomaly_reason('[{"净利润": null}]')
+        assert "NULL" in _result_anomaly_reason('[{"净利润": null, "是否亏损": "否"}]')
+        assert "NULL" in _result_anomaly_reason('{"rows": [[null]]}')
+        assert "NULL" in _result_anomaly_reason('{"rows": [{"净利润": ""}]}')
+        assert _result_anomaly_reason('[{"净利润": -10}]') is None
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_result_reflection_generates_sql(self, mock_get_model):
+        from agents.flow.sql_react import result_reflection
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="SELECT COALESCE(SUM(x), 0) AS net_profit FROM t;"))
+        mock_get_model.return_value = mock_model
+
+        result = await result_reflection({
+            "query": "去年亏损",
+            "sql": "SELECT SUM(x) AS net_profit FROM t HAVING net_profit < 0;",
+            "result": '[{"net_profit": null}]',
+            "docs": [_mock_doc()],
+            "retry_count": 0,
+        })
+
+        assert result["is_sql"] is True
+        assert result["error"] is None
+        assert result["sql"] == "SELECT COALESCE(SUM(x), 0) AS net_profit FROM t;"
+        assert result["retry_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Graph structure
@@ -516,6 +808,7 @@ class TestBuildSqlReactGraph:
         assert "approve" in node_names
         assert "execute_sql" in node_names
         assert "error_analysis" in node_names
+        assert "result_reflection" in node_names
         assert "query_enhance" in node_names
         assert "recall_evidence" in node_names
 
@@ -620,6 +913,37 @@ class TestErrorAnalysis:
         result = await error_analysis(state)
 
         assert result["retry_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Business knowledge recall
+# ---------------------------------------------------------------------------
+
+class TestBusinessKnowledgeRecall:
+    """Test business knowledge fallback recall."""
+
+    @patch("agents.rag.retriever._load_business_knowledge_from_mysql")
+    @patch("agents.rag.retriever._es_bm25_search")
+    @patch("agents.rag.retriever._milvus_vector_search")
+    def test_synonym_lexical_fallback(self, mock_vector, mock_es, mock_load_bk):
+        """When vector/BM25 miss, configured synonyms should recall business knowledge."""
+        from agents.rag.retriever import recall_business_knowledge
+
+        mock_vector.return_value = []
+        mock_es.return_value = []
+        mock_load_bk.return_value = [{
+            "term": "净利润",
+            "formula": "收入 - 成本 - 费用；亏损表示净利润 < 0",
+            "synonyms": "净收益, 盈利, 亏损, 净亏损, 赔钱, 赚钱",
+            "related_tables": "t_journal_item,t_account,t_expense_claim",
+        }]
+
+        docs = recall_business_knowledge("去年亏损", top_k=5)
+
+        assert len(docs) == 1
+        assert "术语: 净利润" in docs[0].page_content
+        assert docs[0].metadata["retriever_source"] == "mysql_lexical"
+        assert "亏损" in docs[0].metadata["matched_terms"]
 
 
 # ---------------------------------------------------------------------------

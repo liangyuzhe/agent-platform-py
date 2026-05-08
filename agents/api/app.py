@@ -1,6 +1,8 @@
 """FastAPI 应用入口。"""
 
 from contextlib import asynccontextmanager
+import asyncio
+import os
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +12,20 @@ from agents.api.routers import chat, rag, query, document, admin
 from agents.config.settings import settings
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+async def _run_startup_check(name: str, func, logger):
+    """Run blocking startup checks with a short timeout so UI/API can boot."""
+    timeout = float(os.getenv("STARTUP_CHECK_TIMEOUT", "3"))
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(func),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        logger.warning("%s startup check timed out after %.1fs; continuing startup", name, timeout)
+    except Exception as e:
+        logger.warning("%s startup check failed: %s", name, e)
 
 
 @asynccontextmanager
@@ -29,14 +45,14 @@ async def lifespan(app: FastAPI):
     await init_redis()
 
     # 初始化 Milvus 连接（pymilvus 兼容 patch + 连接验证）
-    _init_milvus(logger)
+    await _run_startup_check("Milvus", lambda: _init_milvus(logger), logger)
 
     # 确保 MySQL 表存在
     try:
         from agents.tool.storage.doc_metadata import ensure_doc_metadata_table
-        ensure_doc_metadata_table()
+        await _run_startup_check("doc_metadata", ensure_doc_metadata_table, logger)
     except Exception as e:
-        logger.warning("Failed to ensure doc_metadata table: %s", e)
+        logger.warning("Failed to schedule doc_metadata table check: %s", e)
 
     # 初始化模型
     init_chat_models()

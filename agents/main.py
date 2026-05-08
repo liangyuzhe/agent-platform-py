@@ -2,6 +2,7 @@
 
 import logging
 import logging.config
+import os
 import uvicorn
 
 # Uvicorn log config extended with application loggers
@@ -31,13 +32,14 @@ _LOG_CONFIG = {
 
 
 def main():
+    reload_enabled = os.getenv("UVICORN_RELOAD", "").lower() in {"1", "true", "yes", "on"}
     uvicorn.run(
         "agents.api.app:app",
-        host="0.0.0.0",
-        port=8080,
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", "8080")),
         log_level="info",
         log_config=_LOG_CONFIG,
-        reload=True,
+        reload=reload_enabled,
     )
 
 

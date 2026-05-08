@@ -139,10 +139,12 @@ async def sql_react(state: FinalGraphState, config=None) -> dict:
     """SQL React 子图。"""
     from agents.flow.sql_react import build_sql_react_graph
     sql_graph = build_sql_react_graph()
+    query = state.get("query", "")
     result = await sql_graph.ainvoke(
         {
-            "query": state["query"],
+            "query": query,
             "rewritten_query": state.get("rewritten_query", ""),
+            "chat_history": state.get("chat_history", []),
         },
         config=config,
     )

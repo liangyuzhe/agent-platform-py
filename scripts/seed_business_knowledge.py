@@ -2,9 +2,14 @@
 
 Usage:
     python -m scripts.seed_business_knowledge
+
+Optionally override the seed file:
+    BUSINESS_KNOWLEDGE_SEED_FILE=/path/to/business_knowledge.json python -m scripts.seed_business_knowledge
 """
 
 import asyncio
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +17,8 @@ import pymysql
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agents.config.settings import settings
+
+_DEFAULT_SEED_FILE = Path(__file__).resolve().parents[1] / "data" / "business_knowledge_seed.json"
 
 
 def get_conn():
@@ -43,27 +50,24 @@ def create_table(conn):
     print("t_business_knowledge table created")
 
 
+def load_seed_records() -> list[dict]:
+    seed_file = Path(os.getenv("BUSINESS_KNOWLEDGE_SEED_FILE", str(_DEFAULT_SEED_FILE))).expanduser()
+    with seed_file.open("r", encoding="utf-8") as f:
+        records = json.load(f)
+    if not isinstance(records, list):
+        raise ValueError(f"Business knowledge seed file must contain a list: {seed_file}")
+    return records
+
+
 def seed_data(conn):
-    records = [
-        ("毛利率", "(SUM(credit_amount) - SUM(debit_amount)) / SUM(credit_amount) * 100 WHERE account_type='损益'", "gross margin, 毛利比率", "t_journal_item,t_account"),
-        ("净利率", "(收入 - 成本 - 费用) / 收入 * 100", "net margin, 净利润比率", "t_journal_item,t_account,t_expense_claim"),
-        ("预算执行率", "actual_amount / budget_amount * 100", "预算完成率, 执行进度, 执行比例", "t_budget"),
-        ("预算差异", "actual_amount - budget_amount", "预算偏差, 超支金额", "t_budget"),
-        ("资产负债率", "负债总额 / 资产总额 * 100", "负债率, 杠杆率", "t_account"),
-        ("应收账款周转率", "收入 / 平均应收账款", "应收周转, 回款效率", "t_receivable_payable,t_journal_item"),
-        ("应收逾期率", "逾期应收金额 / 应收总额 * 100", "逾期比例, 坏账率", "t_receivable_payable"),
-        ("费用总额", "SUM(total_amount) FROM t_expense_claim WHERE status IN ('已审批','已付款')", "总费用, 费用合计, 报销总额", "t_expense_claim"),
-        ("部门费用", "SUM(total_amount) GROUP BY cost_center_id", "各部门费用, 部门开销", "t_expense_claim,t_cost_center"),
-        ("凭证过账率", "COUNT(CASE WHEN status='已过账' THEN 1 END) / COUNT(*) * 100", "过账比例", "t_journal_entry"),
-        ("发票认证率", "COUNT(CASE WHEN verification_status='已认证' THEN 1 END) / COUNT(*) * 100 WHERE direction='进项'", "认证比例, 抵扣率", "t_invoice"),
-        ("资金划转频率", "COUNT(*) / 天数", "转账频次, 划款频率", "t_fund_transfer"),
-        ("固定资产净值率", "(acquisition_cost - accumulated_depreciation) / acquisition_cost * 100", "资产新旧程度", "t_fixed_asset"),
-        ("制证人工作量", "COUNT(*) GROUP BY prepared_by", "凭证制作量, 制单统计", "t_journal_entry"),
-        ("科目余额", "SUM(debit_amount) - SUM(credit_amount) GROUP BY account_code", "账户余额, 科目结余", "t_journal_item,t_account"),
-    ]
+    records = load_seed_records()
 
     with conn.cursor() as cur:
-        for term, formula, synonyms, related_tables in records:
+        for item in records:
+            term = item["term"]
+            formula = item["formula"]
+            synonyms = item.get("synonyms", "")
+            related_tables = item.get("related_tables", "")
             cur.execute(
                 """INSERT INTO t_business_knowledge (term, formula, synonyms, related_tables)
                    VALUES (%s, %s, %s, %s)

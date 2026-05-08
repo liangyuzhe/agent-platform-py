@@ -6,6 +6,13 @@ from langgraph.graph import add_messages
 from langchain_core.documents import Document
 
 
+def keep_existing_query(current: str | None, incoming: str | None) -> str:
+    """Keep query stable when parent/child graph state is merged in one step."""
+    if current:
+        return current
+    return incoming or ""
+
+
 class RAGChatState(TypedDict):
     """RAG Chat 图的状态。"""
     input: dict                                  # {"session_id": str, "query": str, "rag_mode"?: str}
@@ -21,7 +28,7 @@ class RAGChatState(TypedDict):
 
 class SQLReactState(TypedDict):
     """SQL React 图的状态。"""
-    query: str                                   # 当前用户问题（可能是代词化的）
+    query: Annotated[str, keep_existing_query]   # 当前用户问题（可能是代词化的）
     rewritten_query: str                         # 上下文化后的独立问题
     enhanced_query: str                          # 业务术语增强后的查询
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
@@ -42,6 +49,7 @@ class SQLReactState(TypedDict):
     error: str | None                            # SQL 执行错误信息
     retry_count: int                             # 重试次数
     execution_history: list[dict]                # 执行历史 [{sql, result, error}]
+    reflection_notice: str                       # 结果异常反思提示
 
 
 class AnalystState(TypedDict):
@@ -56,7 +64,7 @@ class AnalystState(TypedDict):
 
 class FinalGraphState(TypedDict):
     """主调度图的状态。"""
-    query: str
+    query: Annotated[str, keep_existing_query]
     session_id: str
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat

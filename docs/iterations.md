@@ -1372,3 +1372,287 @@ Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT) and (utf8mb4_general_ci,
 
 - mysql2 的 `charset` 选项同时控制字符集和 collation
 - 设置 `MYSQL_CHARSET` 环境变量确保即使 npx 缓存清除后修复仍生效
+
+---
+
+## Iteration 21：NL2SQL 增强稳定性 + 异常结果反思
+
+### 出现了什么问题
+
+SQL Agent 在处理类似“去年亏损”的查询时暴露了几类问题：
+
+1. `query_enhance` 依赖 LLM 输出，LLM 空响应时直接退回原 query，业务术语增强不稳定。
+2. 业务知识召回只依赖向量/BM25，口语化同义词（如“亏损”）召回不到时，增强链路无法使用 `t_business_knowledge`。
+3. LLM 生成的 SQL 可能带有异常 token、Markdown 代码块、尾部截断关键字（如 `HAVIN`）或多余分号。
+4. SQL 执行成功但结果异常（空集、NULL、包装结构中的 `rows: []` 等）时，原流程直接结束，无法自我修正。
+5. 结果异常后反思生成修正 SQL，会再次触发审批；如果前端没有明确过程提示，用户会以为同一条 SQL 被重复审批。
+6. approve 恢复父图时，缺失 `query` 会报 `KeyError: 'query'`；补回 `query` 后若节点同一步再次写入 `query`，会触发 LangGraph `INVALID_CONCURRENT_GRAPH_UPDATE`。
+
+### 为什么要解决
+
+- NL2SQL 的错误不只来自 SQL 执行异常，也可能来自“结果可执行但语义不可信”。
+- 业务口径应来自可配置业务知识，而不是在代码里硬编码某个 query 的词表。
+- 审批是用户交互节点，自动反思和二次确认必须让用户看见过程，否则体验上像“重复弹窗”。
+- LangGraph 恢复时状态字段要稳定，避免 approve 后在父图/子图之间丢上下文。
+
+### 怎么解决
+
+**1. 业务知识驱动的 query_enhance**
+
+- 移除 `_PROFIT_LOSS_HINTS`、`去年` 等 case 级硬编码。
+- `query_enhance` 只解析召回到的业务知识 evidence：`术语`、`公式/定义`、`同义词`。
+- `recall_business_knowledge` 增加 MySQL 词典兜底：当 Milvus/ES 未召回足够结果时，从 `t_business_knowledge.term/synonyms` 做通用同义词匹配。
+- 业务词扩展通过维护 `t_business_knowledge` 完成，不再改代码。
+
+**2. SQL 输出格式化与校验**
+
+- 新增 `normalize_sql_answer()`，统一处理：
+  - `<text_never_used_...>` / `</text_never_used_...>` 异常 token
+  - Markdown SQL 代码块
+  - SQL 前的解释性文本
+  - 尾部多余分号
+  - 截断关键字（如 `HAVIN`、`WHERE`、`AND`、`GROUP BY`）
+  - 括号不匹配、非 `SELECT/WITH` 开头
+- `sql_generate` 和 `result_reflection` 都显式调用本地 formatter，不能只依赖 LLM tool schema。
+- 格式不合法时返回 `is_sql=False`，不进入审批/执行。
+
+**3. 执行结果异常检测 + 反思修正**
+
+- 新增 `_result_anomaly_reason()`，识别：
+  - 裸 `[]`
+  - `{"rows": []}`、`{"data": []}`、`{"result": []}`、`{"items": []}`
+  - `{"columns": [...], "rows": []}`
+  - `null` / `None`
+  - 结构化结果中全字段为 `NULL` 或空字符串
+  - 原始结果字符串中包含 `null` 或 `[]` 的可疑信号
+- 新增 `result_reflection` 节点：执行成功但结果异常时，LLM 直接反思并生成修正后的 SQL。
+- 反思后的 SQL 不再回到 `sql_generate`，而是走：
+
+```text
+execute_sql -> result_reflection -> safety_check -> approve -> execute_sql
+```
+
+这样避免“反思节点给建议，再让 sql_generate 再生成一次”的重复生成。
+
+**4. 审批与 SSE 体验**
+
+- `approve` 对反思后的 SQL 使用不同 interrupt 文案：
+
+```text
+上次执行结果疑似异常，系统已反思并生成修正后的 SQL。请确认是否执行修正后的 SQL？
+```
+
+- 新增 `POST /api/query/approve/stream`：
+  - 审批后推送“已确认，正在执行 SQL...”
+  - 推送“如果执行结果异常，系统会自动反思并生成修正 SQL...”
+  - 若再次进入审批，推送“检测到执行结果异常，已完成反思并生成修正 SQL”
+  - 最后通过 `result` 事件返回 `QueryResponse`
+- 前端 SQL Agent 审批按钮改为读取 SSE，显示带动画的进度行，再渲染最终结果或修正 SQL 审批卡片。
+
+**5. approve 恢复状态修复**
+
+- SQL 审批中断时仍暂存原始 query。
+- approve 恢复时只发送 `Command(resume=...)`：
+
+```python
+Command(resume={
+    "approved": req.approved,
+    "feedback": req.feedback,
+})
+```
+
+- `sql_react` 子图不再返回 `query`，减少父图/子图状态合并时的重复写入。
+- `FinalGraphState.query` 和 `SQLReactState.query` 增加 `Annotated[..., keep_existing_query]` reducer。父图和 SQL 子图在 approve/resume 后若同一步携带 `query`，保留已有原始 query，避免 LangGraph `INVALID_CONCURRENT_GRAPH_UPDATE`。
+- approve 完成后仍通过 session preference 中暂存的 `_pending_query` 恢复原始问题，用于保存本轮 Q&A；不再把 query 写入 graph update。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/flow/sql_react.py` | `query_enhance` 改为 evidence 驱动；新增结果异常检测和 `result_reflection`；反思 SQL 直接走 `safety_check`；approve 文案区分修正 SQL |
+| `agents/rag/retriever.py` | 业务知识召回增加 MySQL term/synonyms 兜底 |
+| `agents/model/format_tool.py` | 新增 `normalize_sql_answer()`；format tool 内部也执行 SQL 清洗校验 |
+| `agents/api/routers/query.py` | 新增 `/approve/stream`；approve 恢复只使用 `Command(resume=...)`；pending query 仅用于最终 Q&A 保存 |
+| `agents/static/index.html` | SQL 审批改为 SSE 进度展示；反思后修正 SQL 显示明确状态 |
+| `agents/flow/state.py` | 新增 `reflection_notice` 状态字段；`query` 增加 `keep_existing_query` reducer |
+| `scripts/seed_business_knowledge.py` | 补充“净利润”业务知识及口语化同义词 |
+| `tests/test_sql_react.py` | 覆盖 SQL formatter、空/NULL 结果异常、result_reflection 直接生成 SQL |
+| `tests/test_final_api.py` | 覆盖 approve 恢复状态和 approve SSE 流式事件 |
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| LLM query_enhance 空响应 | 退回原 query | 使用召回到的业务知识做确定性增强 |
+| 业务同义词召回失败 | 只能依赖向量/BM25 | MySQL `term/synonyms` 兜底召回 |
+| SQL 带异常 token | 可能进入审批/执行 | formatter 清理或拦截 |
+| SQL 尾部截断 | 可能执行失败或报错不清晰 | 本地识别为 invalid SQL |
+| SQL 执行返回 `[]` / `NULL` | 直接结束 | 进入 `result_reflection` 生成修正 SQL |
+| 反思后 SQL | 先给建议再进 `sql_generate` | 直接生成修正 SQL，走安全检查和审批 |
+| 二次审批体验 | 用户只看到又弹出 SQL | SSE 展示执行、异常检测、反思、修正 SQL 确认 |
+| approve 恢复缺 query | 报 `KeyError: 'query'` | approve resume 不依赖写回 query；最终保存从 `_pending_query` 取原始问题 |
+| 重复写 query | 触发 LangGraph 并发写错误 | 子图不返回 `query`，且 `query` 字段使用 reducer 保留已有值 |
+
+---
+
+## Iteration 22：追问场景 SQL 口径继承
+
+### 出现了什么问题
+
+连续追问时，第二轮 SQL 可能和第一轮 SQL 口径不一致。例如第一轮问“去年亏损”，第二轮问“亏损多少”：
+
+- 第一轮可能使用 `je.status = '已过账'`
+- 第二轮可能改成 `je.status IN ('已审核','已过账')`
+- 第一轮可能用简单借贷发生额差额
+- 第二轮可能改用 `balance_direction` 公式
+- 第一轮字段别名是“净利润/盈亏状态”
+- 第二轮又回到“去年净利润”
+
+这些 SQL 都可能能执行，但语义口径已经漂移，用户看到的结果会互相矛盾。
+
+### 根因
+
+- 外层 `classify_intent` 读取了 session history，但 `dispatcher.sql_react` 只把 `query` 和 `rewritten_query` 传给 SQL React 子图，没有传 `chat_history`。
+- SQL 执行完成后只保存了自然语言 answer，没有保存上一轮 SQL 的时间范围、状态过滤、JOIN、指标公式、排除条件等口径信息。
+- 后续追问进入 `sql_generate` 时缺少上一轮 SQL 上下文，LLM 会重新推断口径，因此发生状态过滤和公式漂移。
+
+### 解决方案
+
+**1. 保存最近一次 SQL 口径**
+
+SQL 执行完成后，将以下内容写入 session preference 的 `_last_sql_context`：
+
+```text
+用户问题
+生成 SQL
+展示结果
+```
+
+这不是对业务问题硬编码，而是保存当前会话中已经确认执行过的 SQL 口径。
+
+**2. 加载会话时注入 SQL 上下文**
+
+`_load_chat_history()` 会把 `_last_sql_context` 注入为 system message：
+
+```text
+[上一轮SQL上下文]
+用户问题: ...
+生成SQL:
+...
+展示结果: ...
+```
+
+**3. SQL 子图接收 chat_history**
+
+`dispatcher.sql_react` 调用 SQL React 子图时传入 `chat_history`，让 SQL 生成节点能看到上一轮 SQL 口径。
+
+**4. Prompt 明确追问继承规则**
+
+`sql_generate` prompt 增加规则：
+
+- 如果上下文中提供了上一轮 SQL，且用户是在追问或省略表达，必须沿用上一轮的时间范围、状态过滤、表连接、指标计算口径和排除条件。
+- 除非用户明确要求变更口径。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `agents/api/routers/query.py` | 保存 `_last_sql_context`；加载 history 时注入上一轮 SQL 上下文 |
+| `agents/flow/dispatcher.py` | 调用 SQL React 子图时传入 `chat_history` |
+| `agents/flow/sql_react.py` | SQL 生成 prompt 加入追问继承规则；把上一轮 SQL 上下文放入生成上下文 |
+| `tests/test_final_api.py` | 覆盖 SQL 上下文保存与加载 |
+| `tests/test_sql_react.py` | 覆盖 prompt 约束和 SQL 上下文注入 |
+
+### 优化效果
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| “去年亏损”后追问“亏损多少” | 第二轮重新推断 SQL 口径 | 第二轮沿用上一轮时间范围、状态过滤和指标公式 |
+| 状态过滤 | 可能从 `已过账` 漂移到 `已审核/已过账` | 默认继承上一轮状态过滤 |
+| 指标公式 | 可能换公式 | 默认继承上一轮指标计算口径 |
+| 用户明确改口径 | 不确定 | 用户明确要求时允许变更 |
+
+---
+
+## Iteration 23：上一年度亏损测试数据补齐
+
+### 出现了什么问题
+
+用户执行“去年亏损”相关 SQL 时，最终结果仍然是 0：
+
+- `net_profit = 0.00`
+- `profit_status = 不盈不亏`
+- `loss_amount = 0`
+
+这不是 SQL 执行异常，而是测试数据缺口。
+
+### 根因
+
+- `scripts.seed_financial` 只生成最近 6 个月数据，按当前日期查询上一年度时可能没有完整年度数据。
+- 随机记账凭证只从前 15 个科目里抽样，里面没有 `6001`、`6401`、`5401` 等损益类科目。
+- 因此按 `status = '已过账'`、`account_type = '损益'`、上一年度期间过滤时，收入、成本、费用都可能没有发生额，结果自然为 0。
+
+### 解决方案
+
+在 `scripts.seed_financial` 中补充可重复刷新的上一年度亏损场景：
+
+- 每次 seed 先删除同年度 `LOSS-YYYY-*` 测试凭证，避免重复累加。
+- 重新插入上一年度 12 个月已过账凭证。
+- 每月包含主营业务收入、主营业务成本、期间费用三类分录。
+- 每张凭证借贷平衡，损益科目与银行存款科目配平。
+- 年度合计保证成本和费用大于收入，使净利润为负、亏损金额为正。
+
+这是测试数据造数，不是运行时 query 规则硬编码。SQL Agent 仍然通过 schema、语义模型、业务知识和对话上下文生成 SQL。
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `scripts/seed_financial.py` | 新增 `seed_prior_year_loss_scenario()`，写入稳定的上一年度亏损凭证 |
+| `README.md` | 初始化脚本教程说明 `seed_financial` 包含可重复刷新的亏损测试数据 |
+
+### 验证口径
+
+执行 `python -m scripts.seed_financial` 后，用上一年度、已过账、损益类科目过滤，收入减成本减费用应返回负数；“亏损多少”应返回正的亏损金额。
+
+---
+
+## Iteration 24：清理遗留 mysql_schema 向量索引
+
+### 出现了什么问题
+
+Milvus 中仍然存在 `source=mysql_schema` 的历史 schema 文档。当前 SQL Agent 的候选表选择和 schema 加载已经改为 Redis/MySQL：
+
+- 候选表：`load_full_table_metadata()`，优先 Redis，miss 后查 MySQL `information_schema.tables`
+- 字段 schema：`get_semantic_model_by_tables()`，优先 Redis，miss 后查 MySQL `t_semantic_model`
+
+因此这些旧向量记录不再参与 SQL 生成，但会造成维护和排查上的混淆。
+
+### 解决方案
+
+- `scripts.seed_financial` 不再执行 schema re-index。
+- `scripts.seed_all` 不再执行 `schema_indexer.index_mysql_schemas()`。
+- 新增 `scripts.cleanup_schema_indexes`，一次性删除 Milvus/ES 中 `source=mysql_schema` 的历史记录。
+- README 初始化脚本说明同步更新：schema 数据统一由 MySQL/Redis 提供，Milvus/ES 只保留业务知识、SQL few-shot 和用户文档等非结构化检索数据。
+
+### 检索分工
+
+| 数据类型 | 权威来源/缓存 | 检索方式 | 原因 |
+|----------|---------------|----------|------|
+| 表名、表注释 | MySQL `information_schema.tables`；Redis `schema:table_metadata` 缓存 | 精确加载全量表元数据，再让 LLM 精选候选表 | 表元数据必须完整实时，向量召回可能漏表 |
+| 字段 schema、业务名、同义词、字段描述 | MySQL `t_semantic_model`；Redis `schema:semantic_model:<table>` 缓存 | 按选中表精确加载 | SQL 生成需要精确字段、类型、PK/FK 和业务描述 |
+| 表关系/JOIN 关系 | `information_schema.key_column_usage` + `t_semantic_model` 逻辑外键 | 按表名精确查询 | JOIN 条件不能靠语义相似度猜测 |
+| 业务知识 | MySQL `t_business_knowledge` + Milvus `business_knowledge` + ES `business_knowledge` | Milvus 向量 + ES BM25 + RRF；MySQL term/synonyms 字符匹配兜底 | 业务表达有同义词和口语化说法，需要语义召回和关键词召回结合 |
+| SQL few-shot | MySQL `t_agent_knowledge` + Milvus `agent_knowledge` + ES `agent_knowledge` | Milvus 向量 + ES BM25 + RRF，过滤无 SQL 内容 | 用相似问题和关键词命中补充 SQL 写法示例 |
+| 用户上传文档 | Milvus/ES 文档索引 | 向量/关键词检索 + 重排 | 文档是非结构化文本，适合 RAG 检索 |
+| 会话、checkpoint、schema 缓存、领域摘要缓存 | Redis | key-value 精确读写 | 高频状态数据需要低延迟缓存 |
+| 业务明细数据 | MySQL 业务表 | 审批后的 SELECT SQL 执行 | MySQL 是业务事实数据的权威来源 |
+
+### 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `scripts/seed_financial.py` | 去掉 schema re-index 调用 |
+| `scripts/seed_all.py` | 去掉第 5 步 schema re-index |
+| `scripts/cleanup_schema_indexes.py` | 新增历史 `mysql_schema` 索引清理脚本 |
+| `README.md` | 更新 seed 流程和清理脚本说明 |

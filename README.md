@@ -121,9 +121,11 @@ financial-copilot-platform/
 ├── tests/                          # 测试
 ├── docs/                           # 技术文档
 │   ├── iterations.md               # 迭代优化记录
-│   └── python_langchain_design.md  # Python 版设计文档
+│   └── resilience_design.md        # 熔断降级与 Fallback 设计
+├── python_langchain_design.md       # 技术设计文档
 │
 └── data/                           # 数据目录
+    ├── business_knowledge_seed.json # 可配置业务知识种子
     └── sft/                        # SFT 训练数据
 ```
 
@@ -206,6 +208,98 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 | Admin | http://localhost:8080/ | 语义模型 / 业务知识 / 智能体知识管理（Tab 4） |
 | API 文档 | http://localhost:8080/docs | Swagger UI |
 | 健康检查 | http://localhost:8080/health | 服务状态 |
+
+## 初始化脚本教程
+
+这些脚本用于把 NL2SQL 需要的“数据、语义、业务口径、SQL 示例”准备好。代码只负责加载和同步，具体业务口径应放在 MySQL 或 seed 配置文件里，不应写在查询逻辑里。
+
+### 推荐顺序
+
+全新环境建议直接执行总入口：
+
+```bash
+python -m scripts.seed_all
+```
+
+它会按顺序执行：
+
+1. `seed_financial`：创建财务测试业务表并写入样例数据。
+2. `seed_semantic_model`：初始化 `t_semantic_model`，同步字段类型、注释、主键、外键和业务映射。
+3. `seed_business_knowledge`：把业务术语、公式、同义词写入 `t_business_knowledge`，并索引到 Milvus/ES。
+4. `seed_agent_knowledge`：写入 SQL Q&A few-shot 示例，并索引到 Milvus/ES。
+
+### 脚本说明
+
+| 脚本 | 为什么执行 | 写入/影响 | 什么时候执行 |
+|------|------------|-----------|--------------|
+| `scripts.seed_financial` | 准备本地演示和测试数据，否则 SQL Agent 没有业务表可查 | 创建 `t_account`、`t_journal_entry`、`t_journal_item` 等财务表和样例数据；包含可重复刷新的上一年度已过账亏损场景 | 首次搭建、重置测试库、验证“去年亏损/亏损多少” |
+| `scripts.seed_semantic_model` | 让 NL2SQL 理解字段业务含义，而不只看到物理字段名 | 创建/更新 `t_semantic_model`，从 `information_schema` 同步技术 schema，并写入业务名/同义词/描述 | 表结构变更后、首次搭建 |
+| `scripts.seed_business_knowledge` | 提供业务术语、公式、同义词，例如“亏损”对应某个业务口径 | 创建/更新 `t_business_knowledge`，并写入 Milvus/ES 检索索引 | 业务口径变更后、首次搭建 |
+| `scripts.seed_agent_knowledge` | 提供 SQL few-shot 示例，帮助 LLM 学习项目内常见 SQL 写法 | 创建/更新 `t_agent_knowledge`，并写入 Milvus/ES 检索索引 | 新增高质量 SQL 示例后 |
+| `scripts.seed_all` | 一键完成完整初始化，减少漏跑脚本 | 顺序执行以上脚本；schema 只进入 MySQL/Redis，不再写入 Milvus/ES | 全新环境优先使用 |
+| `scripts.cleanup_schema_indexes` | 清理旧版本遗留的 schema 向量索引 | 删除 Milvus/ES 中 `source=mysql_schema` 的历史记录 | 升级到 MySQL/Redis schema 检索后执行一次 |
+
+### 单独执行
+
+```bash
+# 1. 只创建财务测试表和样例数据
+python -m scripts.seed_financial
+
+# 2. 只同步语义模型
+python -m scripts.seed_semantic_model
+
+# 3. 只同步业务知识
+python -m scripts.seed_business_knowledge
+
+# 4. 只同步 SQL few-shot 示例
+python -m scripts.seed_agent_knowledge
+
+# 5. 清理旧 schema 向量索引（升级后执行一次）
+python -m scripts.cleanup_schema_indexes
+```
+
+`scripts.seed_financial` 会额外写入一组 `LOSS-YYYY-*` 凭证，用于稳定验证“去年亏损”“亏损多少”等 NL2SQL 场景。脚本每次执行都会先清理同年度旧的 `LOSS-YYYY-*` 凭证，再重新插入上一年度 12 个月的已过账收入、成本、费用分录，避免重复累加。该数据只用于测试库造数，不参与运行时 SQL 生成逻辑。
+
+### 业务知识配置
+
+默认业务知识来自：
+
+```bash
+data/business_knowledge_seed.json
+```
+
+这个文件是可配置数据，不是运行逻辑。修改业务术语、公式、同义词后，重新执行：
+
+```bash
+python -m scripts.seed_business_knowledge
+```
+
+如果不同项目有不同业务口径，不要改 Python 脚本，指定自己的 JSON 文件：
+
+```bash
+BUSINESS_KNOWLEDGE_SEED_FILE=/path/to/business_knowledge.json \
+  python -m scripts.seed_business_knowledge
+```
+
+JSON 格式：
+
+```json
+[
+  {
+    "term": "业务术语",
+    "formula": "公式或口径说明",
+    "synonyms": "同义词1, 同义词2",
+    "related_tables": "t_table_a,t_table_b"
+  }
+]
+```
+
+### 执行前提
+
+- MySQL、Milvus、Elasticsearch 已启动。
+- `.env` 里配置了 MySQL、Embedding 模型、Milvus、ES。
+- `seed_business_knowledge` 和 `seed_agent_knowledge` 需要 Embedding 配置可用，因为会写向量索引。
+- 如果只想先打开前端和 API，可以先启动服务；但 SQL Agent 的业务增强和 few-shot 质量依赖这些 seed 数据。
 
 ## API 接口
 
@@ -343,18 +437,95 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 ```
 contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → sql_generate
      (代词消解)         (业务知识+few-shot)  (术语翻译)      (LLM选表)    (MySQL语义模型)              (SQL生成+补表)
+     → safety_check → approve → execute_sql
+          (安全检查)     (人工审批)     (MCP执行)
 ```
 
 **核心流程**：
 1. **代词消解**：结合对话历史将"他"→"zhangsan01"
 2. **证据检索**：并行检索业务知识（公式/术语）+ 智能体知识（SQL 示例），RRF 融合
-3. **查询增强**：用业务知识翻译术语（GMV → 已支付订单总额）
+3. **查询增强**：基于召回到的业务知识 evidence 翻译术语/同义词；业务知识召回支持 MySQL `term/synonyms` 兜底
 4. **表选择**：从 MySQL `t_semantic_model` 加载表名+描述，LLM 精选
 5. **Schema 加载**：从 `t_semantic_model` 构建含业务映射的 schema 文档
-6. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示
+6. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示；生成结果经 `normalize_sql_answer()` 清洗/校验
 7. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
 
-**自纠错**：执行失败时，`is_retryable()` 判断错误类型，连接类错误自动重试（最多 5 次），语法类错误直接返回。
+### 6. 检索数据源分工
+
+当前项目把“结构化元数据”和“非结构化知识”分开存储，避免用向量库承担精确 schema 查询。
+
+| 数据 | 存储位置 | 检索方式 | 使用节点 | 为什么这样查 |
+|------|----------|----------|----------|--------------|
+| 表名、表注释 | Redis `schema:table_metadata`；miss 后查 MySQL `information_schema.tables` | 精确读取全量候选表，再由 LLM 精选 | `select_tables` | 表名是结构化元数据，要求完整、实时、可解释，不适合靠向量相似度召回 |
+| 字段类型、字段注释、PK/FK、业务名、同义词、业务描述 | Redis `schema:semantic_model:<table>`；miss 后查 MySQL `t_semantic_model` | 按已选表精确加载 | `sql_retrieve`、自动补表 | SQL 生成必须拿到准确字段和关系，Redis 降低延迟，MySQL 作为权威来源 |
+| 表关系、JOIN 关系 | MySQL `t_semantic_model` 的逻辑外键 + `information_schema.key_column_usage` | 按表名精确查询 | `select_tables`、`sql_generate` | JOIN 条件必须确定，不能依赖向量相似度推断 |
+| 业务术语、公式、同义词 | MySQL `t_business_knowledge` + Milvus `source=business_knowledge` + ES `metadata.source=business_knowledge` | Milvus 向量召回 + ES BM25 + RRF；不足时 MySQL term/synonyms 字符匹配兜底 | `recall_evidence`、`query_enhance`、`sql_generate` | 用户表达可能口语化，向量适合语义近似，BM25 适合关键词命中，MySQL 兜底保证配置过的同义词能命中 |
+| SQL few-shot 示例 | MySQL `t_agent_knowledge` + Milvus `source=agent_knowledge` + ES `metadata.source=agent_knowledge` | Milvus 向量召回 + ES BM25 + RRF；过滤不含 SQL 的结果 | `recall_evidence`、`sql_generate` | 示例 SQL 是非结构化知识，向量找相似问题，BM25 命中表名/字段名/指标词 |
+| 用户上传文档 | Milvus/ES 文档索引 | RAG 检索、重排 | RAG Chat 流程 | 文档内容天然非结构化，适合向量语义召回 + 关键词召回 |
+| 会话状态、checkpoint、schema 缓存、领域摘要缓存 | Redis | key-value 精确读取 | API、LangGraph、schema sync | 高频状态数据需要低延迟读写，Redis 作为缓存和会话存储 |
+| 实际业务数据 | MySQL 业务表 | LLM 生成 SELECT，经审批后由 MCP MySQL 执行 | `execute_sql` | MySQL 是业务数据权威来源，SQL 执行前必须经过安全检查和人工确认 |
+
+`source=mysql_schema` 的 Milvus/ES 记录是旧版 schema 向量检索遗留数据。当前 NL2SQL 不再读取这些记录，升级后可执行：
+
+```bash
+python -m scripts.cleanup_schema_indexes
+```
+
+清理后，Milvus/ES 只保留业务知识、SQL few-shot、用户文档等非结构化检索数据；schema 统一由 Redis/MySQL 提供。
+
+**执行后自修正**：
+- 执行失败时，`is_retryable()` 判断错误类型，可重试错误进入 `error_analysis → sql_generate`
+- 执行成功但结果异常（空集、`NULL`、包装结构中的 `rows: []` 等）进入 `result_reflection`
+- `result_reflection` 直接生成修正后的 SQL，然后走 `safety_check → approve → execute_sql`，不再重复进入 `sql_generate`
+- 审批恢复使用 SSE 展示“执行中 → 异常检测 → 反思生成修正 SQL → 等待确认”的过程，避免用户误以为重复审批同一条 SQL
+- `query` 是稳定输入字段，父图和 SQL 子图都使用 `keep_existing_query` reducer，避免 approve/resume 后重复写入触发 LangGraph 并发更新错误
+
+**时序调用图**：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户/前端
+    participant API as Query API
+    participant G as Final Graph
+    participant S as SQL React
+    participant LLM as LLM
+    participant DB as MCP MySQL
+
+    U->>API: /api/query/classify
+    API->>G: classify_intent
+    G-->>API: intent + rewritten_query
+
+    U->>API: /api/query/invoke
+    API->>G: sql_query
+    G->>S: contextualize_query
+    S->>S: recall_evidence
+    S->>S: query_enhance
+    S->>S: select_tables + sql_retrieve
+    S->>LLM: sql_generate
+    LLM-->>S: SQL
+    S->>S: normalize_sql_answer + safety_check
+    S-->>API: interrupt(sql)
+    API-->>U: pending_approval
+
+    U->>API: /api/query/approve/stream
+    API-->>U: SSE status: 正在执行 SQL
+    API->>G: Command(resume)
+    G->>S: approve -> execute_sql
+    S->>DB: execute SQL
+    DB-->>S: result
+
+    alt 结果正常
+        S-->>API: answer/result
+        API-->>U: SSE result: completed
+    else 结果异常
+        S->>LLM: result_reflection
+        LLM-->>S: 修正后的 SQL
+        S->>S: normalize_sql_answer + safety_check
+        S-->>API: interrupt(reflected sql)
+        API-->>U: SSE status: 已反思并生成修正 SQL
+        API-->>U: SSE result: pending_approval
+    end
+```
 
 ### 6. 意图路由 + 查询重写
 
@@ -377,15 +548,19 @@ user_decision = interrupt({
     "message": "请审批此 SQL",
 })
 
-if user_decision == "YES":
-    return Command(goto="execute_sql")
-else:
-    return Command(goto="sql_generate", update={"refine_feedback": user_decision})
+if user_decision.get("approved"):
+    return {"approved": True}
+
+return {
+    "approved": False,
+    "answer": user_decision.get("feedback", "SQL 已被拒绝。"),
+    "is_sql": False,
+}
 ```
 
-审批不通过时，用户可提供修改意见，系统自动回到 SQL 生成节点重新生成。
+审批通过后继续 `execute_sql`；审批不通过时直接结束并返回用户反馈。审批恢复使用 `Command(resume=...)`，不在 resume 时写回 `query`，避免父图/子图同一步重复更新状态。
 
-### 6. Token 预算管理
+### 8. Token 预算管理
 
 ```python
 counter = TokenCounter()
@@ -394,7 +569,7 @@ fitted = counter.fit_to_budget(parts, max_tokens=28672)
 # 自动裁剪低优先级内容，防止超出上下文窗口
 ```
 
-### 7. SFT 数据飞轮
+### 9. SFT 数据飞轮
 
 ```
 ChatModel 调用 → SFTHandler 自动采集 → 教师模型（DeepSeek）评分/修正 → JSONL 导出
@@ -473,8 +648,10 @@ docker-compose logs -f milvus
 
 ## 技术文档
 
+- [设计文档](python_langchain_design.md)
+- [迭代优化记录](docs/iterations.md)
+- [熔断降级与 Fallback 设计](docs/resilience_design.md)
 - [新手教学文档](TUTORIAL.md)
-- [Python 版设计文档](python_langchain_design.md)
 
 ## 依赖说明
 
