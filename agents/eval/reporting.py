@@ -38,6 +38,7 @@ def build_report_payload(
         strategies.append({
             "strategy": report.config.name,
             "description": report.config.description,
+            "relevant_field": getattr(report.config, "relevant_field", "relevant_doc_ids"),
             "num_queries": len(report.results),
             "metrics": {k: round(v, 4) for k, v in report.aggregate.items()},
             "latency": {

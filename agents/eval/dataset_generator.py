@@ -106,6 +106,131 @@ def _parse_eval_items(raw: str) -> list[dict]:
     return items
 
 
+def _split_csv_terms(value: str | None) -> list[str]:
+    if not value:
+        return []
+    normalized = value.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def _normalize_doc_id(prefix: str, value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text.startswith(prefix) else f"{prefix}{text}"
+
+
+def _query_matches_any(query: str, terms: list[str]) -> bool:
+    query_l = query.lower()
+    for term in terms:
+        token = str(term or "").strip()
+        if not token:
+            continue
+        if token.lower() in query_l:
+            return True
+    return False
+
+
+def _tokenize_knowledge_text(text: str) -> set[str]:
+    normalized = text.lower()
+    tokens = set()
+    current = []
+    for ch in normalized:
+        if ch.isalnum() or ch == "_":
+            current.append(ch)
+        else:
+            if current:
+                tokens.add("".join(current))
+                current = []
+            if "\u4e00" <= ch <= "\u9fff":
+                tokens.add(ch)
+    if current:
+        tokens.add("".join(current))
+    for size in (2, 3, 4):
+        for i in range(0, max(0, len(normalized) - size + 1)):
+            chunk = normalized[i : i + size]
+            if any("\u4e00" <= ch <= "\u9fff" for ch in chunk):
+                tokens.add(chunk)
+    return tokens
+
+
+def _annotate_business_doc_ids(item: dict, rows: list[dict]) -> list[str]:
+    query = item.get("query", "")
+    ids = []
+    for row in rows:
+        term = str(row.get("term") or "")
+        aliases = [term, *_split_csv_terms(row.get("synonyms"))]
+        if _query_matches_any(query, aliases):
+            doc_id = _normalize_doc_id("business_", row.get("doc_id") or row.get("id") or term)
+            if doc_id:
+                ids.append(doc_id)
+    return list(dict.fromkeys(ids))
+
+
+def _annotate_agent_doc_ids(item: dict, rows: list[dict], min_overlap: int = 2) -> list[str]:
+    query_terms = _tokenize_knowledge_text(item.get("query", ""))
+    ids = []
+    for row in rows:
+        text = "\n".join([
+            str(row.get("question") or ""),
+            str(row.get("description") or ""),
+            str(row.get("category") or ""),
+        ])
+        overlap = query_terms & _tokenize_knowledge_text(text)
+        if len(overlap) >= min_overlap:
+            doc_id = _normalize_doc_id("agent_", row.get("doc_id") or row.get("id") or row.get("question"))
+            if doc_id:
+                ids.append(doc_id)
+    return list(dict.fromkeys(ids))
+
+
+def annotate_knowledge_labels(
+    items: list[dict],
+    business_rows: list[dict],
+    agent_rows: list[dict],
+) -> list[dict]:
+    """Add optional business/agent knowledge relevance labels to eval items.
+
+    This is deterministic and local. It does not call an LLM; it only uses
+    configured business terms/synonyms and lexical overlap with SQL examples.
+    """
+    annotated = []
+    for item in items:
+        updated = dict(item)
+        business_ids = _annotate_business_doc_ids(updated, business_rows)
+        agent_ids = _annotate_agent_doc_ids(updated, agent_rows)
+        if business_ids:
+            updated["relevant_business_doc_ids"] = business_ids
+        if agent_ids:
+            updated["relevant_agent_doc_ids"] = agent_ids
+        annotated.append(updated)
+    return annotated
+
+
+def _fetch_knowledge_rows() -> tuple[list[dict], list[dict]]:
+    """Fetch business and agent knowledge rows from MySQL."""
+    import pymysql
+
+    conn = pymysql.connect(
+        host=settings.mysql.host,
+        port=settings.mysql.port,
+        user=settings.mysql.username,
+        password=settings.mysql.password,
+        database=settings.mysql.database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, term, formula, synonyms, related_tables FROM t_business_knowledge ORDER BY term")
+            business_rows = cur.fetchall()
+            cur.execute("SELECT id, question, sql_text, description, category FROM t_agent_knowledge ORDER BY category, id")
+            agent_rows = cur.fetchall()
+    finally:
+        conn.close()
+    return business_rows, agent_rows
+
+
 def _fetch_all_schema_docs() -> list[dict]:
     """Fetch schema documents from MySQL t_semantic_model as seed material."""
     import pymysql
@@ -138,6 +263,7 @@ def _fetch_all_schema_docs() -> list[dict]:
 async def generate_eval_dataset(
     num_queries_per_table: int = 3,
     output_path: str | Path = "eval_dataset.jsonl",
+    annotate_knowledge: bool = True,
 ) -> list[dict]:
     """Generate evaluation dataset using LLM.
 
@@ -210,6 +336,13 @@ async def generate_eval_dataset(
         if item["query"] not in seen:
             seen.add(item["query"])
             unique_items.append(item)
+
+    if annotate_knowledge:
+        try:
+            business_rows, agent_rows = _fetch_knowledge_rows()
+            unique_items = annotate_knowledge_labels(unique_items, business_rows, agent_rows)
+        except Exception as e:
+            logger.warning("Knowledge label annotation skipped: %s", e)
 
     # Write to file
     output = Path(output_path)

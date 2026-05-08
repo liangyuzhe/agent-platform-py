@@ -269,6 +269,9 @@ python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dat
 
 # 运行召回评测并生成报告
 python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
+
+# 离线运行 NL2SQL 端到端结果评测
+python -m agents.eval.cli run-nl2sql --dataset data/eval/nl2sql_cases.jsonl --output data/eval/nl2sql_eval_report.json
 ```
 
 两个命令的区别：
@@ -277,6 +280,7 @@ python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output da
 |------|------|------|
 | `generate` | 基于 MySQL `t_semantic_model` 和 LLM 生成自然语言 query，并标注标准相关表 `relevant_doc_ids` | `eval_dataset.jsonl` |
 | `run` | 对数据集里的 query 执行召回策略，把实际召回表和标准相关表对比，计算 Accuracy、Recall、MRR、NDCG、延迟等指标 | `eval_report.json` |
+| `run-nl2sql` | 对已有 NL2SQL 回放样本计算 SQL 有效率、执行成功率、结果匹配率、延迟和首字延迟 | `nl2sql_eval_report.json` |
 
 `run` 默认评测：
 
@@ -297,6 +301,26 @@ python -m agents.eval.cli run \
 默认不再加载旧版 Milvus/ES schema 文档检索和 CrossEncoder reranker。完整原理、指标解释和报告格式见 [评测体系设计](docs/evaluation_design.md)。
 
 评测集默认排除 `domain_summary`、`t_semantic_model` 等系统内部表，避免把 Agent 元数据表误当成业务查询目标。
+
+`generate` 默认还会基于本地 `t_business_knowledge` 和 `t_agent_knowledge` 补充可选标注字段：
+
+- `relevant_business_doc_ids`
+- `relevant_agent_doc_ids`
+
+这一步是本地字符串/词法匹配，不调用 LLM。如需关闭：
+
+```bash
+python -m agents.eval.cli generate \
+  --num-per-table 3 \
+  --output data/eval/eval_dataset.jsonl \
+  --no-knowledge-labels
+```
+
+`run-nl2sql` 不会调用线上 Agent，也不会执行数据库，只评测已记录样本。样本格式：
+
+```json
+{"query":"去年亏损多少","generated_sql":"SELECT ...;","actual_result":[{"loss_amount":"100.00"}],"expected_result":[{"loss_amount":"100.00"}],"latency_ms":1200,"first_token_latency_ms":350}
+```
 
 ### 业务知识配置
 

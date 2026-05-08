@@ -14,7 +14,7 @@ router = APIRouter()
 
 _ROOT = Path(__file__).resolve().parents[3]
 _REPORT_DIRS = [_ROOT / "data" / "eval", _ROOT]
-_REPORT_PATTERNS = ["eval_report*.json", "*.eval.json"]
+_REPORT_PATTERNS = ["eval_report*.json", "*eval_report*.json", "*.eval.json"]
 
 
 def _candidate_report_paths() -> list[Path]:

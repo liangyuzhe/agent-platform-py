@@ -36,6 +36,7 @@ def test_build_report_payload_contains_summary_and_traceable_results():
 
     assert payload["run_id"] == "run-1"
     strategy = payload["strategies"][0]
+    assert strategy["relevant_field"] == "relevant_doc_ids"
     assert strategy["metrics"] == {"accuracy@5": 0.5, "recall@5": 0.75}
     assert strategy["latency"] == {"avg_ms": 20.0, "p50_ms": 10.0, "p95_ms": 30.0}
     assert strategy["first_token_latency"] == {"avg_ms": None, "p50_ms": None, "p95_ms": None}

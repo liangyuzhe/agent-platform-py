@@ -30,6 +30,7 @@ def cmd_generate(args):
     dataset = asyncio.run(generate_eval_dataset(
         num_queries_per_table=args.num_per_table,
         output_path=args.output,
+        annotate_knowledge=not args.no_knowledge_labels,
     ))
     print(f"Generated {len(dataset)} evaluation queries -> {args.output}")
 
@@ -70,6 +71,19 @@ def cmd_detail(args):
             print(f"    {k}: {v:.4f}")
 
 
+def cmd_run_nl2sql(args):
+    """Run offline NL2SQL end-to-end evaluation."""
+    from agents.eval.nl2sql_runner import run_nl2sql_evaluation
+
+    report = run_nl2sql_evaluation(
+        dataset_path=args.dataset,
+        output_path=args.output,
+    )
+    print(f"Evaluated {report['num_queries']} NL2SQL cases -> {args.output}")
+    for key, value in report.get("metrics", {}).items():
+        print(f"  {key}: {value:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RAG Retrieval Evaluation")
     sub = parser.add_subparsers(dest="command")
@@ -78,6 +92,11 @@ def main():
     p_gen = sub.add_parser("generate", help="Generate evaluation dataset")
     p_gen.add_argument("--num-per-table", type=int, default=3, help="Queries per table")
     p_gen.add_argument("--output", default="eval_dataset.jsonl", help="Output path")
+    p_gen.add_argument(
+        "--no-knowledge-labels",
+        action="store_true",
+        help="Do not add local business/few-shot relevance labels",
+    )
 
     # run
     p_run = sub.add_parser("run", help="Run evaluation")
@@ -95,6 +114,11 @@ def main():
     p_det.add_argument("--dataset", default="eval_dataset.jsonl", help="Dataset path")
     p_det.add_argument("--report", default="eval_report.json", help="Report path")
 
+    # run-nl2sql
+    p_nl2sql = sub.add_parser("run-nl2sql", help="Run offline NL2SQL end-to-end evaluation")
+    p_nl2sql.add_argument("--dataset", required=True, help="JSONL cases with generated_sql/result labels")
+    p_nl2sql.add_argument("--output", default="data/eval/nl2sql_eval_report.json", help="Report output path")
+
     args = parser.parse_args()
 
     if args.command == "generate":
@@ -103,6 +127,8 @@ def main():
         cmd_run(args)
     elif args.command == "detail":
         cmd_detail(args)
+    elif args.command == "run-nl2sql":
+        cmd_run_nl2sql(args)
     else:
         parser.print_help()
         sys.exit(1)

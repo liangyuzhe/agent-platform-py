@@ -1773,3 +1773,45 @@ pytest tests/test_eval_pipeline_strategies.py tests/test_eval_runner_schema.py t
 ```
 
 结果：`39 passed`。完整回归 `tests/test_eval_pipeline_strategies.py tests/test_eval_runner_schema.py tests/test_eval_metrics.py tests/test_eval_reporting.py tests/test_eval_dataset_generator.py tests/test_imports.py tests/test_api.py` 为 `76 passed`。
+
+---
+
+## Iteration 28：知识召回标注与 NL2SQL 离线端到端评测
+
+### 背景
+
+Iteration 27 已经能分别评测 schema、业务知识和 Agent few-shot 召回，但数据集默认只有 `relevant_doc_ids`，导致业务知识和 few-shot 策略经常显示 `num_queries = 0`。同时生产环境最终关心的不只是召回，还包括 SQL 是否规范、是否执行成功、执行结果是否符合预期、端到端延迟和首字延迟。
+
+### 解决方案
+
+- `generate` 默认基于本地知识表补充可选标注：
+  - `relevant_business_doc_ids`
+  - `relevant_agent_doc_ids`
+- 知识标注不调用 LLM：
+  - 业务知识用 `term` / `synonyms` 命中 query。
+  - Agent few-shot 用 query 与 `question` / `description` / `category` 词法重叠匹配。
+- 增加 `--no-knowledge-labels`，必要时只生成 schema 表标注。
+- 新增 `agents.eval.nl2sql_runner` 和 CLI：
+  - `python -m agents.eval.cli run-nl2sql --dataset ... --output ...`
+- NL2SQL 离线报告包含：
+  - `sql_valid`
+  - `execution_success`
+  - `result_exact_match`
+  - P50/P95 延迟
+  - 首字延迟
+  - per-query 明细
+- 前端 Evaluation 页面支持：
+  - retrieval 报告按策略切换 query 明细。
+  - NL2SQL 端到端报告独立展示核心指标。
+
+### 设计取舍
+
+`run-nl2sql` 默认只评测已记录样本，不调用 Agent，不执行数据库。这保证本地 TDD 和 CI 不依赖外部 LLM token、MySQL 数据状态或人工审批。后续接生产回放时，只需要把线上生成的 `generated_sql`、`actual_result`、`latency_ms`、`first_token_latency_ms` 写成 JSONL，即可复用同一套报告和页面。
+
+### 验证
+
+```bash
+pytest -q
+```
+
+结果：`234 passed`。测试过程中 LangSmith 网络上报失败为本地网络限制，不影响测试结论。

@@ -273,6 +273,8 @@
         .eval-table tr:last-child td { border-bottom: none; }
         .eval-scroll { overflow: auto; border-radius: 8px; }
         .eval-muted { color: var(--muted); font-size: 12px; }
+        .eval-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 8px; }
+        .eval-section-head select { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; color: #17202a; }
         .metric-help {
             display: grid;
             grid-template-columns: repeat(2, minmax(220px, 1fr));
@@ -409,7 +411,13 @@
                 <div class="eval-scroll">
                     <table class="eval-table" id="evalStrategies"></table>
                 </div>
-                <div style="height:16px"></div>
+                <div class="eval-section-head">
+                    <div>
+                        <strong>Query 明细</strong>
+                        <div class="eval-muted" id="evalDetailMeta">按策略查看可回溯样本</div>
+                    </div>
+                    <select id="evalStrategySelect" onchange="renderEvalDetails()"></select>
+                </div>
                 <div class="eval-scroll">
                     <table class="eval-table" id="evalDetails"></table>
                 </div>
@@ -727,6 +735,7 @@
 
         // --- Evaluation ---
         let evalLoaded = false;
+        let currentEvalReport = null;
         async function loadEvalReport() {
             const metricsBox = document.getElementById('evalMetrics');
             const strategiesTable = document.getElementById('evalStrategies');
@@ -744,6 +753,7 @@
                 }
                 const report = await resp.json();
                 evalLoaded = true;
+                currentEvalReport = report;
                 renderEvalReport(report);
             } catch (e) {
                 metricsBox.innerHTML = '<div class="upload-result error">加载失败: ' + escHtml(e.message) + '</div>';
@@ -751,6 +761,10 @@
         }
 
         function renderEvalReport(report) {
+            if (report.report_type === 'nl2sql_end_to_end') {
+                renderNl2sqlReport(report);
+                return;
+            }
             const strategies = report.strategies || [];
             const best = [...strategies].sort((a, b) => {
                 const am = a.metrics || {}, bm = b.metrics || {};
@@ -772,14 +786,51 @@
                 '<thead><tr><th>策略</th><th>样本数</th><th>Accuracy@5</th><th>Recall@5</th><th>MRR</th><th>P50/P95 延迟</th><th>首字延迟</th></tr></thead><tbody>' +
                 strategies.map(s => {
                     const m = s.metrics || {}, l = s.latency || {}, ttft = s.first_token_latency || {};
-                    return `<tr><td><strong>${escHtml(s.strategy || '')}</strong><div class="eval-muted">${escHtml(s.description || '')}</div></td><td>${s.num_queries || 0}</td><td>${fmtPct(m['accuracy@5'])}</td><td>${fmtPct(m['recall@5'])}</td><td>${fmtNum(m.mrr)}</td><td>${fmtMs(l.p50_ms)} / ${fmtMs(l.p95_ms)}</td><td>${ttft.p95_ms == null ? 'N/A' : fmtMs(ttft.p95_ms)}</td></tr>`;
+                    return `<tr><td><strong>${escHtml(s.strategy || '')}</strong><div class="eval-muted">${escHtml(s.description || '')}</div><div class="eval-muted">标注字段: ${escHtml(s.relevant_field || 'relevant_doc_ids')}</div></td><td>${s.num_queries || 0}</td><td>${fmtPct(m['accuracy@5'])}</td><td>${fmtPct(m['recall@5'])}</td><td>${fmtNum(m.mrr)}</td><td>${fmtMs(l.p50_ms)} / ${fmtMs(l.p95_ms)}</td><td>${ttft.p95_ms == null ? 'N/A' : fmtMs(ttft.p95_ms)}</td></tr>`;
                 }).join('') + '</tbody>';
 
-            const first = strategies[0] || {};
-            const rows = (first.results || []).slice(0, 30);
+            const selector = document.getElementById('evalStrategySelect');
+            selector.innerHTML = strategies.map((s, idx) => `<option value="${idx}">${escHtml(s.strategy || 'strategy')}</option>`).join('');
+            const bestIndex = Math.max(0, strategies.findIndex(s => s.strategy === best.strategy));
+            selector.value = String(bestIndex);
+            renderEvalDetails();
+        }
+
+        function renderEvalDetails() {
+            const report = currentEvalReport || {};
+            const strategies = report.strategies || [];
+            const selector = document.getElementById('evalStrategySelect');
+            const idx = Number(selector.value || 0);
+            const selected = strategies[idx] || strategies[0] || {};
+            const rows = (selected.results || []).slice(0, 50);
+            document.getElementById('evalDetailMeta').textContent =
+                `${selected.strategy || '-'} · 标注字段 ${selected.relevant_field || 'relevant_doc_ids'} · 展示前 ${rows.length} 条`;
             document.getElementById('evalDetails').innerHTML =
                 '<thead><tr><th>Query</th><th>Relevant</th><th>Retrieved Top5</th><th>Accuracy@5</th><th>Recall@5</th><th>Latency</th></tr></thead><tbody>' +
                 rows.map(r => `<tr><td>${escHtml(r.query || '')}</td><td>${escHtml((r.relevant_doc_ids || []).join(', '))}</td><td>${escHtml((r.retrieved_doc_ids || []).slice(0, 5).join(', '))}</td><td>${fmtPct((r.metrics || {})['accuracy@5'])}</td><td>${fmtPct((r.metrics || {})['recall@5'])}</td><td>${fmtMs(r.latency_ms)}</td></tr>`).join('') +
+                '</tbody>';
+        }
+
+        function renderNl2sqlReport(report) {
+            const metrics = report.metrics || {};
+            const latency = report.latency || {};
+            document.getElementById('evalMeta').textContent = `${report.report_type || '-'} · ${report.dataset_path || ''}`;
+            document.getElementById('evalMetrics').innerHTML = [
+                metricCard('SQL 有效率', fmtPct(metrics.sql_valid)),
+                metricCard('执行成功率', fmtPct(metrics.execution_success)),
+                metricCard('结果匹配率', fmtPct(metrics.result_exact_match)),
+                metricCard('P95 延迟', fmtMs(latency.p95_ms)),
+            ].join('');
+            document.getElementById('evalStrategies').innerHTML =
+                '<thead><tr><th>报告类型</th><th>样本数</th><th>SQL 有效率</th><th>执行成功率</th><th>结果匹配率</th><th>P50/P95 延迟</th><th>首字延迟</th></tr></thead><tbody>' +
+                `<tr><td><strong>NL2SQL End-to-End</strong><div class="eval-muted">离线回放 generated_sql / actual_result / expected_result</div></td><td>${report.num_queries || 0}</td><td>${fmtPct(metrics.sql_valid)}</td><td>${fmtPct(metrics.execution_success)}</td><td>${fmtPct(metrics.result_exact_match)}</td><td>${fmtMs((report.latency || {}).p50_ms)} / ${fmtMs((report.latency || {}).p95_ms)}</td><td>${(report.first_token_latency || {}).p95_ms == null ? 'N/A' : fmtMs(report.first_token_latency.p95_ms)}</td></tr>` +
+                '</tbody>';
+            document.getElementById('evalStrategySelect').innerHTML = '<option value="0">NL2SQL End-to-End</option>';
+            document.getElementById('evalDetailMeta').textContent = `离线端到端明细 · 展示前 ${(report.results || []).slice(0, 50).length} 条`;
+            const rows = (report.results || []).slice(0, 50);
+            document.getElementById('evalDetails').innerHTML =
+                '<thead><tr><th>Query</th><th>Generated SQL</th><th>SQL Valid</th><th>Exec Success</th><th>Result Match</th><th>Latency</th></tr></thead><tbody>' +
+                rows.map(r => `<tr><td>${escHtml(r.query || '')}</td><td><code>${escHtml((r.generated_sql || '').slice(0, 300))}</code></td><td>${fmtPct((r.metrics || {}).sql_valid)}</td><td>${fmtPct((r.metrics || {}).execution_success)}</td><td>${fmtPct((r.metrics || {}).result_exact_match)}</td><td>${fmtMs(r.latency_ms)}</td></tr>`).join('') +
                 '</tbody>';
         }
 

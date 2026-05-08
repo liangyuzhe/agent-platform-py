@@ -1,6 +1,10 @@
 """Unit tests for evaluation dataset generation helpers."""
 
-from agents.eval.dataset_generator import _parse_eval_items, _schema_rows_to_docs
+from agents.eval.dataset_generator import (
+    _parse_eval_items,
+    _schema_rows_to_docs,
+    annotate_knowledge_labels,
+)
 
 
 def test_schema_rows_to_docs_renders_semantic_metadata():
@@ -91,3 +95,29 @@ def test_parse_eval_items_requires_query_and_relevant_doc_ids():
     items = _parse_eval_items(raw)
 
     assert items == [{"query": "完整样本", "relevant_doc_ids": ["schema_t_account"]}]
+
+
+def test_annotate_knowledge_labels_adds_business_and_agent_ids_locally():
+    items = [{"query": "去年亏损多少", "relevant_doc_ids": ["schema_t_journal_entry"]}]
+    business_rows = [
+        {"id": 7, "term": "净利润", "synonyms": "亏损,亏损多少,净亏损"},
+        {"id": 8, "term": "毛利率", "synonyms": "毛利"},
+    ]
+    agent_rows = [
+        {"id": 12, "question": "去年亏损多少", "description": "净利润和亏损金额 SQL", "category": "finance"},
+        {"id": 13, "question": "查询固定资产", "description": "资产列表", "category": "asset"},
+    ]
+
+    annotated = annotate_knowledge_labels(items, business_rows, agent_rows)
+
+    assert annotated[0]["relevant_business_doc_ids"] == ["business_7"]
+    assert annotated[0]["relevant_agent_doc_ids"] == ["agent_12"]
+
+
+def test_annotate_knowledge_labels_omits_empty_optional_labels():
+    items = [{"query": "查询凭证状态", "relevant_doc_ids": ["schema_t_journal_entry"]}]
+
+    annotated = annotate_knowledge_labels(items, [], [])
+
+    assert "relevant_business_doc_ids" not in annotated[0]
+    assert "relevant_agent_doc_ids" not in annotated[0]

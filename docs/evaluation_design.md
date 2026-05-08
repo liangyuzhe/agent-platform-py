@@ -98,8 +98,9 @@ run：使用评测数据集运行评测并生成报告
 
 | 命令 | 做什么 | 输入 | 输出 | 是否计算指标 |
 |------|--------|------|------|--------------|
-| `generate` | 让 LLM 基于 `t_semantic_model` 生成自然语言问题和标准相关表 | MySQL `t_semantic_model` | `eval_dataset.jsonl` | 否 |
+| `generate` | 让 LLM 基于 `t_semantic_model` 生成自然语言问题和标准相关表，并本地补充知识召回标注 | MySQL `t_semantic_model`、`t_business_knowledge`、`t_agent_knowledge` | `eval_dataset.jsonl` | 否 |
 | `run` | 用数据集里的 query 执行召回策略，并和标准相关表对比 | `eval_dataset.jsonl` + MySQL `t_semantic_model` | `eval_report.json` | 是 |
+| `run-nl2sql` | 对已记录的 NL2SQL SQL/结果样本做离线端到端评测 | `nl2sql_cases.jsonl` | `nl2sql_eval_report.json` | 是 |
 
 ### 1. 生成评测数据集
 
@@ -135,12 +136,21 @@ LLM 同时标注回答该问题需要哪些表
 |------|------|
 | `query` | 模拟用户自然语言问题 |
 | `relevant_doc_ids` | 标准答案：回答该问题必须召回的表，格式为 `schema_<table_name>` |
+| `relevant_business_doc_ids` | 可选：该问题应召回的业务知识，格式为 `business_<id>` |
+| `relevant_agent_doc_ids` | 可选：该问题应召回的 SQL few-shot 示例，格式为 `agent_<id>` |
 
 `--num-per-table 3` 表示每张表让 LLM 生成 3 条问题。假设 `t_semantic_model` 里有 20 张表，理论上约生成 60 条样本；代码会按 query 去重，所以最终数量可能略少。
 
 注意：这是 LLM 生成的 synthetic dataset，适合冷启动和覆盖 schema，但仍建议后续人工审核一批高价值样本，并逐步加入真实用户问题。
 
 默认会排除系统内部表，例如 `domain_summary`、`t_semantic_model`、`t_business_knowledge`、`t_agent_knowledge`。这些表服务于 Agent 运行和知识管理，不是业务人员自然语言查数的目标；如果放进评测集，LLM 可能生成“查询领域摘要”这类内部运维问题，导致业务召回指标失真。
+
+生成后会默认用本地规则补充知识召回标注：
+
+- 业务知识：用 `term` 和 `synonyms` 命中 query 后生成 `business_<id>`。
+- Agent 知识：用 query 与 few-shot 的 `question`、`description`、`category` 做词法重叠匹配后生成 `agent_<id>`。
+
+这一步不调用 LLM。如果只想生成 schema 表标注，可使用 `--no-knowledge-labels`。
 
 如需额外排除表，可设置：
 
@@ -236,6 +246,39 @@ http://localhost:8080
 ```
 
 进入 `Evaluation` tab。页面会读取 `/api/eval/reports/latest`，展示最新报告。
+
+页面支持两类报告：
+
+- Retrieval 报告：展示策略对比，并可按策略切换 per-query 明细。
+- NL2SQL 端到端报告：展示 SQL 有效率、执行成功率、结果匹配率、延迟和首字延迟。
+
+### 4. NL2SQL 端到端离线评测
+
+离线端到端评测用于生产回放或人工标注 case，不会调用线上 Agent，也不会执行数据库。它评测的是“已经生成/记录下来的 SQL 和执行结果是否符合预期”。
+
+运行：
+
+```bash
+python -m agents.eval.cli run-nl2sql \
+  --dataset data/eval/nl2sql_cases.jsonl \
+  --output data/eval/nl2sql_eval_report.json
+```
+
+样本格式：
+
+```json
+{"query":"去年亏损多少","generated_sql":"SELECT ...;","actual_result":[{"loss_amount":"100.00"}],"expected_result":[{"loss_amount":"100.00"}],"latency_ms":1200,"first_token_latency_ms":350}
+```
+
+核心指标：
+
+| 指标 | 含义 | 方向 |
+|------|------|------|
+| `sql_valid` | SQL 是否能通过格式规范化校验 | 0-1，越大越好 |
+| `execution_success` | 样本是否没有记录执行错误 | 0-1，越大越好 |
+| `result_exact_match` | `actual_result` 与 `expected_result` 规范化后是否一致 | 0-1，越大越好 |
+| `latency.p95_ms` | 端到端长尾延迟 | 最小 0ms，越小越好 |
+| `first_token_latency.p95_ms` | 首字长尾延迟 | 最小 0ms，越小越好 |
 
 ## API
 
