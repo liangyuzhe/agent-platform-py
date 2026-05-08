@@ -245,7 +245,7 @@ ENABLE_LEGACY_EVAL_RETRIEVERS=1 \
 http://localhost:8080
 ```
 
-进入 `Evaluation` tab。页面会读取 `/api/eval/reports/latest`，展示最新报告。
+进入 `Evaluation` tab。页面会读取 `/api/eval/reports` 获取历史报告列表，并默认展示最新报告。也可以从下拉菜单切换历史报告，回溯某一次评测的策略指标和 query 明细。
 
 页面支持两类报告：
 
@@ -286,6 +286,7 @@ python -m agents.eval.cli run-nl2sql \
 |----------|------|
 | `GET /api/eval/reports` | 返回可用报告列表和简要摘要 |
 | `GET /api/eval/reports/latest` | 返回最近一次完整报告，含 per-query 明细 |
+| `GET /api/eval/reports/{name}` | 按已发现的报告文件名返回完整报告 |
 
 ## 后续迭代
 

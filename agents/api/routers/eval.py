@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException
 
@@ -56,7 +57,18 @@ def _load_report(path: Path) -> dict[str, Any]:
             "strategies": strategies,
         }
     payload["_path"] = str(path)
+    payload["_name"] = path.name
     return payload
+
+
+def _find_report_by_name(name: str) -> Path | None:
+    decoded = unquote(name)
+    if "/" in decoded or "\\" in decoded or decoded in {"", ".", ".."}:
+        return None
+    for path in _candidate_report_paths():
+        if path.name == decoded:
+            return path
+    return None
 
 
 @router.get("/reports")
@@ -68,6 +80,7 @@ async def list_reports():
             payload = _load_report(path)
             summary = compact_report(payload)
             summary["path"] = str(path)
+            summary["name"] = path.name
             reports.append(summary)
         except Exception:
             continue
@@ -81,3 +94,12 @@ async def latest_report():
     if not paths:
         raise HTTPException(status_code=404, detail="No evaluation report found")
     return _load_report(paths[0])
+
+
+@router.get("/reports/{name}")
+async def report_by_name(name: str):
+    """Return one evaluation report by discovered file name."""
+    path = _find_report_by_name(name)
+    if not path:
+        raise HTTPException(status_code=404, detail="Evaluation report not found")
+    return _load_report(path)

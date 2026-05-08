@@ -275,6 +275,7 @@
         .eval-muted { color: var(--muted); font-size: 12px; }
         .eval-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 8px; }
         .eval-section-head select { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; color: #17202a; }
+        .eval-report-select { min-width: 260px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; color: #17202a; }
         .metric-help {
             display: grid;
             grid-template-columns: repeat(2, minmax(220px, 1fr));
@@ -397,7 +398,10 @@
                         <strong>评测报告</strong>
                         <div class="eval-muted" id="evalMeta">加载最近一次评测报告</div>
                     </div>
-                    <button class="upload-btn" onclick="loadEvalReport()">刷新</button>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <select class="eval-report-select" id="evalReportSelect" onchange="loadSelectedEvalReport()"></select>
+                        <button class="upload-btn" onclick="loadEvalReport()">刷新</button>
+                    </div>
                 </div>
                 <div class="eval-grid" id="evalMetrics"></div>
                 <div class="metric-help">
@@ -736,6 +740,7 @@
         // --- Evaluation ---
         let evalLoaded = false;
         let currentEvalReport = null;
+        let evalReportList = [];
         async function loadEvalReport() {
             const metricsBox = document.getElementById('evalMetrics');
             const strategiesTable = document.getElementById('evalStrategies');
@@ -745,18 +750,52 @@
             strategiesTable.innerHTML = '';
             detailsTable.innerHTML = '';
             try {
-                const resp = await fetch('/api/eval/reports/latest');
-                if (!resp.ok) {
+                const listResp = await fetch('/api/eval/reports');
+                if (!listResp.ok) {
                     metricsBox.innerHTML = '<div class="admin-note">暂无评测报告。先执行 <code>python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json</code></div>';
                     meta.textContent = '未找到报告';
                     return;
                 }
+                const listPayload = await listResp.json();
+                evalReportList = listPayload.reports || [];
+                renderEvalReportSelector(evalReportList);
+                if (!evalReportList.length) {
+                    metricsBox.innerHTML = '<div class="admin-note">暂无评测报告。先执行 <code>python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json</code></div>';
+                    meta.textContent = '未找到报告';
+                    return;
+                }
+                const selectedName = evalReportList[0].name;
+                const resp = await fetch('/api/eval/reports/' + encodeURIComponent(selectedName));
+                if (!resp.ok) throw new Error('报告加载失败');
                 const report = await resp.json();
                 evalLoaded = true;
                 currentEvalReport = report;
                 renderEvalReport(report);
             } catch (e) {
                 metricsBox.innerHTML = '<div class="upload-result error">加载失败: ' + escHtml(e.message) + '</div>';
+            }
+        }
+
+        function renderEvalReportSelector(reports) {
+            const selector = document.getElementById('evalReportSelect');
+            selector.innerHTML = reports.map(r => {
+                const label = `${r.name || r.run_id || 'report'} · ${r.report_type || 'retrieval'} · ${r.created_at || ''}`;
+                return `<option value="${escHtml(r.name || '')}">${escHtml(label)}</option>`;
+            }).join('');
+        }
+
+        async function loadSelectedEvalReport() {
+            const selector = document.getElementById('evalReportSelect');
+            const name = selector.value;
+            if (!name) return;
+            try {
+                const resp = await fetch('/api/eval/reports/' + encodeURIComponent(name));
+                if (!resp.ok) throw new Error('报告加载失败');
+                const report = await resp.json();
+                currentEvalReport = report;
+                renderEvalReport(report);
+            } catch (e) {
+                document.getElementById('evalMetrics').innerHTML = '<div class="upload-result error">加载失败: ' + escHtml(e.message) + '</div>';
             }
         }
 
