@@ -57,11 +57,13 @@ def cmd_detail(args):
 
     print("\nEvaluation Report Summary:")
     print("=" * 60)
-    for entry in data:
+    entries = data.get("strategies", data if isinstance(data, list) else [])
+    for entry in entries:
         print(f"\nStrategy: {entry['strategy']}")
         print(f"  Description: {entry['description']}")
         print(f"  Queries: {entry['num_queries']}")
-        print(f"  Avg Latency: {entry['avg_latency_ms']}ms")
+        latency = entry.get("latency", {})
+        print(f"  Avg Latency: {latency.get('avg_ms', entry.get('avg_latency_ms'))}ms")
         print(f"  Metrics:")
         for k, v in entry["metrics"].items():
             print(f"    {k}: {v:.4f}")

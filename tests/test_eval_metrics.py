@@ -1,6 +1,14 @@
 """Unit tests for retrieval evaluation metrics."""
 
-from agents.eval.metrics import recall_at_k, mrr, ndcg_at_k, evaluate_single, aggregate_metrics
+from agents.eval.metrics import (
+    accuracy_at_k,
+    aggregate_metrics,
+    evaluate_single,
+    mrr,
+    ndcg_at_k,
+    precision_at_k,
+    recall_at_k,
+)
 
 
 class TestRecallAtK:
@@ -19,6 +27,23 @@ class TestRecallAtK:
 
     def test_empty_relevant(self):
         assert recall_at_k(["a", "b"], set(), 3) == 1.0
+
+
+class TestPrecisionAtK:
+    def test_precision_counts_hits_in_top_k(self):
+        assert precision_at_k(["a", "x", "b"], {"a", "b"}, 2) == 0.5
+
+    def test_precision_empty_retrieval(self):
+        assert precision_at_k([], {"a"}, 3) == 0.0
+
+
+class TestAccuracyAtK:
+    def test_accuracy_requires_all_relevant_docs(self):
+        assert accuracy_at_k(["a", "b", "x"], {"a", "b"}, 2) == 1.0
+        assert accuracy_at_k(["a", "x", "b"], {"a", "b"}, 2) == 0.0
+
+    def test_accuracy_empty_relevant_is_perfect(self):
+        assert accuracy_at_k(["x"], set(), 1) == 1.0
 
 
 class TestMRR:
@@ -62,6 +87,8 @@ class TestEvaluateSingle:
     def test_returns_all_keys(self):
         result = evaluate_single(["a", "b"], {"a"}, k_values=[1, 3])
         assert "mrr" in result
+        assert "accuracy@1" in result
+        assert "precision@1" in result
         assert "recall@1" in result
         assert "recall@3" in result
         assert "ndcg@1" in result

@@ -1,4 +1,4 @@
-"""Retrieval evaluation metrics: Recall@K, MRR, NDCG@K."""
+"""Evaluation metrics for retrieval and NL2SQL quality reports."""
 
 from __future__ import annotations
 
@@ -26,6 +26,28 @@ def recall_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> flo
     top_k = retrieved_ids[:k]
     hits = sum(1 for doc_id in top_k if doc_id in relevant_ids)
     return hits / len(relevant_ids)
+
+
+def precision_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    """Precision@K: fraction of top-K retrieved docs that are relevant."""
+    if k <= 0:
+        return 0.0
+    top_k = retrieved_ids[:k]
+    if not top_k:
+        return 0.0
+    hits = sum(1 for doc_id in top_k if doc_id in relevant_ids)
+    return hits / len(top_k)
+
+
+def accuracy_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    """Accuracy@K: 1 if all relevant docs are found in top-K, else 0.
+
+    This is stricter than Recall@K and useful as a user-facing "query passed"
+    indicator for retrieval tasks.
+    """
+    if not relevant_ids:
+        return 1.0
+    return 1.0 if relevant_ids.issubset(set(retrieved_ids[:k])) else 0.0
 
 
 def mrr(retrieved_ids: list[str], relevant_ids: set[str]) -> float:
@@ -72,6 +94,8 @@ def evaluate_single(
 
     results = {"mrr": mrr(retrieved_ids, relevant_ids)}
     for k in k_values:
+        results[f"accuracy@{k}"] = accuracy_at_k(retrieved_ids, relevant_ids, k)
+        results[f"precision@{k}"] = precision_at_k(retrieved_ids, relevant_ids, k)
         results[f"recall@{k}"] = recall_at_k(retrieved_ids, relevant_ids, k)
         results[f"ndcg@{k}"] = ndcg_at_k(retrieved_ids, relevant_ids, k)
 

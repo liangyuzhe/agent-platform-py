@@ -656,6 +656,7 @@ docker-compose logs -f milvus
 ## 技术文档
 
 - [设计文档](python_langchain_design.md)
+- [评测体系设计](docs/evaluation_design.md)
 - [迭代优化记录](docs/iterations.md)
 - [熔断降级与 Fallback 设计](docs/resilience_design.md)
 - [新手教学文档](TUTORIAL.md)

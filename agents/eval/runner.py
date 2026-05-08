@@ -16,6 +16,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 
 from agents.eval.metrics import evaluate_single, aggregate_metrics
+from agents.eval.reporting import build_report_payload
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +266,7 @@ def run_evaluation(
         reports.append(report)
 
     # Save report
-    _save_report(reports, output_path)
+    _save_report(reports, output_path, dataset_path)
 
     # Print summary table
     _print_summary(reports)
@@ -273,20 +274,12 @@ def run_evaluation(
     return reports
 
 
-def _save_report(reports: list[StrategyReport], output_path: str | Path) -> None:
+def _save_report(reports: list[StrategyReport], output_path: str | Path, dataset_path: str | Path = "") -> None:
     """Save evaluation report as JSON."""
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    data = []
-    for report in reports:
-        data.append({
-            "strategy": report.config.name,
-            "description": report.config.description,
-            "num_queries": len(report.results),
-            "avg_latency_ms": round(report.avg_latency_ms, 1),
-            "metrics": {k: round(v, 4) for k, v in report.aggregate.items()},
-        })
+    data = build_report_payload(reports, dataset_path=dataset_path)
 
     with open(output, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

@@ -262,6 +262,32 @@
             font-size: 14px;
         }
         code { background: #eef2f7; color: #334155; padding: 2px 5px; border-radius: 4px; }
+        .eval-grid { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .metric-card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; }
+        .metric-card .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+        .metric-card .value { font-size: 22px; font-weight: 750; }
+        .eval-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+        .eval-table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; border: 1px solid var(--line); }
+        .eval-table th, .eval-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+        .eval-table th { background: #f8fafc; color: #475569; font-weight: 700; }
+        .eval-table tr:last-child td { border-bottom: none; }
+        .eval-scroll { overflow: auto; border-radius: 8px; }
+        .eval-muted { color: var(--muted); font-size: 12px; }
+        .metric-help {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(220px, 1fr));
+            gap: 8px 12px;
+            margin-bottom: 16px;
+            padding: 12px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: #fbfdff;
+            font-size: 12px;
+            color: #475569;
+        }
+        .metric-help strong { color: #17202a; }
+        .direction-up { color: var(--success); font-weight: 700; }
+        .direction-down { color: var(--danger); font-weight: 700; }
         @keyframes pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.12); } }
         @media (max-width: 820px) {
             .container { grid-template-columns: 1fr; }
@@ -273,6 +299,8 @@
             .workspace { height: calc(100vh - 210px); min-height: 480px; }
             .message .bubble, .sql-message .bubble { max-width: 92%; }
             .upload-options { grid-template-columns: 1fr; }
+            .eval-grid { grid-template-columns: 1fr 1fr; }
+            .metric-help { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -287,6 +315,7 @@
                 <button class="active" onclick="switchTab('chat')">Chat</button>
                 <button onclick="switchTab('agent')">SQL Agent</button>
                 <button onclick="switchTab('upload')">Upload Document</button>
+                <button onclick="switchTab('eval')">Evaluation</button>
                 <button onclick="switchTab('admin')">Admin</button>
             </nav>
         </aside>
@@ -358,6 +387,37 @@
         </div>
 
         <!-- Admin Tab -->
+        <div id="tab-eval" class="tab-content">
+            <section class="workspace">
+              <div class="upload-box">
+                <div class="eval-toolbar">
+                    <div>
+                        <strong>评测报告</strong>
+                        <div class="eval-muted" id="evalMeta">加载最近一次评测报告</div>
+                    </div>
+                    <button class="upload-btn" onclick="loadEvalReport()">刷新</button>
+                </div>
+                <div class="eval-grid" id="evalMetrics"></div>
+                <div class="metric-help">
+                    <div><strong>Accuracy@K</strong>：Top-K 是否完整命中标注相关文档，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>Precision@K</strong>：Top-K 中相关文档占比，反映噪声，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>Recall@K</strong>：标注相关文档被召回的比例，反映漏召回，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>MRR / NDCG@K</strong>：相关结果是否排在前面，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>P50 / P95 延迟</strong>：典型和长尾耗时，<span class="direction-down">越小越好</span>。</div>
+                    <div><strong>首字延迟 TTFT</strong>：流式首个 token 等待时间，当前预留，<span class="direction-down">越小越好</span>。</div>
+                </div>
+                <div class="eval-scroll">
+                    <table class="eval-table" id="evalStrategies"></table>
+                </div>
+                <div style="height:16px"></div>
+                <div class="eval-scroll">
+                    <table class="eval-table" id="evalDetails"></table>
+                </div>
+              </div>
+            </section>
+        </div>
+
+        <!-- Admin Tab -->
         <div id="tab-admin" class="tab-content">
             <section class="workspace">
               <div class="upload-box">
@@ -386,11 +446,12 @@
 
         // --- Tab switching ---
         function switchTab(name) {
-            const tabs = ['chat', 'agent', 'upload', 'admin'];
+            const tabs = ['chat', 'agent', 'upload', 'eval', 'admin'];
             const titles = {
                 chat: ['Chat', '知识库问答和通用对话'],
                 agent: ['SQL Agent', '自然语言查数、SQL 审批和结果反思'],
                 upload: ['Upload Document', '上传文档并写入检索索引'],
+                eval: ['Evaluation', '准确率、召回率、延迟和可回溯评测明细'],
                 admin: ['Admin', '语义模型和业务知识管理入口'],
             };
             document.querySelectorAll('.tabs button').forEach((b, i) => {
@@ -401,6 +462,7 @@
             });
             document.getElementById('pageTitle').textContent = titles[name][0];
             document.getElementById('pageMeta').textContent = titles[name][1];
+            if (name === 'eval') loadEvalReport();
         }
 
         // --- Chat ---
@@ -662,6 +724,71 @@
             d.textContent = s;
             return d.innerHTML;
         }
+
+        // --- Evaluation ---
+        let evalLoaded = false;
+        async function loadEvalReport() {
+            const metricsBox = document.getElementById('evalMetrics');
+            const strategiesTable = document.getElementById('evalStrategies');
+            const detailsTable = document.getElementById('evalDetails');
+            const meta = document.getElementById('evalMeta');
+            metricsBox.innerHTML = '<div class="eval-muted">加载中...</div>';
+            strategiesTable.innerHTML = '';
+            detailsTable.innerHTML = '';
+            try {
+                const resp = await fetch('/api/eval/reports/latest');
+                if (!resp.ok) {
+                    metricsBox.innerHTML = '<div class="admin-note">暂无评测报告。先执行 <code>python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json</code></div>';
+                    meta.textContent = '未找到报告';
+                    return;
+                }
+                const report = await resp.json();
+                evalLoaded = true;
+                renderEvalReport(report);
+            } catch (e) {
+                metricsBox.innerHTML = '<div class="upload-result error">加载失败: ' + escHtml(e.message) + '</div>';
+            }
+        }
+
+        function renderEvalReport(report) {
+            const strategies = report.strategies || [];
+            const best = [...strategies].sort((a, b) => {
+                const am = a.metrics || {}, bm = b.metrics || {};
+                return (bm['accuracy@5'] || 0) - (am['accuracy@5'] || 0)
+                    || (bm['recall@5'] || 0) - (am['recall@5'] || 0)
+                    || ((a.latency || {}).p95_ms || 0) - ((b.latency || {}).p95_ms || 0);
+            })[0] || {};
+            const metrics = best.metrics || {};
+            const latency = best.latency || {};
+            document.getElementById('evalMeta').textContent = `${report.run_id || '-'} · ${report.created_at || ''} · ${report.dataset_path || ''}`;
+            document.getElementById('evalMetrics').innerHTML = [
+                metricCard('最佳策略', best.strategy || '-'),
+                metricCard('Accuracy@5', fmtPct(metrics['accuracy@5'])),
+                metricCard('Recall@5', fmtPct(metrics['recall@5'])),
+                metricCard('P95 延迟', fmtMs(latency.p95_ms)),
+            ].join('');
+
+            document.getElementById('evalStrategies').innerHTML =
+                '<thead><tr><th>策略</th><th>样本数</th><th>Accuracy@5</th><th>Recall@5</th><th>MRR</th><th>P50/P95 延迟</th><th>首字延迟</th></tr></thead><tbody>' +
+                strategies.map(s => {
+                    const m = s.metrics || {}, l = s.latency || {}, ttft = s.first_token_latency || {};
+                    return `<tr><td><strong>${escHtml(s.strategy || '')}</strong><div class="eval-muted">${escHtml(s.description || '')}</div></td><td>${s.num_queries || 0}</td><td>${fmtPct(m['accuracy@5'])}</td><td>${fmtPct(m['recall@5'])}</td><td>${fmtNum(m.mrr)}</td><td>${fmtMs(l.p50_ms)} / ${fmtMs(l.p95_ms)}</td><td>${ttft.p95_ms == null ? 'N/A' : fmtMs(ttft.p95_ms)}</td></tr>`;
+                }).join('') + '</tbody>';
+
+            const first = strategies[0] || {};
+            const rows = (first.results || []).slice(0, 30);
+            document.getElementById('evalDetails').innerHTML =
+                '<thead><tr><th>Query</th><th>Relevant</th><th>Retrieved Top5</th><th>Accuracy@5</th><th>Recall@5</th><th>Latency</th></tr></thead><tbody>' +
+                rows.map(r => `<tr><td>${escHtml(r.query || '')}</td><td>${escHtml((r.relevant_doc_ids || []).join(', '))}</td><td>${escHtml((r.retrieved_doc_ids || []).slice(0, 5).join(', '))}</td><td>${fmtPct((r.metrics || {})['accuracy@5'])}</td><td>${fmtPct((r.metrics || {})['recall@5'])}</td><td>${fmtMs(r.latency_ms)}</td></tr>`).join('') +
+                '</tbody>';
+        }
+
+        function metricCard(label, value) {
+            return `<div class="metric-card"><div class="label">${escHtml(label)}</div><div class="value">${escHtml(String(value))}</div></div>`;
+        }
+        function fmtPct(v) { return v == null ? 'N/A' : (v * 100).toFixed(1) + '%'; }
+        function fmtMs(v) { return v == null ? 'N/A' : Number(v).toFixed(1) + ' ms'; }
+        function fmtNum(v) { return v == null ? 'N/A' : Number(v).toFixed(4); }
 
         // --- Upload ---
         const dropZone = document.getElementById('dropZone');
