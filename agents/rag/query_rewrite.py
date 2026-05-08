@@ -6,6 +6,7 @@ from typing import Union
 
 from agents.config.settings import settings
 from agents.model.chat_model import get_chat_model
+from agents.tool.trace.tracing import child_trace_config
 
 
 _REWRITE_SYSTEM_PROMPT = """\
@@ -37,6 +38,7 @@ async def rewrite_query(
     summary: str,
     history: Union[str, list[dict]],
     query: str,
+    config: dict | None = None,
 ) -> str:
     """Rewrite *query* into a standalone search query using conversation context.
 
@@ -68,5 +70,12 @@ async def rewrite_query(
         ("human", user_message),
     ]
 
-    response = await llm.ainvoke(messages)
+    response = await llm.ainvoke(
+        messages,
+        config=child_trace_config(
+            config,
+            "query_rewrite.llm",
+            tags=["llm", "query_rewrite"],
+        ),
+    )
     return response.content.strip()

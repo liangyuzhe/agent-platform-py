@@ -15,6 +15,7 @@ from langchain_milvus import Milvus
 from agents.config.settings import settings
 from agents.algorithm.rrf import reciprocal_rank_fusion
 from agents.rag.reranker import CrossEncoderReranker
+from agents.tool.trace.tracing import traced_retriever_call, traced_tool_call
 
 try:
     from elasticsearch import Elasticsearch
@@ -563,7 +564,18 @@ def load_full_table_metadata() -> list[dict]:
     return result
 
 
-def _milvus_vector_search(query: str, source: str, top_k: int) -> list[Document]:
+def _milvus_vector_search(query: str, source: str, top_k: int, callbacks=None) -> list[Document]:
+    """Vector search in Milvus with source filter."""
+    return traced_retriever_call(
+        f"milvus.vector_search.{source}",
+        query,
+        callbacks,
+        lambda: _milvus_vector_search_untraced(query, source, top_k),
+        metadata={"vector_db": "milvus", "source": source, "top_k": top_k},
+    )
+
+
+def _milvus_vector_search_untraced(query: str, source: str, top_k: int) -> list[Document]:
     """Vector search in Milvus with source filter."""
     from pymilvus import MilvusClient
 
@@ -599,7 +611,17 @@ def _milvus_vector_search(query: str, source: str, top_k: int) -> list[Document]
         client.close()
 
 
-def _es_bm25_search(query: str, source: str, top_k: int = 10) -> list[Document]:
+def _es_bm25_search(query: str, source: str, top_k: int = 10, callbacks=None) -> list[Document]:
+    return traced_retriever_call(
+        f"es.bm25_search.{source}",
+        query,
+        callbacks,
+        lambda: _es_bm25_search_untraced(query, source, top_k),
+        metadata={"search_engine": "elasticsearch", "source": source, "top_k": top_k},
+    )
+
+
+def _es_bm25_search_untraced(query: str, source: str, top_k: int = 10) -> list[Document]:
     """BM25 keyword search in Elasticsearch with source filter.
 
     Uses raw ES client to match the indexing format from schema_indexer and seed scripts.
@@ -708,7 +730,18 @@ def _split_synonyms(value: str | None) -> list[str]:
     return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
-def _lexical_business_knowledge_search(query: str, top_k: int) -> list[Document]:
+def _lexical_business_knowledge_search(query: str, top_k: int, callbacks=None) -> list[Document]:
+    """Fallback business recall by matching query against configured term/synonyms."""
+    return traced_tool_call(
+        "mysql.lexical_business_knowledge_search",
+        query,
+        callbacks,
+        lambda: _lexical_business_knowledge_search_untraced(query, top_k),
+        metadata={"storage": "mysql", "source": "business_knowledge", "top_k": top_k},
+    )
+
+
+def _lexical_business_knowledge_search_untraced(query: str, top_k: int) -> list[Document]:
     """Fallback business recall by matching query against configured term/synonyms."""
     if not query:
         return []
@@ -744,11 +777,11 @@ def _lexical_business_knowledge_search(query: str, top_k: int) -> list[Document]
     return docs[:top_k]
 
 
-def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
+def recall_business_knowledge(query: str, top_k: int = 5, callbacks=None) -> list[Document]:
     """混合检索业务知识：向量 + BM25 + RRF，过滤无公式/术语的结果。"""
     # 并行：向量检索 + BM25
-    vector_docs = _milvus_vector_search(query, "business_knowledge", top_k)
-    es_docs = _es_bm25_search(query, "business_knowledge", top_k)
+    vector_docs = _milvus_vector_search(query, "business_knowledge", top_k, callbacks=callbacks)
+    es_docs = _es_bm25_search(query, "business_knowledge", top_k, callbacks=callbacks)
 
     # RRF 融合
     if vector_docs and es_docs:
@@ -763,7 +796,7 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
     if len(filtered) < top_k:
         existing_ids = {d.metadata.get("doc_id", "") for d in filtered}
         lexical_docs = [
-            d for d in _lexical_business_knowledge_search(query, top_k)
+            d for d in _lexical_business_knowledge_search(query, top_k, callbacks=callbacks)
             if d.metadata.get("doc_id", "") not in existing_ids
         ]
         filtered.extend(lexical_docs[: top_k - len(filtered)])
@@ -775,11 +808,11 @@ def recall_business_knowledge(query: str, top_k: int = 5) -> list[Document]:
     return filtered[:top_k]
 
 
-def recall_agent_knowledge(query: str, top_k: int = 3) -> list[Document]:
+def recall_agent_knowledge(query: str, top_k: int = 3, callbacks=None) -> list[Document]:
     """混合检索智能体知识：向量 + BM25 + RRF，过滤无 SQL 的结果。"""
     # 并行：向量检索 + BM25
-    vector_docs = _milvus_vector_search(query, "agent_knowledge", top_k)
-    es_docs = _es_bm25_search(query, "agent_knowledge", top_k)
+    vector_docs = _milvus_vector_search(query, "agent_knowledge", top_k, callbacks=callbacks)
+    es_docs = _es_bm25_search(query, "agent_knowledge", top_k, callbacks=callbacks)
 
     # RRF 融合
     if vector_docs and es_docs:
@@ -932,4 +965,3 @@ def get_table_relationships(table_names: list[str]) -> list[dict]:
     except Exception as e:
         logger.warning("get_table_relationships failed: %s", e)
         return []
-

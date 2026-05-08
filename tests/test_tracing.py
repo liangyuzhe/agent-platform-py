@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import patch, MagicMock
+from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler
 
 
 class TestLangSmithInit:
@@ -146,3 +147,111 @@ class TestTraceCallbacks:
         callbacks = get_trace_callbacks()
         assert len(callbacks) == 1
         assert type(callbacks[0]).__name__ == "LangChainTracer"
+
+
+class _RecordingHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.events = []
+
+    def on_retriever_start(self, serialized, query, **kwargs):
+        self.events.append(("retriever_start", serialized.get("name"), query))
+
+    def on_retriever_end(self, documents, **kwargs):
+        self.events.append(("retriever_end", len(documents)))
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        self.events.append(("tool_start", serialized.get("name"), input_str))
+
+    def on_tool_end(self, output, **kwargs):
+        self.events.append(("tool_end", output))
+
+
+class _AsyncRecordingHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.events = []
+
+    async def on_tool_start(self, serialized, input_str, **kwargs):
+        self.events.append(("tool_start", serialized.get("name"), input_str, kwargs.get("metadata")))
+
+    async def on_tool_end(self, output, **kwargs):
+        self.events.append(("tool_end", output))
+
+
+class TestTraceHelpers:
+    """Test helper spans for non-Runnable operations."""
+
+    def test_child_trace_config_extracts_callbacks(self):
+        from agents.tool.trace.tracing import child_trace_config
+
+        cfg = child_trace_config(
+            {"callbacks": ["handler"]},
+            "node.llm",
+            tags=["llm"],
+            metadata={"node": "node"},
+        )
+
+        assert cfg["callbacks"] == ["handler"]
+        assert cfg["run_name"] == "node.llm"
+        assert cfg["tags"] == ["llm"]
+        assert cfg["metadata"] == {"node": "node"}
+
+    def test_traced_retriever_call_emits_retriever_events(self):
+        from agents.tool.trace.tracing import traced_retriever_call
+
+        handler = _RecordingHandler()
+        result = traced_retriever_call(
+            "milvus.vector_search.business_knowledge",
+            "去年亏损",
+            [handler],
+            lambda: [MagicMock()],
+        )
+
+        assert len(result) == 1
+        assert handler.events[0] == (
+            "retriever_start",
+            "milvus.vector_search.business_knowledge",
+            "去年亏损",
+        )
+        assert handler.events[-1] == ("retriever_end", 1)
+
+    def test_traced_tool_call_emits_tool_events(self):
+        from agents.tool.trace.tracing import traced_tool_call
+
+        handler = _RecordingHandler()
+        result = traced_tool_call(
+            "schema.load_full_table_metadata",
+            "query",
+            [handler],
+            lambda: [{"table_name": "t_account"}],
+        )
+
+        assert result == [{"table_name": "t_account"}]
+        assert handler.events[0] == ("tool_start", "schema.load_full_table_metadata", "query")
+        assert handler.events[-1][0] == "tool_end"
+
+    @pytest.mark.asyncio
+    async def test_traced_async_tool_call_emits_async_tool_events(self):
+        from agents.tool.trace.tracing import traced_async_tool_call
+
+        async def load_domain():
+            return "领域摘要"
+
+        handler = _AsyncRecordingHandler()
+        manager = AsyncCallbackManager.configure(inheritable_callbacks=[handler])
+
+        result = await traced_async_tool_call(
+            "domain_summary.load",
+            "去年亏损",
+            manager,
+            load_domain,
+            metadata={"storage": "mysql"},
+        )
+
+        assert result == "领域摘要"
+        assert handler.events[0][:3] == (
+            "tool_start",
+            "domain_summary.load",
+            "去年亏损",
+        )
+        assert handler.events[0][3]["storage"] == "mysql"
+        assert handler.events[-1][0] == "tool_end"

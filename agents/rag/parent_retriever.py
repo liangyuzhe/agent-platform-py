@@ -89,13 +89,13 @@ class ParentDocumentRetriever:
         self._reranker = CrossEncoderReranker(model_name=reranker_model)
         self._reranker_top_k = reranker_top_k
 
-    def _retrieve_children_milvus(self, query: str) -> list[Document]:
+    def _retrieve_children_milvus(self, query: str, callbacks=None) -> list[Document]:
         retriever = self._child_milvus.as_retriever(
             search_type="similarity", k=20
         )
-        return retriever.invoke(query)
+        return retriever.invoke(query, config={"callbacks": callbacks or []})
 
-    def _retrieve_children_es(self, query: str) -> list[Document]:
+    def _retrieve_children_es(self, query: str, callbacks=None) -> list[Document]:
         from langchain_elasticsearch import BM25Strategy
 
         store = ElasticsearchStore(
@@ -105,7 +105,7 @@ class ParentDocumentRetriever:
             strategy=BM25Strategy(),
         )
         retriever = store.as_retriever(search_type="similarity", k=20)
-        return retriever.invoke(query)
+        return retriever.invoke(query, config={"callbacks": callbacks or []})
 
     def _fetch_parents_by_ids(self, parent_ids: list[str]) -> dict[str, Document]:
         """Fetch parent chunks from the parent Milvus collection by doc_id."""
@@ -119,7 +119,7 @@ class ParentDocumentRetriever:
         )
         return {doc.metadata.get("doc_id", ""): doc for doc in results}
 
-    def retrieve(self, query: str, top_k: int | None = None) -> list[Document]:
+    def retrieve(self, query: str, top_k: int | None = None, callbacks=None) -> list[Document]:
         """Run parent document retrieval.
 
         Steps:
@@ -136,8 +136,8 @@ class ParentDocumentRetriever:
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {
-                pool.submit(self._retrieve_children_milvus, query): 0,
-                pool.submit(self._retrieve_children_es, query): 1,
+                pool.submit(self._retrieve_children_milvus, query, callbacks=callbacks): 0,
+                pool.submit(self._retrieve_children_es, query, callbacks=callbacks): 1,
             }
             for future in as_completed(futures):
                 idx = futures[future]

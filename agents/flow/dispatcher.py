@@ -15,6 +15,7 @@ from agents.model.chat_model import get_chat_model
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.tool.storage.domain_summary import get_domain_summary
 from agents.config.settings import settings
+from agents.tool.trace.tracing import child_trace_config, traced_async_tool_call, callbacks_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务
 {{"intent": "意图类别", "rewritten_query": "重写后的独立查询"}}"""
 
 
-async def classify_intent(state: FinalGraphState) -> dict:
+async def classify_intent(state: FinalGraphState, config=None) -> dict:
     """意图分类 + 上下文重写：返回 intent 和 rewritten_query。
 
     如果 state 中已有 intent 和 rewritten_query（外部预分类），直接返回。
@@ -71,7 +72,14 @@ async def classify_intent(state: FinalGraphState) -> dict:
         return {"intent": existing_intent, "rewritten_query": state.get("query", "")}
 
     model = get_chat_model(settings.chat_model_type)
-    domain = await get_domain_summary()
+    callbacks = callbacks_from_config(config)
+    domain = await traced_async_tool_call(
+        "domain_summary.load",
+        state.get("query", ""),
+        callbacks,
+        get_domain_summary,
+        metadata={"storage": "mysql", "node": "classify_intent"},
+    )
 
     # 构建对话历史上下文
     chat_history = state.get("chat_history", [])
@@ -87,10 +95,17 @@ async def classify_intent(state: FinalGraphState) -> dict:
 
 用户问题: {state['query']}"""
 
-    response = await model.ainvoke([
-        SystemMessage(content=_CLASSIFY_SYSTEM_PROMPT),
-        HumanMessage(content=user_msg),
-    ])
+    response = await model.ainvoke(
+        [
+            SystemMessage(content=_CLASSIFY_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ],
+        config=child_trace_config(
+            config,
+            "dispatcher.classify_intent.llm",
+            tags=["llm", "intent"],
+        ),
+    )
 
     raw = response.content.strip()
 
@@ -156,18 +171,21 @@ async def sql_react(state: FinalGraphState, config=None) -> dict:
     }
 
 
-async def chat_direct(state: FinalGraphState) -> dict:
+async def chat_direct(state: FinalGraphState, config=None) -> dict:
     """普通对话，接入 RAG Chat 子图。"""
     from agents.flow.rag_chat import build_rag_chat_graph
     rag_graph = build_rag_chat_graph()
     rewritten = state.get("rewritten_query", "")
-    result = await rag_graph.ainvoke({
-        "input": {
-            "session_id": state["session_id"],
-            "query": rewritten or state["query"],
-            "rewritten_query": rewritten,
+    result = await rag_graph.ainvoke(
+        {
+            "input": {
+                "session_id": state["session_id"],
+                "query": rewritten or state["query"],
+                "rewritten_query": rewritten,
+            },
         },
-    })
+        config=config,
+    )
     return {
         "answer": result.get("answer", ""),
         "status": "completed",

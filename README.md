@@ -712,6 +712,12 @@ COZELOOP_JWT_OAUTH_PRIVATE_KEY=your-private-key
 COZELOOP_JWT_OAUTH_PUBLIC_KEY_ID=your-public-key-id
 ```
 
+追踪粒度覆盖：
+
+- 图节点：LangGraph 自动记录。
+- LLM 子调用：意图分类、查询重写、query_enhance、select_tables、sql_generate、error_analysis、result_reflection、RAG chat、Analyst 报告生成。
+- 检索/存储子调用：Milvus 向量检索、Elasticsearch BM25、业务知识 MySQL fallback、schema Redis/MySQL 元数据加载。
+
 ## Docker 部署
 
 ```bash

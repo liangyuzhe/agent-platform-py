@@ -14,6 +14,7 @@ from agents.rag.retriever import get_hybrid_retriever
 from agents.model.chat_model import get_chat_model
 from agents.tool.token_counter import TokenCounter
 from agents.config.settings import settings
+from agents.tool.trace.tracing import callbacks_from_config, child_trace_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ async def preprocess(state: RAGChatState) -> dict:
     }
 
 
-async def rewrite(state: RAGChatState) -> dict:
+async def rewrite(state: RAGChatState, config=None) -> dict:
     """查询重写：利用记忆上下文化查询。
 
     如果 rewritten_query 已由外层 classify 提供，直接复用，跳过 LLM 调用。
@@ -58,6 +59,7 @@ async def rewrite(state: RAGChatState) -> dict:
                 summary=summary,
                 history=history_dicts,
                 query=state["query"],
+                config=config,
             ),
             timeout=settings.resilience.llm_rewrite_timeout,
         )
@@ -72,7 +74,7 @@ async def retrieve(state: RAGChatState, config=None) -> dict:
     query = state.get("rewritten_query", state["query"])
     mode = state.get("rag_mode", settings.rag.mode)
     session_id = state.get("session_id", "")
-    callbacks = (config or {}).get("callbacks", [])
+    callbacks = callbacks_from_config(config)
 
     try:
         if mode == "parent":
@@ -137,11 +139,14 @@ async def construct_messages(state: RAGChatState) -> dict:
     return {"messages": messages}
 
 
-async def chat(state: RAGChatState) -> dict:
+async def chat(state: RAGChatState, config=None) -> dict:
     """LLM 生成响应。"""
     model = get_chat_model(settings.chat_model_type)
     response = await asyncio.wait_for(
-        model.ainvoke(state["messages"]),
+        model.ainvoke(
+            state["messages"],
+            config=child_trace_config(config, "rag_chat.chat.llm", tags=["llm", "rag_chat"]),
+        ),
         timeout=settings.resilience.llm_timeout,
     )
 

@@ -9,6 +9,7 @@ from agents.tool.analyst_tools.parser import parse_sql_result
 from agents.tool.analyst_tools.statistics import compute_statistics
 from agents.tool.analyst_tools.chart import generate_chart_config
 from agents.config.settings import settings
+from agents.tool.trace.tracing import child_trace_config
 
 
 async def parse_data(state: AnalystState) -> dict:
@@ -23,20 +24,23 @@ async def analyze_data(state: AnalystState) -> dict:
     return {"statistics": stats}
 
 
-async def generate_report(state: AnalystState) -> dict:
+async def generate_report(state: AnalystState, config=None) -> dict:
     """LLM 生成文字分析报告。"""
     model = get_chat_model(settings.chat_model_type)
     data = state["parsed_data"]
     stats = state["statistics"]
 
-    response = await model.ainvoke([
-        HumanMessage(content=f"""请基于以下数据生成一段简洁的分析报告（200字以内）：
+    response = await model.ainvoke(
+        [
+            HumanMessage(content=f"""请基于以下数据生成一段简洁的分析报告（200字以内）：
 
 列: {data.get('columns', [])}
 样本数据: {data.get('sample_rows', '')}
 统计指标: {stats}
 """)
-    ])
+        ],
+        config=child_trace_config(config, "analyst.generate_report.llm", tags=["llm", "analyst"]),
+    )
     return {"text_analysis": response.content}
 
 

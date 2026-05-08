@@ -188,7 +188,10 @@ async def classify_intent_endpoint(req: QueryRequest):
     """意图分类（非流式），前端据此选择流式端点。"""
     from agents.flow.dispatcher import classify_intent
     chat_history = _load_chat_history(req.session_id)
-    result = await classify_intent({"query": req.query, "chat_history": chat_history})
+    result = await classify_intent(
+        {"query": req.query, "chat_history": chat_history},
+        config=_make_config(req.session_id),
+    )
     return ClassifyResponse(
         intent=result.get("intent", "chat"),
         rewritten_query=result.get("rewritten_query", req.query),

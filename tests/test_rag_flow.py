@@ -96,6 +96,25 @@ class TestRAGChatRetrieve:
             assert result["docs"] == []
 
     @pytest.mark.asyncio
+    async def test_retrieve_passes_trace_callbacks(self):
+        """Retriever calls should inherit callbacks from graph config."""
+        from agents.flow.rag_chat import retrieve
+
+        with patch("agents.flow.rag_chat.get_hybrid_retriever") as mock_retriever:
+            mock_instance = MagicMock()
+            mock_instance.retrieve.return_value = []
+            mock_retriever.return_value = mock_instance
+
+            state = {
+                "query": "test query",
+                "rewritten_query": "test query",
+                "rag_mode": "traditional",
+            }
+
+            await retrieve(state, config={"callbacks": ["trace-handler"]})
+            assert mock_instance.retrieve.call_args.kwargs["callbacks"] == ["trace-handler"]
+
+    @pytest.mark.asyncio
     async def test_retrieve_parent_mode(self):
         """Test retrieve uses ParentDocumentRetriever in parent mode."""
         from agents.flow.rag_chat import retrieve
@@ -163,6 +182,36 @@ class TestRAGChatConstructMessages:
 
         result = await construct_messages(state)
         assert "AI is artificial intelligence" in result["messages"][1].content
+
+
+class TestRAGChatChat:
+    """Test chat node."""
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.rag_chat.save_session")
+    @patch("agents.flow.rag_chat.compress_session")
+    @patch("agents.flow.rag_chat.get_chat_model")
+    async def test_chat_passes_trace_callbacks(self, mock_get_model, mock_compress, mock_save):
+        from agents.flow.rag_chat import chat
+        from langchain_core.messages import HumanMessage
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="answer"))
+        mock_get_model.return_value = mock_model
+
+        await chat(
+            {
+                "messages": [HumanMessage(content="hello")],
+                "session": {"id": "s1", "history": []},
+                "session_id": "s1",
+                "query": "hello",
+            },
+            config={"callbacks": ["trace-handler"]},
+        )
+
+        call_config = mock_model.ainvoke.call_args.kwargs["config"]
+        assert call_config["callbacks"] == ["trace-handler"]
+        assert call_config["run_name"] == "rag_chat.chat.llm"
 
 
 class TestBuildRAGChatGraph:

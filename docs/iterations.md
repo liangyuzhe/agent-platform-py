@@ -1875,3 +1875,42 @@ python -m agents.eval.cli run-nl2sql \
 - 缺失 dataset 场景返回可读错误和模板生成命令。
 - `--init-template` 可生成 JSONL 模板。
 - 使用模板可成功生成 `nl2sql_eval_report.json`。
+
+---
+
+## Iteration 31：链路追踪子调用细化
+
+### 背景
+
+LangSmith / CozeLoop 能看到 LangGraph 节点，但部分节点内部的 LLM 调用、Milvus 向量检索、Elasticsearch BM25、Redis/MySQL 元数据加载没有形成子 span。排查问题时只能看到节点耗时，无法判断时间花在 LLM、向量库、关键词检索还是 schema 元数据读取。
+
+### 解决方案
+
+- 新增 tracing helper：
+  - `child_trace_config`：从 LangGraph config 继承 callbacks，传给内部 LLM/Runnable。
+  - `traced_retriever_call`：把裸 Milvus/ES 检索包装成 retriever span。
+  - `traced_tool_call` / `traced_async_tool_call`：把 Redis/MySQL 等非 Runnable IO 包装成 tool span。
+- SQL React 细化：
+  - `contextualize_query`
+  - `recall_evidence`
+  - `query_enhance`
+  - `select_tables`
+  - `sql_retrieve`
+  - `sql_generate`
+  - `error_analysis`
+  - `result_reflection`
+- RAG Chat / Dispatcher / Analyst 细化：
+  - query rewrite、retrieve、chat LLM、intent classify、domain summary load、analyst report LLM。
+- 业务知识和 Agent 知识召回细化：
+  - Milvus vector search
+  - ES BM25 search
+  - MySQL lexical fallback
+
+### 验证
+
+新增/更新测试覆盖 callbacks 继承和手动 span 触发：
+
+- 内部 LLM 调用会收到 graph callbacks。
+- knowledge retriever 会收到 graph callbacks。
+- `traced_retriever_call` 会触发 retriever start/end。
+- `traced_tool_call` 会触发 tool start/end。

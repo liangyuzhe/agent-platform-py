@@ -216,6 +216,30 @@ class TestQueryEnhance:
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.get_chat_model")
+    async def test_with_evidence_passes_trace_callbacks(self, mock_get_model):
+        """Inner LLM call should inherit graph callbacks for tracing."""
+        from agents.flow.sql_react import query_enhance
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="查询已支付订单总额"))
+        mock_get_model.return_value = mock_model
+
+        await query_enhance(
+            {
+                "query": "查询GMV",
+                "rewritten_query": "查询GMV",
+                "evidence": ["GMV = 已支付订单总额"],
+                "few_shot_examples": [],
+            },
+            config={"callbacks": ["trace-handler"]},
+        )
+
+        call_config = mock_model.ainvoke.call_args.kwargs["config"]
+        assert call_config["callbacks"] == ["trace-handler"]
+        assert call_config["run_name"] == "sql.query_enhance.llm"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
     async def test_llm_failure_fallback(self, mock_get_model):
         """On LLM failure, should fallback to original query."""
         from agents.flow.sql_react import query_enhance
@@ -367,6 +391,27 @@ class TestSqlGenerate:
         assert result["is_sql"] is True
         assert "SELECT" in result["sql"]
         assert result["sql"].endswith(";")
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_sql_passes_trace_callbacks(self, mock_get_model, mock_format):
+        """SQL generation LLM call should be visible as a child trace."""
+        from agents.flow.sql_react import sql_generate
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=_mock_llm_tool_response("SELECT 1;", True))
+        mock_get_model.return_value = mock_model
+
+        await sql_generate(
+            {"query": "查询所有用户", "docs": [_mock_doc()]},
+            config={"callbacks": ["trace-handler"]},
+        )
+
+        call_config = mock_model.ainvoke.call_args.kwargs["config"]
+        assert call_config["callbacks"] == ["trace-handler"]
+        assert call_config["run_name"] == "sql.sql_generate.llm"
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.create_format_tool")
@@ -913,6 +958,38 @@ class TestErrorAnalysis:
         result = await error_analysis(state)
 
         assert result["retry_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# recall_evidence node
+# ---------------------------------------------------------------------------
+
+class TestRecallEvidence:
+    """Test evidence recall tracing propagation."""
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.recall_agent_knowledge")
+    @patch("agents.flow.sql_react.recall_business_knowledge")
+    async def test_recall_evidence_passes_trace_callbacks(self, mock_business, mock_agent):
+        """Knowledge retrievers should inherit graph callbacks."""
+        from agents.flow.sql_react import recall_evidence
+
+        mock_business.return_value = [
+            Document(page_content="术语: 净利润\n公式: 收入 - 成本", metadata={"score": 0.9})
+        ]
+        mock_agent.return_value = [
+            Document(page_content="SELECT 1;", metadata={"score": 0.9})
+        ]
+
+        result = await recall_evidence(
+            {"query": "去年亏损", "rewritten_query": "去年亏损"},
+            config={"callbacks": ["trace-handler"]},
+        )
+
+        assert result["evidence"] == ["术语: 净利润\n公式: 收入 - 成本"]
+        assert result["few_shot_examples"] == ["SELECT 1;"]
+        assert mock_business.call_args.kwargs["callbacks"] == ["trace-handler"]
+        assert mock_agent.call_args.kwargs["callbacks"] == ["trace-handler"]
 
 
 # ---------------------------------------------------------------------------

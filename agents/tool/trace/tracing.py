@@ -119,6 +119,132 @@ def get_trace_callbacks() -> list[Any]:
     return callbacks
 
 
+def callbacks_from_config(config: dict | None):
+    """Extract LangChain callbacks from a Runnable config."""
+    if not config:
+        return []
+    callbacks = config.get("callbacks", [])
+    if not callbacks:
+        return []
+    if isinstance(callbacks, (list, tuple)):
+        return list(callbacks)
+    # LangGraph may pass CallbackManager/AsyncCallbackManager objects here.
+    return callbacks
+
+
+def child_trace_config(
+    config: dict | None,
+    run_name: str,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build child Runnable config so inner LLM/retriever calls appear in traces."""
+    child: dict[str, Any] = {"run_name": run_name}
+    callbacks = callbacks_from_config(config)
+    if callbacks:
+        child["callbacks"] = callbacks
+    if tags:
+        child["tags"] = tags
+    if metadata:
+        child["metadata"] = metadata
+    return child
+
+
+def traced_retriever_call(
+    name: str,
+    query: str,
+    callbacks: Any | None,
+    func,
+    metadata: dict[str, Any] | None = None,
+):
+    """Trace a non-Runnable retriever operation as a retriever span."""
+    if not callbacks:
+        return func()
+
+    from langchain_core.callbacks import CallbackManager
+
+    manager = CallbackManager.configure(
+        inheritable_callbacks=callbacks,
+        inheritable_tags=["retriever", name],
+        inheritable_metadata=metadata or {},
+    )
+    run_manager = manager.on_retriever_start(
+        {"name": name},
+        query,
+    )
+    try:
+        result = func()
+        run_manager.on_retriever_end(result)
+        return result
+    except Exception as e:
+        run_manager.on_retriever_error(e)
+        raise
+
+
+def traced_tool_call(
+    name: str,
+    input_str: str,
+    callbacks: Any | None,
+    func,
+    metadata: dict[str, Any] | None = None,
+):
+    """Trace non-Runnable IO work such as Redis/MySQL metadata loading."""
+    if not callbacks:
+        return func()
+
+    from langchain_core.callbacks import CallbackManager
+
+    manager = CallbackManager.configure(
+        inheritable_callbacks=callbacks,
+        inheritable_tags=["tool", name],
+        inheritable_metadata=metadata or {},
+    )
+    run_manager = manager.on_tool_start(
+        {"name": name},
+        input_str,
+        inputs={"input": input_str, **(metadata or {})},
+    )
+    try:
+        result = func()
+        run_manager.on_tool_end(str(result)[:4000])
+        return result
+    except Exception as e:
+        run_manager.on_tool_error(e)
+        raise
+
+
+async def traced_async_tool_call(
+    name: str,
+    input_str: str,
+    callbacks: Any | None,
+    func,
+    metadata: dict[str, Any] | None = None,
+):
+    """Trace non-Runnable async IO work as a tool span."""
+    if not callbacks:
+        return await func()
+
+    from langchain_core.callbacks import AsyncCallbackManager
+
+    manager = AsyncCallbackManager.configure(
+        inheritable_callbacks=callbacks,
+        inheritable_tags=["tool", name],
+        inheritable_metadata=metadata or {},
+    )
+    run_manager = await manager.on_tool_start(
+        {"name": name},
+        input_str,
+        inputs={"input": input_str, **(metadata or {})},
+    )
+    try:
+        result = await func()
+        await run_manager.on_tool_end(str(result)[:4000])
+        return result
+    except Exception as e:
+        await run_manager.on_tool_error(e)
+        raise
+
+
 def close_cozeloop() -> None:
     """Shut down the CozeLoop client (call on app shutdown)."""
     global _cozeloop_client
