@@ -399,12 +399,12 @@
                 </div>
                 <div class="eval-grid" id="evalMetrics"></div>
                 <div class="metric-help">
-                    <div><strong>Accuracy@K</strong>：Top-K 是否完整命中标注相关文档，<span class="direction-up">越大越好</span>。</div>
-                    <div><strong>Precision@K</strong>：Top-K 中相关文档占比，反映噪声，<span class="direction-up">越大越好</span>。</div>
-                    <div><strong>Recall@K</strong>：标注相关文档被召回的比例，反映漏召回，<span class="direction-up">越大越好</span>。</div>
-                    <div><strong>MRR / NDCG@K</strong>：相关结果是否排在前面，<span class="direction-up">越大越好</span>。</div>
-                    <div><strong>P50 / P95 延迟</strong>：典型和长尾耗时，<span class="direction-down">越小越好</span>。</div>
-                    <div><strong>首字延迟 TTFT</strong>：流式首个 token 等待时间，当前预留，<span class="direction-down">越小越好</span>。</div>
+                    <div><strong>Accuracy@K</strong>：Top-K 是否完整命中标注相关文档，范围 0-1，最大 1.0，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>Precision@K</strong>：Top-K 中相关文档占比，范围 0-1，最大 1.0，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>Recall@K</strong>：标注相关文档被召回的比例，范围 0-1，最大 1.0，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>MRR / NDCG@K</strong>：相关结果是否排在前面，范围 0-1，最大 1.0，<span class="direction-up">越大越好</span>。</div>
+                    <div><strong>P50 / P95 延迟</strong>：典型和长尾耗时，最小 0ms，无理论上限，<span class="direction-down">越小越好</span>。</div>
+                    <div><strong>首字延迟 TTFT</strong>：流式首个 token 等待时间，最小 0ms，无理论上限，当前预留，<span class="direction-down">越小越好</span>。</div>
                 </div>
                 <div class="eval-scroll">
                     <table class="eval-table" id="evalStrategies"></table>
