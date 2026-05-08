@@ -2,6 +2,10 @@
 
 Captures LLM prompts and completions during agent runs so they can be
 annotated and exported for supervised fine-tuning.
+
+This module is an extension point. It is not wired into the default online
+request path; callers must explicitly bind ``SFTCallbackHandler`` to a model
+when sample collection is desired.
 """
 
 from __future__ import annotations

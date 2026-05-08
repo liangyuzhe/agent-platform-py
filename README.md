@@ -13,7 +13,7 @@
 - **查询增强**：用业务知识翻译术语（如 GMV → 已支付订单总额），提高检索命中率
 - **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
-- **SFT 数据管线**：自动采集训练数据 + 教师模型标注 + JSONL 导出
+- **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
 
 ## 架构概览
@@ -81,10 +81,11 @@ financial-copilot-platform/
 │   ├── rag/                        # RAG 管线
 │   │   ├── indexing.py             # 文档索引（Loader → Splitter → Store）
 │   │   ├── retriever.py            # 混合检索（Milvus + ES BM25 + RRF）
+│   │   ├── domain_summary_builder.py # 基于语义模型生成领域摘要
 │   │   ├── parent_retriever.py     # Parent Document RAG
 │   │   ├── reranker.py             # Cross-Encoder 重排序
 │   │   ├── query_rewrite.py        # 查询重写（指代消解）
-│   │   └── schema_indexer.py       # Schema 索引（seed 脚本用）
+│   │   └── schema_indexer.py       # 旧版 mysql_schema 向量索引兼容入口（默认禁用）
 │   │
 │   ├── tool/                       # 工具层
 │   │   ├── registry.py             # 统一 Tool Registry
@@ -102,7 +103,7 @@ financial-copilot-platform/
 │   │   │   ├── safety.py           # SQL 安全分析
 │   │   │   └── error_codes.py      # 错误码分类 + is_retryable()
 │   │   ├── analyst_tools/          # 数据分析
-│   │   ├── sft/                    # SFT 数据管线
+│   │   ├── sft/                    # SFT 扩展预留（默认未启用）
 │   │   └── trace/                  # 可观测性
 │   │
 │   ├── algorithm/                  # 算法
@@ -126,7 +127,7 @@ financial-copilot-platform/
 │
 └── data/                           # 数据目录
     ├── business_knowledge_seed.json # 可配置业务知识种子
-    └── sft/                        # SFT 训练数据
+    └── sft/                        # SFT 导出数据（预留）
 ```
 
 ## 快速开始
@@ -569,15 +570,21 @@ fitted = counter.fit_to_budget(parts, max_tokens=28672)
 # 自动裁剪低优先级内容，防止超出上下文窗口
 ```
 
-### 9. SFT 数据飞轮
+### 9. SFT 扩展预留
 
 ```
-ChatModel 调用 → SFTHandler 自动采集 → 教师模型（DeepSeek）评分/修正 → JSONL 导出
+ChatModel 调用 → SFTHandler 采集 → 教师模型评分/修正 → JSONL 导出
 ```
 
-- 每次 LLM 调用自动记录输入输出
-- 教师模型评估质量并提供修正答案
-- 导出为训练格式，用于微调小模型
+当前项目主要依赖外部大模型完成意图识别、SQL 生成和结果反思，暂时没有微调小模型的刚性需求。因此 SFT 模块作为可扩展能力保留，**默认未接入在线链路，也不会自动采集每次 LLM 调用**。
+
+保留模块的用途：
+
+- 后续需要微调时，可通过 `SFTCallbackHandler` 采集 prompt/completion。
+- 可用教师模型对样本评分并生成修订答案。
+- 可导出 JSONL，用于离线训练或评测。
+
+如果要正式启用，需要补充配置开关、持久化样本表、采集范围控制和隐私脱敏策略，避免在线请求无感记录敏感业务数据。
 
 ## 配置说明
 

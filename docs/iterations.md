@@ -1656,3 +1656,33 @@ Milvus 中仍然存在 `source=mysql_schema` 的历史 schema 文档。当前 SQ
 | `scripts/seed_all.py` | 去掉第 5 步 schema re-index |
 | `scripts/cleanup_schema_indexes.py` | 新增历史 `mysql_schema` 索引清理脚本 |
 | `README.md` | 更新 seed 流程和清理脚本说明 |
+
+---
+
+## Iteration 25：旧 schema 向量索引入口降级
+
+### 出现了什么问题
+
+Iteration 24 已经停止 seed 流程重建 `source=mysql_schema` 数据，但代码里仍有两个容易误用的入口：
+
+- `agents.rag.schema_indexer.index_mysql_schemas()` 仍可直接把 MySQL schema 写入 Milvus/ES。
+- `agents.eval.dataset_generator` 仍从 Milvus `source=mysql_schema` 生成评测数据。
+
+这会让新架构和旧评测/维护脚本出现口径不一致：线上 NL2SQL 从 Redis/MySQL 读 schema，但评测和手工脚本仍可能依赖旧向量记录。
+
+### 解决方案
+
+- 新增 `agents/rag/domain_summary_builder.py`，领域摘要改为基于 Redis/MySQL 语义模型生成，不再依赖 `schema_indexer`。
+- `agents/api/app.py` 启动时调用新的领域摘要生成模块。
+- `schema_indexer.index_mysql_schemas()` 默认禁用，只有显式设置 `ENABLE_LEGACY_SCHEMA_INDEX=1` 才会运行旧版 schema 向量索引。
+- `agents/eval/dataset_generator.py` 改为从 MySQL `t_semantic_model` 生成评测数据，不再查询 Milvus `source=mysql_schema`。
+- README 和技术设计文档标明 `schema_indexer` 是 legacy 兼容入口，当前 schema 权威来源是 MySQL/Redis。
+
+### 影响
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| app 启动生成领域摘要 | 间接复用 `schema_indexer.generate_domain_summary` | 使用 `domain_summary_builder`，来源统一为语义模型 |
+| 手工调用 `index_mysql_schemas()` | 默认写入 Milvus/ES `mysql_schema` | 默认返回 disabled，避免误建旧索引 |
+| 评测数据生成 | 依赖 Milvus 旧 schema 文档 | 依赖 MySQL `t_semantic_model` |
+| 架构说明 | schema_indexer 容易被理解为当前链路 | 明确为旧版兼容入口 |

@@ -51,10 +51,13 @@
 | `agents/flow/sql_react.py` | NL2SQL 主流程 |
 | `agents/flow/state.py` | LangGraph 状态定义和 reducer |
 | `agents/rag/retriever.py` | 混合检索、业务知识召回、语义模型加载 |
+| `agents/rag/domain_summary_builder.py` | 基于 Redis/MySQL 语义模型生成领域摘要 |
 | `agents/model/format_tool.py` | LLM 结构化输出工具和 SQL 格式化校验 |
 | `agents/tool/sql_tools/` | MCP SQL 执行、安全检查、错误分类 |
 | `agents/static/index.html` | Chat、SQL Agent、审批与 SSE 进度 UI |
 | `scripts/seed_business_knowledge.py` | 业务知识种子数据 |
+
+说明：`agents/rag/schema_indexer.py` 是旧版 `source=mysql_schema` 向量索引兼容入口，默认不在启动、seed 或 NL2SQL 主链路中执行。当前 schema 权威来源是 MySQL `t_semantic_model`，高频读取走 Redis 缓存。
 
 ## 3. API 调用设计
 
@@ -451,4 +454,3 @@ sequenceDiagram
 ```bash
 pytest tests/test_final_api.py tests/test_sql_react.py -q
 ```
-

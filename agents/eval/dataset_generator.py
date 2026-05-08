@@ -1,8 +1,8 @@
-"""Generate evaluation dataset from indexed schema documents.
+"""Generate evaluation dataset from semantic schema metadata.
 
-Uses an LLM to produce (query, relevant_doc_ids) pairs from the actual
-schema documents in Milvus.  Each query simulates a realistic user question
-that would require specific tables to answer.
+Uses an LLM to produce (query, relevant_doc_ids) pairs from MySQL
+``t_semantic_model``. Each query simulates a realistic user question that
+would require specific tables to answer.
 
 Output format (JSONL):
 {"query": "查询所有员工的薪资", "relevant_doc_ids": ["schema_t_employee", "schema_t_salary"]}
@@ -15,7 +15,6 @@ import logging
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pymilvus import MilvusClient
 
 from agents.config.settings import settings
 from agents.model.chat_model import get_chat_model, init_chat_models
@@ -23,20 +22,96 @@ from agents.model.chat_model import get_chat_model, init_chat_models
 logger = logging.getLogger(__name__)
 
 
-def _fetch_all_schema_docs() -> list[dict]:
-    """Fetch all schema documents from Milvus to use as seed material."""
-    uri = f"http://{settings.milvus.addr}"
-    client = MilvusClient(uri=uri)
-    collection = settings.milvus.collection_name
+def _schema_rows_to_docs(rows: list[dict]) -> list[dict]:
+    """Render t_semantic_model rows into schema-doc-like dictionaries."""
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        table_name = row.get("table_name")
+        if table_name:
+            grouped.setdefault(table_name, []).append(row)
 
-    # Get all documents with their content and metadata
-    results = client.query(
-        collection_name=collection,
-        filter='source == "mysql_schema"',
-        output_fields=["pk", "text", "table_name", "doc_id"],
-        limit=1000,
+    docs: list[dict] = []
+    for table_name, columns in grouped.items():
+        lines = [f"表名: {table_name}", "字段:"]
+        for col in columns:
+            parts = [f"  {col.get('column_name', '')}"]
+            if col.get("column_type"):
+                parts.append(str(col["column_type"]))
+            if col.get("is_pk"):
+                parts.append("PRIMARY KEY")
+            if col.get("is_fk") and col.get("ref_table"):
+                parts.append(f"REFERENCES {col['ref_table']}({col.get('ref_column', '')})")
+            if col.get("column_comment"):
+                parts.append(f"-- {col['column_comment']}")
+            if col.get("business_name"):
+                parts.append(f"[业务名: {col['business_name']}]")
+            if col.get("synonyms"):
+                parts.append(f"[同义词: {col['synonyms']}]")
+            if col.get("business_description"):
+                parts.append(f"[描述: {col['business_description']}]")
+            lines.append(" ".join(parts))
+
+        doc_id = f"schema_{table_name}"
+        docs.append({
+            "pk": doc_id,
+            "text": "\n".join(lines),
+            "table_name": table_name,
+            "doc_id": doc_id,
+        })
+
+    return docs
+
+
+def _parse_eval_items(raw: str) -> list[dict]:
+    """Parse JSONL-ish LLM output into evaluation items."""
+    items = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        try:
+            if line.startswith("{"):
+                item = json.loads(line)
+            else:
+                start = line.find("{")
+                end = line.rfind("}") + 1
+                if start < 0 or end <= start:
+                    continue
+                item = json.loads(line[start:end])
+            if "query" in item and "relevant_doc_ids" in item:
+                items.append(item)
+        except json.JSONDecodeError:
+            continue
+    return items
+
+
+def _fetch_all_schema_docs() -> list[dict]:
+    """Fetch schema documents from MySQL t_semantic_model as seed material."""
+    import pymysql
+
+    conn = pymysql.connect(
+        host=settings.mysql.host,
+        port=settings.mysql.port,
+        user=settings.mysql.username,
+        password=settings.mysql.password,
+        database=settings.mysql.database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
     )
-    return results
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name, column_name, column_type, column_comment, "
+                "is_pk, is_fk, ref_table, ref_column, "
+                "business_name, synonyms, business_description "
+                "FROM t_semantic_model "
+                "ORDER BY table_name, column_name"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return _schema_rows_to_docs(rows)
 
 
 async def generate_eval_dataset(
@@ -52,10 +127,10 @@ async def generate_eval_dataset(
     """
     docs = _fetch_all_schema_docs()
     if not docs:
-        logger.error("No schema documents found in Milvus")
+        logger.error("No schema metadata found in t_semantic_model")
         return []
 
-    logger.info("Found %d schema documents", len(docs))
+    logger.info("Found %d semantic schema documents", len(docs))
 
     # Build schema text for LLM context
     schema_parts = []
@@ -105,30 +180,7 @@ async def generate_eval_dataset(
         response = await model.ainvoke([system, human])
         raw = response.content.strip()
 
-        for line in raw.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            # Try to extract JSON from the line
-            try:
-                # Handle lines that might have markdown formatting
-                if line.startswith("```"):
-                    continue
-                if line.startswith("{"):
-                    item = json.loads(line)
-                else:
-                    # Try to find JSON in the line
-                    start = line.find("{")
-                    end = line.rfind("}") + 1
-                    if start >= 0 and end > start:
-                        item = json.loads(line[start:end])
-                    else:
-                        continue
-
-                if "query" in item and "relevant_doc_ids" in item:
-                    all_items.append(item)
-            except json.JSONDecodeError:
-                continue
+        all_items.extend(_parse_eval_items(raw))
 
     # Deduplicate by query text
     seen = set()

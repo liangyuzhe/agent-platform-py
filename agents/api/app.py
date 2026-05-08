@@ -150,24 +150,12 @@ async def _ensure_domain_summary(logger):
             return
 
         logger.info("No domain summary found, generating from semantic model...")
-        from agents.rag.schema_indexer import generate_domain_summary
-        from agents.rag.retriever import load_full_table_metadata
+        from agents.rag.domain_summary_builder import generate_domain_summary
 
-        metadata = load_full_table_metadata()
-        if not metadata:
+        summary = await generate_domain_summary()
+        if not summary:
             logger.info("No tables found, skipping domain summary generation")
             return
-
-        # Build schema docs from metadata for domain summary generation
-        from langchain_core.documents import Document
-        docs = []
-        for m in metadata:
-            content = f"表名: {m['table_name']}"
-            if m.get("table_comment"):
-                content += f" -- {m['table_comment']}"
-            docs.append(Document(page_content=content, metadata={"table_name": m["table_name"]}))
-
-        summary = await generate_domain_summary(docs)
         logger.info("Domain summary generated (%d chars)", len(summary))
     except Exception as e:
         logger.warning("Domain summary generation failed: %s", e)

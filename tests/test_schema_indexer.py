@@ -1,4 +1,4 @@
-"""Tests for MySQL schema auto-indexing into Milvus + ES."""
+"""Tests for legacy MySQL schema indexing helpers."""
 
 import json
 import pytest
@@ -281,10 +281,20 @@ class TestIndexMysqlSchemas:
     """Test the main entry point."""
 
     @pytest.mark.asyncio
+    async def test_index_disabled_by_default(self):
+        """Legacy schema indexing should not run unless explicitly enabled."""
+        from agents.rag.schema_indexer import index_mysql_schemas
+
+        result = await index_mysql_schemas()
+
+        assert result == {"chunk_count": 0, "disabled": True}
+
+    @pytest.mark.asyncio
+    @patch.dict("os.environ", {"ENABLE_LEGACY_SCHEMA_INDEX": "1"})
     @patch("agents.rag.schema_indexer._store_schema_docs")
     @patch("agents.rag.schema_indexer._fetch_table_schemas")
     async def test_index_success(self, mock_fetch, mock_store):
-        """Should fetch schemas and store them."""
+        """Should fetch and store schemas when legacy indexing is enabled."""
         from agents.rag.schema_indexer import index_mysql_schemas
 
         mock_docs = [MagicMock()]
@@ -298,6 +308,7 @@ class TestIndexMysqlSchemas:
         mock_store.assert_called_once_with(mock_docs)
 
     @pytest.mark.asyncio
+    @patch.dict("os.environ", {"ENABLE_LEGACY_SCHEMA_INDEX": "1"})
     @patch("agents.rag.schema_indexer._fetch_table_schemas")
     async def test_index_no_tables(self, mock_fetch):
         """Should return chunk_count=0 when no tables found."""
@@ -310,6 +321,7 @@ class TestIndexMysqlSchemas:
         assert result["chunk_count"] == 0
 
     @pytest.mark.asyncio
+    @patch.dict("os.environ", {"ENABLE_LEGACY_SCHEMA_INDEX": "1"})
     @patch("agents.rag.schema_indexer._fetch_table_schemas")
     async def test_index_fetch_error_returns_zero(self, mock_fetch):
         """Should return chunk_count=0 when fetch raises."""

@@ -3,6 +3,9 @@
 Samples are stored in-memory by default with an optional persistent
 backend.  The :func:`export_to_jsonl` function writes collected samples
 to a JSONL file suitable for SFT training.
+
+This is a reserved extension module. The default application path does not
+persist SFT samples unless a caller explicitly binds the SFT callback.
 """
 
 from __future__ import annotations
