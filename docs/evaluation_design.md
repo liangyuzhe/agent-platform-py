@@ -140,6 +140,15 @@ LLM 同时标注回答该问题需要哪些表
 
 注意：这是 LLM 生成的 synthetic dataset，适合冷启动和覆盖 schema，但仍建议后续人工审核一批高价值样本，并逐步加入真实用户问题。
 
+默认会排除系统内部表，例如 `domain_summary`、`t_semantic_model`、`t_business_knowledge`、`t_agent_knowledge`。这些表服务于 Agent 运行和知识管理，不是业务人员自然语言查数的目标；如果放进评测集，LLM 可能生成“查询领域摘要”这类内部运维问题，导致业务召回指标失真。
+
+如需额外排除表，可设置：
+
+```bash
+EVAL_EXCLUDE_TABLES=table_a,table_b \
+  python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dataset.jsonl
+```
+
 ### 2. 运行评测
 
 运行评测：
@@ -170,6 +179,20 @@ python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output da
 |------|------|------|
 | `schema_lexical` | 基于表名、字段名、字段注释、业务名、同义词、业务描述做本地词法召回 | 当前 schema metadata 质量基线 |
 | `schema_table_name` | 只基于表名做召回 | 对照组，用于判断字段业务描述是否带来收益 |
+| `business_knowledge_recall` | 单独评测业务知识召回 | 仅当数据集包含 `relevant_business_doc_ids` 时计算 |
+| `agent_knowledge_recall` | 单独评测 SQL few-shot 示例召回 | 仅当数据集包含 `relevant_agent_doc_ids` 时计算 |
+| `preselect_pipeline` | 执行线上选表前置链路：`recall_evidence -> query_enhance -> select_tables` | 显式开启后评测真实 NL2SQL 选表路径 |
+
+`business_knowledge_recall` 和 `agent_knowledge_recall` 发生在选表之前，它们不是直接选择 schema 表，而是给 `query_enhance` 和后续 SQL 生成提供业务定义、公式、few-shot 示例。因此这两个策略不会拿 `relevant_doc_ids` 强行计算 schema 召回率，只有数据集显式标注了 `relevant_business_doc_ids` 或 `relevant_agent_doc_ids` 时才参与指标计算；没有对应标注时报告里会显示该策略 `num_queries = 0`。
+
+`preselect_pipeline` 是更贴近线上流程的 schema 召回评测：先召回业务知识和 few-shot，再做 query 增强，最后调用 `select_tables` 产出表名，并转换成 `schema_<table_name>` 与 `relevant_doc_ids` 对比。它会走 LLM 选表节点，因此默认不启用，避免普通本地评测消耗 LLM token。需要评测线上预选链路时显式增加参数：
+
+```bash
+python -m agents.eval.cli run \
+  --dataset data/eval/eval_dataset.jsonl \
+  --output data/eval/eval_report.json \
+  --include-online-pipeline
+```
 
 旧版通用文档检索策略（Milvus/ES/RRF）默认不再运行，因为 schema 评测集标注的是 `schema_<table>`，当前线上 schema 权威来源也是 MySQL/Redis。如果需要兼容测试旧链路，可显式开启：
 

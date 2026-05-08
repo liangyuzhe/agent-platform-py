@@ -41,6 +41,7 @@ def cmd_run(args):
     reports = run_evaluation(
         dataset_path=args.dataset,
         output_path=args.output,
+        include_online_pipeline=args.include_online_pipeline,
     )
 
     if args.detail and reports:
@@ -83,6 +84,11 @@ def main():
     p_run.add_argument("--dataset", default="eval_dataset.jsonl", help="Dataset path")
     p_run.add_argument("--output", default="eval_report.json", help="Report output path")
     p_run.add_argument("--detail", action="store_true", help="Show detailed report")
+    p_run.add_argument(
+        "--include-online-pipeline",
+        action="store_true",
+        help="Also evaluate recall_evidence -> query_enhance -> select_tables; may call external LLM",
+    )
 
     # detail
     p_det = sub.add_parser("detail", help="Show detailed report")

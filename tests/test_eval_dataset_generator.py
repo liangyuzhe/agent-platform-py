@@ -47,6 +47,18 @@ def test_schema_rows_to_docs_ignores_rows_without_table_name():
     assert docs == []
 
 
+def test_schema_rows_to_docs_excludes_internal_metadata_tables():
+    rows = [
+        {"table_name": "domain_summary", "column_name": "summary_text"},
+        {"table_name": "t_semantic_model", "column_name": "business_name"},
+        {"table_name": "t_account", "column_name": "account_name"},
+    ]
+
+    docs = _schema_rows_to_docs(rows)
+
+    assert [doc["doc_id"] for doc in docs] == ["schema_t_account"]
+
+
 def test_parse_eval_items_accepts_json_lines_and_embedded_json():
     raw = """
     {"query": "去年亏损多少", "relevant_doc_ids": ["schema_t_journal_entry", "schema_t_journal_item"]}

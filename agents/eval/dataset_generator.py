@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -21,13 +22,33 @@ from agents.model.chat_model import get_chat_model, init_chat_models
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_EXCLUDED_TABLES = {
+    "domain_summary",
+    "t_semantic_model",
+    "t_business_knowledge",
+    "t_agent_knowledge",
+    "t_document_metadata",
+}
+
+
+def _excluded_tables() -> set[str]:
+    """Tables excluded from business evaluation datasets.
+
+    Internal metadata/knowledge tables are useful for the application runtime
+    but should not become NL2SQL business evaluation targets.
+    """
+    configured = os.getenv("EVAL_EXCLUDE_TABLES", "")
+    extra = {item.strip() for item in configured.split(",") if item.strip()}
+    return _DEFAULT_EXCLUDED_TABLES | extra
+
 
 def _schema_rows_to_docs(rows: list[dict]) -> list[dict]:
     """Render t_semantic_model rows into schema-doc-like dictionaries."""
+    excluded = _excluded_tables()
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         table_name = row.get("table_name")
-        if table_name:
+        if table_name and table_name not in excluded:
             grouped.setdefault(table_name, []).append(row)
 
     docs: list[dict] = []

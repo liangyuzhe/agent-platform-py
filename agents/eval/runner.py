@@ -34,7 +34,9 @@ class StrategyConfig:
     reranker_top_k: int = 10
     rerank_threshold: float = 0.1
     # Which retriever class to use
-    mode: str = "schema_lexical"  # schema_lexical, schema_table_name, traditional, parent, vector_only, es_only
+    mode: str = "schema_lexical"
+    # Dataset field containing ground-truth IDs for this strategy.
+    relevant_field: str = "relevant_doc_ids"
 
 
 @dataclass
@@ -141,12 +143,44 @@ class _SchemaMetadataRetriever:
         ]
 
 
+class _AsyncStrategyRetriever:
+    """Sync wrapper for async evaluation strategies returning doc IDs directly."""
+
+    def __init__(self, runner, top_k: int = 10):
+        self._runner = runner
+        self._top_k = top_k
+
+    def retrieve_ids(self, query: str) -> tuple[list[str], float]:
+        result = asyncio.run(self._runner(query, self._top_k))
+        return result.retrieved_doc_ids, result.latency_ms
+
+
+class _PreselectPipelineRetriever:
+    """Sync wrapper for recall_evidence -> query_enhance -> select_tables."""
+
+    def retrieve_ids(self, query: str) -> tuple[list[str], float]:
+        from agents.eval.strategies import run_preselect_pipeline
+
+        result = asyncio.run(run_preselect_pipeline(query))
+        return result.retrieved_doc_ids, result.latency_ms
+
+
 def _build_retriever(config: StrategyConfig):
     """Build a retriever instance from strategy config."""
     if config.mode == "schema_lexical":
         return _SchemaMetadataRetriever(include_fields=True, top_k=config.reranker_top_k)
     elif config.mode == "schema_table_name":
         return _SchemaMetadataRetriever(include_fields=False, top_k=config.reranker_top_k)
+    elif config.mode == "preselect_pipeline":
+        return _PreselectPipelineRetriever()
+    elif config.mode == "business_knowledge_recall":
+        from agents.eval.strategies import run_business_knowledge_recall
+
+        return _AsyncStrategyRetriever(run_business_knowledge_recall, top_k=config.reranker_top_k)
+    elif config.mode == "agent_knowledge_recall":
+        from agents.eval.strategies import run_agent_knowledge_recall
+
+        return _AsyncStrategyRetriever(run_agent_knowledge_recall, top_k=config.reranker_top_k)
     elif config.mode == "parent":
         from agents.rag.parent_retriever import ParentDocumentRetriever
         return ParentDocumentRetriever(reranker_top_k=config.reranker_top_k)
@@ -182,11 +216,13 @@ def run_single_query(
     k_values: list[int],
 ) -> EvalResult:
     """Run retrieval for a single query and compute metrics."""
-    t0 = time.monotonic()
-    docs = retriever.retrieve(query)
-    latency = (time.monotonic() - t0) * 1000
-
-    retrieved_ids = _extract_doc_ids(docs)
+    if hasattr(retriever, "retrieve_ids"):
+        retrieved_ids, latency = retriever.retrieve_ids(query)
+    else:
+        t0 = time.monotonic()
+        docs = retriever.retrieve(query)
+        latency = (time.monotonic() - t0) * 1000
+        retrieved_ids = _extract_doc_ids(docs)
     metrics = evaluate_single(retrieved_ids, relevant_ids, k_values)
 
     return EvalResult(
@@ -221,10 +257,18 @@ def evaluate_strategy(
     retriever = _build_retriever(config)
 
     report = StrategyReport(config=config)
+    applicable = [item for item in dataset if item.get(config.relevant_field)]
+    if not applicable:
+        logger.info(
+            "Skipping strategy %s: dataset has no %s labels",
+            config.name,
+            config.relevant_field,
+        )
+        return report
 
-    for i, item in enumerate(dataset):
+    for i, item in enumerate(applicable):
         query = item["query"]
-        relevant_ids = set(item["relevant_doc_ids"])
+        relevant_ids = set(item[config.relevant_field])
 
         try:
             result = run_single_query(retriever, query, relevant_ids, k_values)
@@ -234,7 +278,7 @@ def evaluate_strategy(
             continue
 
         if (i + 1) % 10 == 0:
-            logger.info("  %s: %d/%d queries done", config.name, i + 1, len(dataset))
+            logger.info("  %s: %d/%d queries done", config.name, i + 1, len(applicable))
 
     if report.results:
         all_metrics = [r.metrics for r in report.results]
@@ -249,6 +293,7 @@ def run_evaluation(
     strategies: list[StrategyConfig] | None = None,
     k_values: list[int] | None = None,
     output_path: str | Path = "eval_report.json",
+    include_online_pipeline: bool = False,
 ) -> list[StrategyReport]:
     """Run full evaluation across all strategies.
 
@@ -262,6 +307,8 @@ def run_evaluation(
         Cutoff values for metrics.
     output_path:
         Where to save the JSON report.
+    include_online_pipeline:
+        Include preselect_pipeline, which executes LLM-backed online nodes.
     """
     # Load dataset
     dataset = []
@@ -296,7 +343,35 @@ def run_evaluation(
                 reranker_top_k=10,
                 mode="schema_table_name",
             ),
+            StrategyConfig(
+                name="business_knowledge_recall",
+                description="Business knowledge recall before table selection; evaluated when relevant_business_doc_ids labels exist",
+                retrieve_k=20,
+                reranker_top_k=10,
+                mode="business_knowledge_recall",
+                relevant_field="relevant_business_doc_ids",
+            ),
+            StrategyConfig(
+                name="agent_knowledge_recall",
+                description="Few-shot SQL knowledge recall before table selection; evaluated when relevant_agent_doc_ids labels exist",
+                retrieve_k=20,
+                reranker_top_k=10,
+                mode="agent_knowledge_recall",
+                relevant_field="relevant_agent_doc_ids",
+            ),
         ]
+        if include_online_pipeline or os.environ.get("ENABLE_ONLINE_EVAL_PIPELINE") == "1":
+            strategies.insert(
+                2,
+                StrategyConfig(
+                    name="preselect_pipeline",
+                    description="Online pre-selection path: recall_evidence -> query_enhance -> select_tables",
+                    retrieve_k=20,
+                    reranker_top_k=10,
+                    mode="preselect_pipeline",
+                    relevant_field="relevant_doc_ids",
+                ),
+            )
         if os.environ.get("ENABLE_LEGACY_EVAL_RETRIEVERS") == "1":
             strategies.extend([
                 StrategyConfig(

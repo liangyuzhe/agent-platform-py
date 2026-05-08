@@ -267,7 +267,7 @@ python -m scripts.cleanup_schema_indexes
 # 从 t_semantic_model 生成 schema 评测数据集
 python -m agents.eval.cli generate --num-per-table 3 --output data/eval/eval_dataset.jsonl
 
-# 运行当前 schema metadata 召回评测并生成报告
+# 运行召回评测并生成报告
 python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
 ```
 
@@ -278,7 +278,25 @@ python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output da
 | `generate` | 基于 MySQL `t_semantic_model` 和 LLM 生成自然语言 query，并标注标准相关表 `relevant_doc_ids` | `eval_dataset.jsonl` |
 | `run` | 对数据集里的 query 执行召回策略，把实际召回表和标准相关表对比，计算 Accuracy、Recall、MRR、NDCG、延迟等指标 | `eval_report.json` |
 
-`run` 默认评测 `schema_lexical` 和 `schema_table_name` 两个策略，不再默认加载旧版 Milvus/ES 文档检索和 CrossEncoder reranker。完整原理、指标解释和报告格式见 [评测体系设计](docs/evaluation_design.md)。
+`run` 默认评测：
+
+- `schema_lexical`：本地 schema metadata 词法召回基线。
+- `schema_table_name`：只看表名的对照组。
+- `business_knowledge_recall`：业务知识召回，只有数据集带 `relevant_business_doc_ids` 时计算。
+- `agent_knowledge_recall`：SQL few-shot 召回，只有数据集带 `relevant_agent_doc_ids` 时计算。
+
+线上选表前置链路 `preselect_pipeline` 会执行 `recall_evidence -> query_enhance -> select_tables`，可能调用外部 LLM。需要评测真实线上链路时显式开启：
+
+```bash
+python -m agents.eval.cli run \
+  --dataset data/eval/eval_dataset.jsonl \
+  --output data/eval/eval_report.json \
+  --include-online-pipeline
+```
+
+默认不再加载旧版 Milvus/ES schema 文档检索和 CrossEncoder reranker。完整原理、指标解释和报告格式见 [评测体系设计](docs/evaluation_design.md)。
+
+评测集默认排除 `domain_summary`、`t_semantic_model` 等系统内部表，避免把 Agent 元数据表误当成业务查询目标。
 
 ### 业务知识配置
 
