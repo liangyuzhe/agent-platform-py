@@ -2033,3 +2033,50 @@ python -m agents.eval.cli run-online-nl2sql \
 ```
 
 结果：`262 passed`。
+
+---
+
+## Iteration 35：审批后 SQL 执行失败自动修复
+
+### 背景
+
+用户审批 SQL 后，执行阶段可能出现由 LLM 生成 SQL 导致的错误，例如：
+
+```text
+Error: Unknown column 'a.account_type' in 'field list'
+```
+
+这类错误通常是 SQL 作用域、字段别名、子查询外层引用内层表别名、嵌套聚合等生成问题，应该进入自动修复流程，而不是直接把执行失败返回给前端。
+
+### 解决方案
+
+- 新增 `_should_repair_sql_error`：
+  - `Unknown column`
+  - `SQL syntax`
+  - `Invalid use of group function`
+  - `42S02` / `42S22` / `42000`
+  - `1054` / `1064` / `1111`
+  - `ambiguous`、`GROUP BY`、子查询返回列数等常见 SQL 生成错误
+- 权限、认证、密码、连接等不可由 SQL 改写修复的错误不进入 LLM 修复。
+- `route_after_execute` 遇到可修复 SQL 错误时进入：
+
+```text
+execute_sql -> error_analysis -> sql_generate -> safety_check -> approve
+```
+
+- `sql_generate` prompt 增加约束：
+  - 不要在同一层 SELECT 中嵌套聚合函数。
+  - 外层查询不能引用内层表别名，只能引用子查询输出列。
+- 二次审批文案改为：
+
+```text
+上次 SQL 执行失败，系统已分析错误并生成修正后的 SQL。请确认是否执行修正后的 SQL？
+```
+
+- SSE 进度文案同步覆盖“执行失败或结果异常”两类自动修复。
+
+### 验证
+
+- `Unknown column 'a.account_type' in 'field list'` 被判定为可修复。
+- 权限错误不会进入 LLM SQL 修复。
+- 修复后 SQL 的 approve interrupt 使用用户友好的执行失败修正文案。

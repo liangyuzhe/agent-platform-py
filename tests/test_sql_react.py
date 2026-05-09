@@ -948,6 +948,40 @@ class TestRouting:
         graph = build_sql_react_graph()
         assert graph is not None
 
+    def test_unknown_column_error_is_repairable(self):
+        """Generated SQL scope/column errors should enter SQL repair."""
+        from agents.flow.sql_react import _should_repair_sql_error
+
+        assert _should_repair_sql_error("Error: Unknown column 'a.account_type' in 'field list'")
+
+    def test_permission_error_is_not_llm_repairable(self):
+        """Auth/permission failures should not be fixed by regenerating SQL."""
+        from agents.flow.sql_react import _should_repair_sql_error
+
+        assert not _should_repair_sql_error("Access denied for user readonly")
+
+
+class TestApprove:
+    """Test approve node messaging."""
+
+    @patch("agents.flow.sql_react.interrupt")
+    def test_approve_message_for_repaired_sql_after_execution_error(self, mock_interrupt):
+        from agents.flow.sql_react import approve
+
+        mock_interrupt.return_value = {"approved": False, "feedback": "wait"}
+
+        result = approve({
+            "sql": "SELECT 1;",
+            "execution_history": [
+                {"sql": "SELECT bad;", "result": None, "error": "Unknown column 'bad'"}
+            ],
+        })
+
+        interrupt_payload = mock_interrupt.call_args.args[0]
+        assert "执行失败" in interrupt_payload["message"]
+        assert "修正后的 SQL" in interrupt_payload["message"]
+        assert result["approved"] is False
+
 
 # ---------------------------------------------------------------------------
 # error_analysis node

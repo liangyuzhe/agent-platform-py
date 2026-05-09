@@ -300,12 +300,12 @@ async def approve_sql_stream(req: ApproveRequest, request: Request):
                 yield {"event": "status", "data": "正在提交拒绝意见..."}
             else:
                 yield {"event": "status", "data": "已确认，正在执行 SQL..."}
-                yield {"event": "status", "data": "如果执行结果异常，系统会自动反思并生成修正 SQL..."}
+                yield {"event": "status", "data": "如果 SQL 执行失败或结果异常，系统会自动分析并生成修正 SQL..."}
 
             result = await _approve_sql_result(req)
 
             if result.pending_approval:
-                yield {"event": "status", "data": "检测到执行结果异常，已完成反思并生成修正 SQL。"}
+                yield {"event": "status", "data": "检测到执行失败或结果异常，已完成反思/分析并生成修正 SQL。"}
                 yield {"event": "status", "data": "请确认是否执行修正后的 SQL。"}
             else:
                 yield {"event": "status", "data": "SQL 执行完成。"}

@@ -677,7 +677,9 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
 8. 生成盈亏/正负判断时必须区分三种情况：大于 0、小于 0、等于 0；不要用 ELSE 把 0 归为亏损或盈利
 9. 当用户问“亏损多少/亏损金额”时，应返回亏损金额：净利润 < 0 时为 ABS(净利润)，否则为 0；不要仅返回名为“净利润”的字段
 10. 如果上下文中提供了上一轮 SQL，且用户是在追问或省略表达，必须沿用上一轮的时间范围、状态过滤、表连接、指标计算口径和排除条件；除非用户明确要求变更口径
-11. 使用 sql_format_response 工具输出结果"""),
+11. 不要在同一层 SELECT 中嵌套聚合函数，例如 SUM(CASE WHEN SUM(...) THEN ... END)；需要二次聚合时先在子查询中产出净利润/亏损金额，再在外层 SUM(亏损金额)
+12. 外层查询只能引用子查询输出列或子查询别名，不能引用内层表别名（如 a.account_type、ji.debit_amount）
+13. 使用 sql_format_response 工具输出结果"""),
         HumanMessage(content=query),
     ]
 
@@ -858,9 +860,12 @@ async def safety_check(state: SQLReactState) -> dict:
 def approve(state: SQLReactState) -> dict:
     """人工审批 SQL。使用 interrupt 暂停图执行，等待用户确认。"""
     is_reflected_sql = bool(state.get("reflection_notice"))
+    has_execution_error = any(h.get("error") for h in state.get("execution_history", []))
     message = "请确认是否执行以上 SQL？"
     if is_reflected_sql:
         message = "上次执行结果疑似异常，系统已反思并生成修正后的 SQL。请确认是否执行修正后的 SQL？"
+    elif has_execution_error:
+        message = "上次 SQL 执行失败，系统已分析错误并生成修正后的 SQL。请确认是否执行修正后的 SQL？"
 
     result = interrupt({
         "sql": state["sql"],
@@ -961,6 +966,50 @@ def _result_anomaly_reason(result) -> str | None:
         return "执行结果所有字段均为 NULL"
 
     return text_anomaly_reason
+
+
+def _should_repair_sql_error(error_msg: str) -> bool:
+    """Return whether an execution error should go through LLM SQL repair."""
+    if not error_msg:
+        return False
+    lowered = error_msg.lower()
+    non_repairable_markers = (
+        "access denied",
+        "permission denied",
+        "权限",
+        "认证",
+        "密码",
+        "connection",
+        "connect",
+        "timeout",
+        "timed out",
+    )
+    if any(marker in lowered for marker in non_repairable_markers):
+        return is_retryable(error_msg)
+
+    repairable_markers = (
+        "unknown column",
+        "unknown table",
+        "doesn't exist",
+        "does not exist",
+        "syntax",
+        "sql syntax",
+        "invalid use of group function",
+        "aggregate",
+        "field list",
+        "group by",
+        "not in group by",
+        "ambiguous",
+        "operand should contain",
+        "subquery returns",
+        "42s02",
+        "42s22",
+        "42000",
+        "1054",
+        "1064",
+        "1111",
+    )
+    return is_retryable(error_msg) or any(marker in lowered for marker in repairable_markers)
 
 
 async def error_analysis(state: SQLReactState, config=None) -> dict:
@@ -1127,8 +1176,8 @@ def build_sql_react_graph():
                 logger.info("route_after_execute: suspicious result, retrying via reflection: %s", reason)
                 return "result_reflection"
             return END
-        # 错误不可重试（语法/权限/表不存在），直接结束
-        if not is_retryable(state["error"]):
+        # SQL 生成类错误进入 LLM 修复；权限/认证等不可由 SQL 改写修复的错误直接结束。
+        if not _should_repair_sql_error(state["error"]):
             logger.info("route_after_execute: non-retryable error, ending: %s", state["error"][:200])
             return END
         # 可重试错误：检查次数
