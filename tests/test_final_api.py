@@ -159,8 +159,8 @@ class TestQueryInvoke:
 
         call_kwargs = mock_graph.ainvoke.call_args
         config = call_kwargs[1].get("config") or call_kwargs[0][1] if len(call_kwargs[0]) > 1 else call_kwargs[1].get("config")
-        # Config should have thread_id
-        assert config["configurable"]["thread_id"] == "my-session"
+        # Each new query should use an isolated graph thread under the session.
+        assert config["configurable"]["thread_id"].startswith("my-session:turn:")
 
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
@@ -179,6 +179,30 @@ class TestQueryInvoke:
         call_args = mock_graph.ainvoke.call_args
         initial_state = call_args[0][0]
         assert initial_state["intent"] == "sql_query"
+        assert initial_state["rewritten_query"] == ""
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_passes_rewritten_query_to_graph(self, mock_build_graph, mock_callbacks):
+        """Pre-classified rewritten_query should be present in graph input."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"answer": "ok", "status": "completed"})
+        mock_build_graph.return_value = mock_graph
+
+        req = QueryRequest(
+            query="第一季度员工工资",
+            session_id="s1",
+            intent="sql_query",
+            rewritten_query="我们公司第一季度的员工工资情况",
+        )
+        await query_invoke(req)
+
+        initial_state = mock_graph.ainvoke.call_args[0][0]
+        assert initial_state["query"] == "第一季度员工工资"
+        assert initial_state["rewritten_query"] == "我们公司第一季度的员工工资情况"
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +252,36 @@ class TestQueryApprove:
         assert isinstance(cmd, Command)
         assert cmd.resume["approved"] is True
         assert cmd.resume["feedback"] == "looks good"
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.save_session")
+    @patch("agents.api.routers.query.get_session")
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_approve_uses_pending_graph_thread(
+        self,
+        mock_build_graph,
+        mock_callbacks,
+        mock_get_session,
+        mock_save_session,
+    ):
+        """Approval should resume the pending turn thread, not the chat session id."""
+        from agents.api.routers.query import approve_sql, ApproveRequest
+        from agents.tool.memory.session import Session
+
+        session = Session(id="s1")
+        session.preferences["_pending_query"] = "查询用户"
+        session.preferences["_pending_thread_id"] = "s1:turn:abc123"
+        mock_get_session.return_value = session
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"answer": "ok", "status": "completed"})
+        mock_build_graph.return_value = mock_graph
+
+        await approve_sql(ApproveRequest(session_id="s1", approved=True))
+
+        config = mock_graph.ainvoke.call_args.kwargs["config"]
+        assert config["configurable"]["thread_id"] == "s1:turn:abc123"
 
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])

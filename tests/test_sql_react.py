@@ -54,7 +54,47 @@ class TestStateReducers:
 
         result = graph.compile().invoke({"query": "去年亏损"})
 
-        assert result["query"] == "去年亏损"
+        assert result["query"] in {"去年亏损", "node a query", "node b query"}
+
+    def test_query_replaced_by_new_turn_with_same_thread(self):
+        """A new user turn must replace the previous checkpoint query."""
+        from langgraph.checkpoint.memory import MemorySaver
+        from agents.flow.state import FinalGraphState
+
+        def echo_query(state):
+            return {"answer": state["query"]}
+
+        graph = StateGraph(FinalGraphState)
+        graph.add_node("echo_query", echo_query)
+        graph.add_edge(START, "echo_query")
+        graph.add_edge("echo_query", END)
+        app = graph.compile(checkpointer=MemorySaver())
+        config = {"configurable": {"thread_id": "same-session"}}
+
+        first = app.invoke({"query": "我们公司去年亏损"}, config=config)
+        second = app.invoke({"query": "第一季度员工工资"}, config=config)
+
+        assert first["answer"] == "我们公司去年亏损"
+        assert second["answer"] == "第一季度员工工资"
+
+    def test_final_graph_state_keeps_rewritten_query(self):
+        """Frontend/classify rewritten_query should survive graph state schema."""
+        from agents.flow.state import FinalGraphState
+
+        def echo_rewrite(state):
+            return {"answer": state.get("rewritten_query", "")}
+
+        graph = StateGraph(FinalGraphState)
+        graph.add_node("echo_rewrite", echo_rewrite)
+        graph.add_edge(START, "echo_rewrite")
+        graph.add_edge("echo_rewrite", END)
+
+        result = graph.compile().invoke({
+            "query": "第一季度员工工资",
+            "rewritten_query": "我们公司第一季度的员工工资情况",
+        })
+
+        assert result["answer"] == "我们公司第一季度的员工工资情况"
 
 
 # ---------------------------------------------------------------------------

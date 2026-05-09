@@ -1,6 +1,7 @@
 """查询端点：意图分类 + 子图调用 + SQL 审批。"""
 
 import logging
+import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Request
@@ -89,11 +90,18 @@ def _save_sql_context_to_session(session_id: str, query: str, sql: str, answer: 
         logger.warning("Failed to save SQL context to session: %s", e)
 
 
-def _save_pending_query(session_id: str, query: str) -> None:
+def _new_graph_thread_id(session_id: str) -> str:
+    """Create an isolated graph checkpoint thread for one user turn."""
+    return f"{session_id}:turn:{uuid.uuid4().hex[:12]}"
+
+
+def _save_pending_query(session_id: str, query: str, thread_id: str = "") -> None:
     """中断时暂存原始 query，供 approve 后恢复。"""
     try:
         session = get_session(session_id)
         session.preferences["_pending_query"] = query
+        if thread_id:
+            session.preferences["_pending_thread_id"] = thread_id
         save_session(session_id, session)
     except Exception as e:
         logger.warning("Failed to save pending query: %s", e)
@@ -104,7 +112,8 @@ def _pop_pending_query(session_id: str) -> str:
     try:
         session = get_session(session_id)
         query = session.preferences.pop("_pending_query", "")
-        if query:
+        pending_thread = session.preferences.pop("_pending_thread_id", None)
+        if query or pending_thread:
             save_session(session_id, session)
         return query
     except Exception:
@@ -120,11 +129,20 @@ def _get_pending_query(session_id: str) -> str:
         return ""
 
 
-def _make_config(session_id: str) -> dict:
+def _get_pending_thread_id(session_id: str) -> str:
+    """读取中断时暂存的 graph thread id。"""
+    try:
+        session = get_session(session_id)
+        return session.preferences.get("_pending_thread_id", "")
+    except Exception:
+        return ""
+
+
+def _make_config(session_id: str, thread_id: str | None = None) -> dict:
     """构建包含 thread_id 和 trace callbacks 的 config。"""
     callbacks = get_trace_callbacks()
     config = {
-        "configurable": {"thread_id": session_id},
+        "configurable": {"thread_id": thread_id or session_id},
     }
     if callbacks:
         config["callbacks"] = callbacks
@@ -146,7 +164,8 @@ def _extract_interrupt(result: dict) -> dict | None:
 async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
     """Resume the graph after SQL approval and convert the result to API response."""
     graph = build_final_graph()
-    config = _make_config(req.session_id)
+    graph_thread_id = _get_pending_thread_id(req.session_id) or req.session_id
+    config = _make_config(req.session_id, graph_thread_id)
 
     result = await graph.ainvoke(
         Command(resume={
@@ -203,19 +222,17 @@ async def classify_intent_endpoint(req: QueryRequest):
 async def query_invoke(req: QueryRequest):
     """查询调用：传入 intent 时跳过分类，直接路由到子图。"""
     graph = build_final_graph()
-    config = _make_config(req.session_id)
+    graph_thread_id = _new_graph_thread_id(req.session_id)
+    config = _make_config(req.session_id, graph_thread_id)
     chat_history = _load_chat_history(req.session_id)
 
     initial_state = {
         "query": req.query,
         "session_id": req.session_id,
         "chat_history": chat_history,
+        "intent": req.intent or "",
+        "rewritten_query": req.rewritten_query or "",
     }
-    # 前端已分类+重写，传入后跳过 LLM 调用
-    if req.intent:
-        initial_state["intent"] = req.intent
-    if req.rewritten_query:
-        initial_state["rewritten_query"] = req.rewritten_query
 
     try:
         result = await graph.ainvoke(initial_state, config=config)
@@ -232,7 +249,7 @@ async def query_invoke(req: QueryRequest):
     interrupt_val = _extract_interrupt(result)
     if interrupt_val:
         # 暂存原始 query，供 approve 后恢复
-        _save_pending_query(req.session_id, req.query)
+        _save_pending_query(req.session_id, req.query, graph_thread_id)
         return QueryResponse(
             query=req.query,
             answer=interrupt_val.get("message", "请确认是否执行该 SQL"),

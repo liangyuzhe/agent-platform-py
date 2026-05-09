@@ -6,11 +6,14 @@ from langgraph.graph import add_messages
 from langchain_core.documents import Document
 
 
-def keep_existing_query(current: str | None, incoming: str | None) -> str:
-    """Keep query stable when parent/child graph state is merged in one step."""
-    if current:
-        return current
-    return incoming or ""
+def latest_non_empty(current: str | None, incoming: str | None) -> str:
+    """Use the latest non-empty state value.
+
+    LangGraph checkpointers keep state by ``thread_id``. New user turns must be
+    able to replace the previous turn's query, while resume calls with no new
+    value should keep the existing one.
+    """
+    return incoming or current or ""
 
 
 class RAGChatState(TypedDict):
@@ -28,8 +31,8 @@ class RAGChatState(TypedDict):
 
 class SQLReactState(TypedDict):
     """SQL React 图的状态。"""
-    query: Annotated[str, keep_existing_query]   # 当前用户问题（可能是代词化的）
-    rewritten_query: str                         # 上下文化后的独立问题
+    query: Annotated[str, latest_non_empty]      # 当前用户问题（可能是代词化的）
+    rewritten_query: Annotated[str, latest_non_empty]  # 上下文化后的独立问题
     enhanced_query: str                          # 业务术语增强后的查询
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     table_names: list[str]                       # 所有可用表名（启动时缓存）
@@ -64,10 +67,11 @@ class AnalystState(TypedDict):
 
 class FinalGraphState(TypedDict):
     """主调度图的状态。"""
-    query: Annotated[str, keep_existing_query]
+    query: Annotated[str, latest_non_empty]
     session_id: str
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat
+    rewritten_query: Annotated[str, latest_non_empty]  # classify 或前端预分类产出的独立查询
     sql: str
     result: str
     answer: str

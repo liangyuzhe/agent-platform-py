@@ -1954,3 +1954,48 @@ python -m agents.eval.cli run-online-nl2sql \
   - 不自动审批时停在 `pending_approval`。
   - 批量评测会写 `online_nl2sql_end_to_end` 报告。
   - 模板命令可生成 JSONL。
+
+---
+
+## Iteration 33：修复跨轮 Query 被 Checkpoint 旧状态污染
+
+### 背景
+
+同一前端会话连续提问时，`thread_id` 直接使用 `session_id`，LangGraph checkpoint 会把上一轮 SQL 图状态带到下一轮。例如用户新问“第一季度员工工资”，`classify_intent.llm` 已返回：
+
+```json
+{"intent": "sql_query", "rewritten_query": "我们公司第一季度的员工工资情况"}
+```
+
+但进入 `route_intent` / `sql_react` 时，状态里的 `query` 仍可能是上一轮“我们公司去年亏损”，导致后续 SQL 全部沿用旧问题。
+
+### 原因
+
+- `FinalGraphState.query` 使用的 reducer 是“已有就保留”，新一轮输入无法覆盖旧 checkpoint query。
+- `FinalGraphState` 没声明 `rewritten_query`，前端预分类传入的 rewritten query 可能无法稳定进入主图状态。
+- graph checkpoint 以会话为粒度复用，上一轮 `sql`、`result`、`answer` 等状态也存在污染下一轮的风险。
+
+### 解决方案
+
+- 将 query reducer 改为 `latest_non_empty`：新输入覆盖旧值，approve resume 没有新值时保留当前值。
+- `SQLReactState.rewritten_query` 和 `FinalGraphState.rewritten_query` 使用同样 reducer，保证预分类结果可传入子图。
+- `/api/query/invoke` 每个新 query 生成独立 graph thread id：
+
+```text
+{session_id}:turn:{uuid}
+```
+
+- SQL 审批中断时暂存 `_pending_thread_id`，`approve` 使用该 thread 恢复图执行。
+- 聊天历史仍然通过 session store 维护，不再依赖 LangGraph checkpoint 跨轮保存业务状态。
+
+### 验证
+
+- 新增 dispatcher 回归：同一 `thread_id` 连续两次输入不同 query，第二次进入 SQL 子图时必须使用新 query 和新 rewritten query。
+- 新增 API 回归：`invoke` 使用单轮 graph thread，`approve` 使用 pending graph thread。
+- 完整回归：
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+结果：`259 passed`。
