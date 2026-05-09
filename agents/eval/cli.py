@@ -102,6 +102,50 @@ def cmd_run_nl2sql(args):
         print(f"  {key}: {value:.4f}")
 
 
+def cmd_run_online_nl2sql(args):
+    """Run live NL2SQL evaluation through the agent graph."""
+    from pathlib import Path
+
+    from agents.eval.online_nl2sql_runner import (
+        run_online_nl2sql_evaluation,
+        write_online_nl2sql_template,
+    )
+
+    dataset_path = Path(args.dataset)
+    if args.init_template:
+        output = write_online_nl2sql_template(dataset_path)
+        print(f"Wrote online NL2SQL evaluation template -> {output}")
+        print("Fill query/expected_result, then rerun without --init-template.")
+        return
+
+    if not dataset_path.exists():
+        print(
+            f"Online NL2SQL dataset not found: {dataset_path}\n"
+            "This command replays cases through the live agent and may call external LLMs.\n"
+            f"Create a template first with: python -m agents.eval.cli run-online-nl2sql --dataset {dataset_path} --init-template",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.auto_approve_sql:
+        print(
+            "Warning: --auto-approve-sql will execute safe SELECT/WITH SQL through the live SQL tool.",
+            file=sys.stderr,
+        )
+
+    report = run_online_nl2sql_evaluation(
+        dataset_path=dataset_path,
+        output_path=args.output,
+        auto_approve_sql=args.auto_approve_sql,
+        max_approval_rounds=args.max_approval_rounds,
+        force_sql_intent=not args.full_dispatch,
+        session_prefix=args.session_prefix,
+    )
+    print(f"Evaluated {report['num_queries']} online NL2SQL cases -> {args.output}")
+    for key, value in report.get("metrics", {}).items():
+        print(f"  {key}: {value:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RAG Retrieval Evaluation")
     sub = parser.add_subparsers(dest="command")
@@ -142,6 +186,37 @@ def main():
         help="Write a starter NL2SQL JSONL dataset template and exit",
     )
 
+    # run-online-nl2sql
+    p_online = sub.add_parser("run-online-nl2sql", help="Replay NL2SQL cases through the live agent")
+    p_online.add_argument("--dataset", required=True, help="JSONL cases with query and optional expected_result")
+    p_online.add_argument("--output", default="data/eval/online_nl2sql_eval_report.json", help="Report output path")
+    p_online.add_argument(
+        "--init-template",
+        action="store_true",
+        help="Write a starter online NL2SQL JSONL dataset template and exit",
+    )
+    p_online.add_argument(
+        "--auto-approve-sql",
+        action="store_true",
+        help="Auto-approve safe SQL interrupts so cases execute end to end",
+    )
+    p_online.add_argument(
+        "--max-approval-rounds",
+        type=int,
+        default=2,
+        help="Maximum SQL approval/resume rounds per case",
+    )
+    p_online.add_argument(
+        "--full-dispatch",
+        action="store_true",
+        help="Do not force sql_query intent; evaluate classify_intent as part of the path",
+    )
+    p_online.add_argument(
+        "--session-prefix",
+        default="eval-online-nl2sql",
+        help="Session id prefix used for isolated replay threads",
+    )
+
     args = parser.parse_args()
 
     if args.command == "generate":
@@ -152,6 +227,8 @@ def main():
         cmd_detail(args)
     elif args.command == "run-nl2sql":
         cmd_run_nl2sql(args)
+    elif args.command == "run-online-nl2sql":
+        cmd_run_online_nl2sql(args)
     else:
         parser.print_help()
         sys.exit(1)

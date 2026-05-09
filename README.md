@@ -275,15 +275,25 @@ python -m agents.eval.cli run-nl2sql --dataset data/eval/nl2sql_cases.jsonl --in
 
 # 填写真实 generated_sql / actual_result / expected_result 后运行端到端结果评测
 python -m agents.eval.cli run-nl2sql --dataset data/eval/nl2sql_cases.jsonl --output data/eval/nl2sql_eval_report.json
+
+# 首次准备在线 NL2SQL 回放样本模板
+python -m agents.eval.cli run-online-nl2sql --dataset data/eval/online_nl2sql_cases.jsonl --init-template
+
+# 真实调用 Agent，到 SQL 审批中断为止
+python -m agents.eval.cli run-online-nl2sql --dataset data/eval/online_nl2sql_cases.jsonl --output data/eval/online_nl2sql_eval_report.json
+
+# 测试库中自动审批并执行 SQL
+python -m agents.eval.cli run-online-nl2sql --dataset data/eval/online_nl2sql_cases.jsonl --output data/eval/online_nl2sql_eval_report.json --auto-approve-sql
 ```
 
-两个命令的区别：
+这些命令的区别：
 
 | 命令 | 作用 | 输出 |
 |------|------|------|
 | `generate` | 基于 MySQL `t_semantic_model` 和 LLM 生成自然语言 query，并标注标准相关表 `relevant_doc_ids` | `eval_dataset.jsonl` |
 | `run` | 对数据集里的 query 执行召回策略，把实际召回表和标准相关表对比，计算 Accuracy、Recall、MRR、NDCG、延迟等指标 | `eval_report.json` |
 | `run-nl2sql` | 对已有 NL2SQL 回放样本计算 SQL 有效率、执行成功率、结果匹配率、延迟和首字延迟 | `nl2sql_eval_report.json` |
+| `run-online-nl2sql` | 真实调用线上 Agent 回放自然语言 query，可停在审批中断，也可自动审批后执行 SQL | `online_nl2sql_eval_report.json` |
 
 `run` 默认评测：
 
@@ -332,6 +342,8 @@ python -m agents.eval.cli run-nl2sql \
 ```json
 {"query":"去年亏损多少","generated_sql":"SELECT ...;","actual_result":[{"loss_amount":"100.00"}],"expected_result":[{"loss_amount":"100.00"}],"latency_ms":1200,"first_token_latency_ms":350}
 ```
+
+`run-online-nl2sql` 会调用真实 Agent，适合测试线上链路。默认强制 `intent=sql_query`，避免把意图分类混入 SQL 生成指标；如需完整调度链路，加 `--full-dispatch`。默认不自动审批 SQL，只记录首个审批中断和生成 SQL；如需执行到结果，加 `--auto-approve-sql`，建议只在测试库或只读账号上使用。
 
 ### 业务知识配置
 
@@ -735,8 +747,10 @@ docker-compose logs -f milvus
 
 - [设计文档](python_langchain_design.md)
 - [评测体系设计](docs/evaluation_design.md)
+- [评测使用手册](docs/evaluation_user_guide.md)
 - [迭代优化记录](docs/iterations.md)
 - [熔断降级与 Fallback 设计](docs/resilience_design.md)
+- [财务 NL2SQL 微调方案](docs/sql_finetuning_plan.md)
 - [新手教学文档](TUTORIAL.md)
 
 ## 依赖说明

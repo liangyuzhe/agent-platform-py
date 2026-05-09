@@ -101,6 +101,7 @@ run：使用评测数据集运行评测并生成报告
 | `generate` | 让 LLM 基于 `t_semantic_model` 生成自然语言问题和标准相关表，并本地补充知识召回标注 | MySQL `t_semantic_model`、`t_business_knowledge`、`t_agent_knowledge` | `eval_dataset.jsonl` | 否 |
 | `run` | 用数据集里的 query 执行召回策略，并和标准相关表对比 | `eval_dataset.jsonl` + MySQL `t_semantic_model` | `eval_report.json` | 是 |
 | `run-nl2sql` | 对已记录的 NL2SQL SQL/结果样本做离线端到端评测 | `nl2sql_cases.jsonl` | `nl2sql_eval_report.json` | 是 |
+| `run-online-nl2sql` | 调用真实 Agent 回放 query，可停在审批中断或自动审批后执行 SQL | `online_nl2sql_cases.jsonl` | `online_nl2sql_eval_report.json` | 是 |
 
 ### 1. 生成评测数据集
 
@@ -288,6 +289,47 @@ python -m agents.eval.cli run-nl2sql \
 | `latency.p95_ms` | 端到端长尾延迟 | 最小 0ms，越小越好 |
 | `first_token_latency.p95_ms` | 首字长尾延迟 | 最小 0ms，越小越好 |
 
+### 5. 在线 NL2SQL 端到端评测
+
+在线评测用于真实回放当前 Agent 链路。它会调用外部 LLM，并复用 LangGraph 审批中断机制。
+
+初始化模板：
+
+```bash
+python -m agents.eval.cli run-online-nl2sql \
+  --dataset data/eval/online_nl2sql_cases.jsonl \
+  --init-template
+```
+
+只评测 SQL 生成，到审批中断为止：
+
+```bash
+python -m agents.eval.cli run-online-nl2sql \
+  --dataset data/eval/online_nl2sql_cases.jsonl \
+  --output data/eval/online_nl2sql_eval_report.json
+```
+
+自动审批并执行 SQL：
+
+```bash
+python -m agents.eval.cli run-online-nl2sql \
+  --dataset data/eval/online_nl2sql_cases.jsonl \
+  --output data/eval/online_nl2sql_eval_report.json \
+  --auto-approve-sql
+```
+
+默认会强制 `intent=sql_query`，让指标聚焦 NL2SQL 主链路。如果需要把意图分类也纳入评测，增加 `--full-dispatch`。
+
+在线评测报告沿用 NL2SQL 端到端报告结构，并额外记录：
+
+| 字段 | 含义 |
+|------|------|
+| `session_id` | 本次回放使用的隔离线程 |
+| `sql_rounds` | 每次审批中断生成的 SQL，包含结果反思后的修正 SQL |
+| `answer` | Agent 最终返回给前端的用户友好回答 |
+| `status` | `completed`、`pending_approval`、`error` 等状态 |
+| `first_response_latency_ms` | 首次审批中断或最终响应出现的耗时 |
+
 ## API
 
 | Endpoint | 用途 |
@@ -298,16 +340,9 @@ python -m agents.eval.cli run-nl2sql \
 
 ## 后续迭代
 
-### P1：端到端 NL2SQL 评测
+### P1：真实黄金集沉淀
 
-在 retrieval 评测基础上，增加从自然语言到 SQL 执行结果的端到端指标：
-
-- SQL 生成成功率
-- SQL 可执行率
-- 审批前安全通过率
-- 结果正确率
-- 异常反思修复率
-- 总耗时、首字延迟、SQL 生成耗时、执行耗时
+在线评测 Runner 已补齐，下一步重点是把真实财务 query、期望 SQL/结果、失败修正样本沉淀成稳定黄金集。
 
 ### P2：趋势对比
 
