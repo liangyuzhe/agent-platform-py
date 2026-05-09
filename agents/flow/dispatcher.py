@@ -6,6 +6,7 @@ invoke 端点接收预分类结果，跳过重复 LLM 调用。
 
 import json
 import logging
+import re
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -33,6 +34,22 @@ _INTENTS = [
     _INTENT_REPORT, _INTENT_AUDIT, _INTENT_KNOWLEDGE, _INTENT_CHAT,
 ]
 
+_COMPANY_CUES = ("我们公司", "本公司", "公司", "企业", "我司")
+_TIME_CUES = (
+    "去年", "今年", "本年", "上年", "第一季度", "第二季度", "第三季度", "第四季度",
+    "一季度", "二季度", "三季度", "四季度", "本月", "上月", "本季度", "上季度",
+)
+_FINANCIAL_DATA_CUES = (
+    "亏损", "盈利", "利润", "净利润", "收入", "成本", "费用", "工资", "薪酬",
+    "员工工资", "应付职工薪酬", "余额", "发生额", "预算", "报销", "发票",
+    "应收", "应付", "凭证", "资产", "折旧", "资金", "回款", "付款",
+)
+_PUBLIC_ENTITY_CUES = (
+    "贵州茅台", "腾讯", "阿里", "百度", "京东", "美团", "比亚迪", "宁德时代",
+    "苹果", "微软", "谷歌", "特斯拉", "股票", "股价", "年报", "季报",
+)
+
+
 _CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务：
 
 1. **意图分类**：根据数据库领域摘要和用户问题，判断意图类别
@@ -54,6 +71,30 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务
 
 请严格按以下 JSON 格式返回，不要有其他内容：
 {{"intent": "意图类别", "rewritten_query": "重写后的独立查询"}}"""
+
+
+def _looks_like_company_data_query(query: str) -> bool:
+    """Heuristic guard for local company finance data queries.
+
+    Intent classification is allowed to use history for rewriting, but history
+    should not turn an explicit company finance data query into generic chat.
+    """
+    if not query:
+        return False
+    text = re.sub(r"\s+", "", query)
+    if any(cue in text for cue in _PUBLIC_ENTITY_CUES) and not any(cue in text for cue in _COMPANY_CUES):
+        return False
+    has_financial_data = any(cue in text for cue in _FINANCIAL_DATA_CUES)
+    has_company = any(cue in text for cue in _COMPANY_CUES)
+    has_time = any(cue in text for cue in _TIME_CUES) or bool(re.search(r"20\d{2}年?|20\d{2}-\d{1,2}", text))
+    return has_financial_data and (has_company or has_time)
+
+
+def _normalize_intent(intent: str, query: str, rewritten_query: str) -> str:
+    """Apply deterministic guardrails after LLM intent classification."""
+    if _looks_like_company_data_query(query) or _looks_like_company_data_query(rewritten_query):
+        return _INTENT_SQL
+    return intent
 
 
 async def classify_intent(state: FinalGraphState, config=None) -> dict:
@@ -145,6 +186,8 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
             if valid_intent in raw.lower():
                 intent = valid_intent
                 break
+
+    intent = _normalize_intent(intent, state.get("query", ""), rewritten_query)
 
     logger.info("classify_intent: intent=%s, query='%s' -> '%s'", intent, state["query"], rewritten_query)
     return {"intent": intent, "rewritten_query": rewritten_query}

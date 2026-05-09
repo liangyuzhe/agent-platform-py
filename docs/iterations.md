@@ -1999,3 +1999,37 @@ python -m agents.eval.cli run-online-nl2sql \
 ```
 
 结果：`259 passed`。
+
+---
+
+## Iteration 34：公司财务查数意图防误判
+
+### 背景
+
+用户问“去年亏损”时，`classify_intent.llm` 在有历史对话干扰的情况下返回：
+
+```json
+{"intent": "chat", "rewritten_query": "我们公司去年是否亏损"}
+```
+
+但该问题属于当前企业财务数据库可回答的结构化查数问题，应该进入 `sql_query`。历史中曾出现“参考知识中未提供...”这类 RAG 回答，会误导 LLM 把本公司财务数据问题当成普通 chat/knowledge。
+
+### 解决方案
+
+- 在 `classify_intent` 解析 LLM 输出后增加 deterministic guard：
+  - 当前 query 或 rewritten query 命中本公司/企业财务数据特征时，强制归为 `sql_query`。
+  - 覆盖关键词包括亏损、盈利、利润、收入、成本、费用、工资、薪酬、余额、发生额、预算、报销、发票、应收应付、凭证、资产、折旧等。
+  - 时间口径包括去年、今年、季度、本月、上月、具体年份/期间等。
+- 明确排除外部公开公司问题，例如“贵州茅台去年亏损情况”，避免把公开知识问题强行路由到本地 SQL。
+
+### 验证
+
+- 新增回归：LLM 返回 `chat` 且 rewritten query 为“我们公司去年是否亏损”时，最终 intent 必须是 `sql_query`。
+- 新增回归：外部公司“去年贵州茅台的亏损情况”仍可保持 `chat`。
+- 完整回归：
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+结果：`262 passed`。
