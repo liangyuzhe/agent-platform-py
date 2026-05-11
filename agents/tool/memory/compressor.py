@@ -43,7 +43,7 @@ async def compress_session(
     llm: BaseChatModel,
     max_history_len: int = DEFAULT_MAX_HISTORY_LEN,
     keep_recent: int = KEEP_RECENT,
-) -> None:
+) -> list[Message]:
     """Compress session history using LLM summarization.
 
     When the history length exceeds *max_history_len*, the older messages are
@@ -57,7 +57,7 @@ async def compress_session(
         keep_recent: Number of recent messages to retain after compression.
     """
     if len(session.history) <= max_history_len:
-        return
+        return []
 
     # Split: older messages to compress, recent messages to keep
     to_compress = session.history[:-keep_recent]
@@ -80,6 +80,7 @@ async def compress_session(
             session.id,
             len(session.summary),
         )
+        return to_compress
     except Exception as e:
         logger.error("Failed to compress session %s: %s", session.id, e)
         # Restore compressed messages to history on failure

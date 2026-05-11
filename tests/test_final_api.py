@@ -90,6 +90,49 @@ class TestSessionSqlContext:
         assert history[0]["content"].startswith("[上一轮SQL上下文]")
         assert "SELECT 1" in history[0]["content"]
 
+    @patch("agents.api.routers.query.get_session")
+    def test_load_chat_history_uses_short_sliding_window(self, mock_get_session):
+        from agents.api.routers.query import _load_chat_history
+        from agents.tool.memory.session import Message, Session
+
+        session = Session(
+            id="s1",
+            summary="用户关注公司经营指标",
+            history=[
+                Message(role="user" if i % 2 == 0 else "assistant", content=f"msg-{i}")
+                for i in range(10)
+            ],
+        )
+        session.preferences["_last_sql_context"] = "生成SQL:\nSELECT 1"
+        mock_get_session.return_value = session
+
+        history = _load_chat_history("s1")
+
+        assert history[0]["content"].startswith("[上一轮SQL上下文]")
+        assert history[1]["content"].startswith("[对话摘要]")
+        assert [m["content"] for m in history[2:]] == [f"msg-{i}" for i in range(4, 10)]
+
+    @patch("agents.api.routers.query.get_session")
+    def test_load_chat_history_includes_long_term_vector_memory(self, mock_get_session, monkeypatch):
+        from langchain_core.documents import Document
+
+        from agents.api.routers.query import _load_chat_history
+        from agents.tool.memory.session import Session
+
+        session = Session(id="s1")
+        session.preferences["_has_long_term_memory"] = "1"
+        mock_get_session.return_value = session
+        monkeypatch.setattr(
+            "agents.tool.memory.vector_store.recall_long_term_memory",
+            lambda session_id, query: [Document(page_content="用户之前关注去年亏损口径")],
+        )
+
+        history = _load_chat_history("s1", "亏损多少")
+
+        assert history[0]["role"] == "system"
+        assert history[0]["content"].startswith("[长期记忆]")
+        assert "去年亏损口径" in history[0]["content"]
+
 
 # ---------------------------------------------------------------------------
 # /api/query/invoke

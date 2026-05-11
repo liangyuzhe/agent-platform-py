@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+import re
 
 import tiktoken
+
+logger = logging.getLogger(__name__)
 
 
 class TokenCounter:
@@ -15,10 +18,16 @@ class TokenCounter:
     """
 
     def __init__(self, encoding_name: str = "cl100k_base") -> None:
-        self._encoding: tiktoken.Encoding = tiktoken.get_encoding(encoding_name)
+        try:
+            self._encoding: tiktoken.Encoding | None = tiktoken.get_encoding(encoding_name)
+        except Exception as e:
+            logger.warning("tiktoken encoding %s unavailable, using fallback counter: %s", encoding_name, e)
+            self._encoding = None
 
     def count(self, text: str) -> int:
         """Return the number of tokens in *text*."""
+        if self._encoding is None:
+            return _fallback_count(text)
         return len(self._encoding.encode(text))
 
     def fit_to_budget(self, parts: list[str], max_tokens: int) -> list[str]:
@@ -43,3 +52,14 @@ class TokenCounter:
             result.append(part)
             used += tokens
         return result
+
+
+def _fallback_count(text: str) -> int:
+    """Approximate token count without external tiktoken assets."""
+    count = 0
+    for token in re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]", text or ""):
+        if re.fullmatch(r"[A-Za-z0-9_]+", token):
+            count += 1
+        else:
+            count += 1
+    return count

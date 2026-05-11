@@ -273,6 +273,26 @@ class MemorySettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_")
 
+    short_window_messages: int = Field(
+        default=6,
+        description="Recent messages to inject as short-term sliding-window memory",
+    )
+    summary_max_history_len: int = Field(
+        default=20,
+        description="Trigger medium-term summary when session history exceeds this many messages",
+    )
+    summary_keep_recent: int = Field(
+        default=6,
+        description="Recent messages to keep after medium-term summarisation",
+    )
+    long_term_top_k: int = Field(
+        default=3,
+        description="Number of long-term vector memories to retrieve",
+    )
+    enable_long_term_vector: bool = Field(
+        default=True,
+        description="Persist compressed memory archives into vector storage",
+    )
     max_tokens: int = Field(
         default=4000,
         description="Max tokens to keep in conversation history",

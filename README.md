@@ -518,22 +518,22 @@ Query → [Milvus(向量), ES(BM25)] → RRF 融合 → Cross-Encoder 重排序 
 - **RRF**：Reciprocal Rank Fusion，无需调参
 - **Cross-Encoder**：`BAAI/bge-reranker-v2-m3`，精排序
 
-### 3. 三级记忆系统
+### 3. 分层记忆系统
 
-| 层级 | 存储 | 内容 | 生命周期 |
-|------|------|------|---------|
-| L1 工作记忆 | Session.History | 最近 3 轮对话原文 | 压缩触发前 |
-| L2 摘要记忆 | Session.Summary | LLM 生成的对话摘要 | 跨压缩周期累积 |
-| L3 知识记忆 | Session.Entities/Facts/Preferences | 结构化实体、事实、偏好 | 持久累积 |
+| 层级 | 存储 | 内容 | 触发方式 |
+|------|------|------|----------|
+| 短期记忆 | `Session.history` 滑动窗口 | 最近 `MEMORY_SHORT_WINDOW_MESSAGES` 条消息，直接注入意图识别/重写 | 每轮读取时裁剪 |
+| 中期记忆 | `Session.summary` | LLM 将旧消息和已有摘要合并后的滚动摘要 | 历史超过 `MEMORY_SUMMARY_MAX_HISTORY_LEN` 后异步压缩 |
+| 长期记忆 | Milvus `source=conversation_memory` | 被压缩归档的旧对话，按 `session_id` 隔离 | 压缩成功后写入向量库，后续按当前 query 语义召回 |
 
-**压缩流程：**
-1. 历史超过阈值 → 取出旧消息
-2. LLM 合并旧消息 + 已有摘要 → 新摘要
-3. 保留最近 N 轮作为工作记忆
+**压缩与召回流程：**
+1. 每轮完成后保存 Q&A 到 session。
+2. 后台 memory manager 判断历史长度，超过阈值时保留最近 `MEMORY_SUMMARY_KEEP_RECENT` 条。
+3. 旧消息与已有摘要合并成新的 `Session.summary`。
+4. 被归档的旧消息写入 Milvus 长期记忆。
+5. 后续查询只携带短期窗口 + 摘要；如果当前 session 有长期记忆，再按 query 召回相关归档片段。
 
-**知识提取：**
-- 每轮对话后异步提取实体、事实、偏好
-- 用于 Query 重写和 Prompt 增强
+结构化实体、事实、偏好提取模块仍保留为扩展能力，适合后续把稳定用户偏好或业务事实沉淀为更可控的长期记忆。
 
 ### 4. SQL 安全分析
 

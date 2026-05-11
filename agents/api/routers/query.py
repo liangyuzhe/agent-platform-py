@@ -14,6 +14,8 @@ from agents.flow.dispatcher import build_final_graph
 from agents.tool.trace.tracing import get_trace_callbacks
 from agents.tool.memory.store import get_session, save_session
 from agents.tool.memory.session import Message
+from agents.tool.memory.manager import schedule_memory_maintenance
+from agents.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +50,21 @@ class ApproveRequest(BaseModel):
     feedback: str = ""
 
 
-def _load_chat_history(session_id: str) -> list[dict]:
+def _load_chat_history(session_id: str, query: str = "") -> list[dict]:
     """从 session store 加载对话历史。"""
     session = get_session(session_id)
-    history = [{"role": m.role, "content": m.content} for m in session.history]
+    recent = session.history[-settings.memory.short_window_messages:]
+    history = [{"role": m.role, "content": m.content} for m in recent]
+    if query and session.preferences.get("_has_long_term_memory"):
+        try:
+            from agents.tool.memory.vector_store import recall_long_term_memory
+
+            memories = recall_long_term_memory(session_id, query)
+            if memories:
+                memory_text = "\n---\n".join(d.page_content for d in memories)
+                history.insert(0, {"role": "system", "content": f"[长期记忆]\n{memory_text}"})
+        except Exception as e:
+            logger.warning("Failed to recall long-term memory: %s", e)
     if session.summary:
         history.insert(0, {"role": "system", "content": f"[对话摘要] {session.summary}"})
     sql_context = session.preferences.get("_last_sql_context", "")
@@ -68,6 +81,7 @@ def _save_qa_to_session(session_id: str, query: str, answer: str) -> None:
         session.history.append(Message(role="user", content=query))
         session.history.append(Message(role="assistant", content=answer))
         save_session(session_id, session)
+        schedule_memory_maintenance(session_id)
         logger.info("Saved Q&A to session %s, history length: %d", session_id, len(session.history))
     except Exception as e:
         logger.warning("Failed to save Q&A to session: %s", e)
@@ -206,7 +220,7 @@ async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
 async def classify_intent_endpoint(req: QueryRequest):
     """意图分类（非流式），前端据此选择流式端点。"""
     from agents.flow.dispatcher import classify_intent
-    chat_history = _load_chat_history(req.session_id)
+    chat_history = _load_chat_history(req.session_id, req.query)
     result = await classify_intent(
         {"query": req.query, "chat_history": chat_history},
         config=_make_config(req.session_id),
@@ -224,7 +238,7 @@ async def query_invoke(req: QueryRequest):
     graph = build_final_graph()
     graph_thread_id = _new_graph_thread_id(req.session_id)
     config = _make_config(req.session_id, graph_thread_id)
-    chat_history = _load_chat_history(req.session_id)
+    chat_history = _load_chat_history(req.session_id, req.query)
 
     initial_state = {
         "query": req.query,

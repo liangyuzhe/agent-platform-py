@@ -166,12 +166,28 @@ async def chat(state: RAGChatState, config=None) -> dict:
 async def _compress_and_save(session_id: str, session: dict):
     """后台任务：压缩记忆并保存。"""
     from agents.tool.memory.session import Session
+    from agents.tool.memory.vector_store import index_long_term_memory
     session_obj = Session(**session)
+    if len(session_obj.history) <= settings.memory.summary_max_history_len:
+        save_session(session_id, session_obj)
+        return
 
     # 压缩记忆（如果历史过长）
     try:
         model = get_chat_model(settings.chat_model_type)
-        await asyncio.wait_for(compress_session(session_obj, llm=model), timeout=settings.resilience.llm_rewrite_timeout)
+        archived = await asyncio.wait_for(
+            compress_session(
+                session_obj,
+                llm=model,
+                max_history_len=settings.memory.summary_max_history_len,
+                keep_recent=settings.memory.summary_keep_recent,
+            ),
+            timeout=settings.resilience.llm_rewrite_timeout,
+        )
+        if archived:
+            doc_id = await asyncio.to_thread(index_long_term_memory, session_id, archived, session_obj.summary)
+            if doc_id:
+                session_obj.preferences["_has_long_term_memory"] = "1"
     except Exception as e:
         logger.warning("Memory compression failed: %s", e)
 

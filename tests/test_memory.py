@@ -84,3 +84,62 @@ class TestSessionStore:
         retrieved = get_session("test_user")
         assert retrieved.id == "test_user"
         assert retrieved.summary == "hello"
+
+
+@pytest.mark.asyncio
+async def test_compress_session_returns_archived_messages():
+    from agents.tool.memory.compressor import compress_session
+
+    session = Session(
+        id="s1",
+        history=[Message(role="user", content=f"msg-{i}") for i in range(8)],
+    )
+    llm = AsyncMock()
+    llm.ainvoke = AsyncMock(return_value=MagicMock(content="摘要"))
+
+    archived = await compress_session(session, llm=llm, max_history_len=6, keep_recent=2)
+
+    assert [m.content for m in archived] == [f"msg-{i}" for i in range(6)]
+    assert [m.content for m in session.history] == ["msg-6", "msg-7"]
+    assert session.summary == "摘要"
+
+
+@pytest.mark.asyncio
+async def test_maintain_session_memory_indexes_compressed_archive(monkeypatch):
+    from agents.tool.memory.manager import maintain_session_memory
+
+    session = Session(
+        id="s1",
+        history=[Message(role="user", content=f"msg-{i}") for i in range(8)],
+    )
+    saved = {}
+    indexed = {}
+    llm = AsyncMock()
+    llm.ainvoke = AsyncMock(return_value=MagicMock(content="摘要"))
+
+    monkeypatch.setattr("agents.tool.memory.manager.get_session", lambda session_id: session)
+    monkeypatch.setattr(
+        "agents.tool.memory.manager.save_session",
+        lambda session_id, sess: saved.update({session_id: sess}),
+    )
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        indexed["args"] = (fn, args, kwargs)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr("agents.tool.memory.manager.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "agents.tool.memory.manager.index_long_term_memory",
+        lambda session_id, messages, summary: indexed.update({
+            "session_id": session_id,
+            "messages": messages,
+            "summary": summary,
+        }),
+    )
+
+    await maintain_session_memory("s1", llm=llm, max_history_len=6, keep_recent=2)
+
+    assert saved["s1"].summary == "摘要"
+    assert [m.content for m in saved["s1"].history] == ["msg-6", "msg-7"]
+    assert indexed["session_id"] == "s1"
+    assert [m.content for m in indexed["messages"]] == [f"msg-{i}" for i in range(6)]
