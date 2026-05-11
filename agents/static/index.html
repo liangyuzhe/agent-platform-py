@@ -261,6 +261,35 @@
             line-height: 1.7;
             font-size: 14px;
         }
+        .admin-grid { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 16px; }
+        .admin-form { display: grid; gap: 10px; }
+        .admin-form label { display: grid; gap: 5px; font-size: 12px; color: #475569; font-weight: 650; }
+        .admin-form input, .admin-form select, .admin-form textarea {
+            width: 100%;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 10px 12px;
+            background: #fff;
+            color: var(--text);
+            font-size: 14px;
+        }
+        .admin-form textarea { min-height: 74px; resize: vertical; }
+        .admin-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .admin-btn {
+            min-height: 38px;
+            padding: 0 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 650;
+            background: var(--brand);
+            color: #fff;
+        }
+        .admin-btn.secondary { background: #fff; color: #334155; border: 1px solid var(--line); }
+        .admin-table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; border: 1px solid var(--line); }
+        .admin-table th, .admin-table td { padding: 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+        .admin-table th { background: #f8fafc; color: #475569; font-weight: 700; }
+        .admin-table code { word-break: break-word; }
         code { background: #eef2f7; color: #334155; padding: 2px 5px; border-radius: 4px; }
         .eval-grid { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
         .metric-card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; }
@@ -304,6 +333,7 @@
             .upload-options { grid-template-columns: 1fr; }
             .eval-grid { grid-template-columns: 1fr 1fr; }
             .metric-help { grid-template-columns: 1fr; }
+            .admin-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -435,8 +465,60 @@
               <div class="upload-box">
                 <div class="admin-note">
                     <strong>管理面板</strong><br>
-                    语义模型和业务知识通过 <code>scripts/seed_semantic_model.py</code> 和 <code>scripts/seed_business_knowledge.py</code> 管理。
-                    表结构变更由 <code>t_semantic_model</code> 自动同步（binlog 监听 + 轮询）。
+                    意图识别默认由 LLM 判断。这里维护的是可选规则信号，适合把高频、确定性强的路由策略沉淀到数据库；规则与 LLM 并行执行，最终由仲裁器给出意图。
+                </div>
+                <div class="admin-grid" style="margin-top:16px;">
+                    <form class="admin-form" onsubmit="saveIntentRule(event)">
+                        <input type="hidden" id="intentRuleId">
+                        <label>规则名称
+                            <input id="intentRuleName" placeholder="例如：公开公司知识问答">
+                        </label>
+                        <label>目标意图
+                            <select id="intentRuleIntent">
+                                <option value="chat">chat</option>
+                                <option value="sql_query">sql_query</option>
+                                <option value="knowledge">knowledge</option>
+                                <option value="anomaly_detect">anomaly_detect</option>
+                                <option value="reconciliation">reconciliation</option>
+                                <option value="report">report</option>
+                                <option value="audit">audit</option>
+                            </select>
+                        </label>
+                        <label>匹配方式
+                            <select id="intentRuleMatchType">
+                                <option value="contains">contains</option>
+                                <option value="exact">exact</option>
+                                <option value="regex">regex</option>
+                            </select>
+                        </label>
+                        <label>匹配表达式
+                            <textarea id="intentRulePattern" placeholder="关键词、完整问题或正则表达式"></textarea>
+                        </label>
+                        <label>重写模板
+                            <input id="intentRuleRewriteTemplate" placeholder="可选，例如：公司{query}">
+                        </label>
+                        <label>优先级
+                            <input id="intentRulePriority" type="number" value="100">
+                        </label>
+                        <label>置信度
+                            <input id="intentRuleConfidence" type="number" min="0" max="1" step="0.01" value="0.9">
+                        </label>
+                        <label>说明
+                            <textarea id="intentRuleDescription" placeholder="规则适用场景"></textarea>
+                        </label>
+                        <label style="display:flex;grid-template-columns:auto 1fr;align-items:center;">
+                            <input id="intentRuleEnabled" type="checkbox" checked style="width:auto;">
+                            启用规则
+                        </label>
+                        <div class="admin-actions">
+                            <button class="admin-btn" type="submit">保存规则</button>
+                            <button class="admin-btn secondary" type="button" onclick="resetIntentRuleForm()">清空</button>
+                        </div>
+                        <div id="intentRuleStatus" class="eval-muted"></div>
+                    </form>
+                    <div class="eval-scroll">
+                        <table class="admin-table" id="intentRulesTable"></table>
+                    </div>
                 </div>
               </div>
             </section>
@@ -475,6 +557,7 @@
             document.getElementById('pageTitle').textContent = titles[name][0];
             document.getElementById('pageMeta').textContent = titles[name][1];
             if (name === 'eval') loadEvalReport();
+            if (name === 'admin') loadIntentRules();
         }
 
         // --- Chat ---
@@ -582,7 +665,8 @@
                     let dots = 0;
                     const loading = setInterval(() => {
                         dots = (dots + 1) % 4;
-                        bubble.textContent = '生成 SQL' + '.'.repeat(dots);
+                        bubble.innerHTML = '<span class="intent-tag sql">SQL Query</span>'
+                            + '<div class="answer-text">意图识别：结构化数据查询。正在生成 SQL' + '.'.repeat(dots) + '</div>';
                     }, 500);
                     const resp = await fetch('/api/query/invoke', {
                         method: 'POST',
@@ -598,6 +682,9 @@
                     }
                 } else {
                     // Chat/Knowledge path: streaming (用重写后的查询)
+                    bubble.innerHTML = '<span class="intent-tag chat">Chat</span>'
+                        + '<div class="answer-text">意图识别：知识问答 / 普通对话。正在检索知识...</div>';
+                    const answerBox = bubble.querySelector('.answer-text');
                     const resp = await fetch('/api/rag/chat/stream', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -621,13 +708,13 @@
                                 const ev = parseSSEBlock(part);
                                 if (ev.event !== 'done' && ev.data) fullContent += ev.data;
                             }
-                            if (fullContent) bubble.textContent = fullContent;
+                            if (fullContent) answerBox.textContent = fullContent;
                         }
                         if (buffer.trim()) {
                             const ev = parseSSEBlock(buffer);
                             if (ev.event !== 'done' && ev.data) fullContent += ev.data;
                         }
-                        bubble.textContent = fullContent || '(无响应)';
+                        answerBox.textContent = fullContent || '(无响应)';
                     }
                 }
             } catch (e) {
@@ -735,6 +822,124 @@
             const d = document.createElement('div');
             d.textContent = s;
             return d.innerHTML;
+        }
+
+        // --- Admin: intent rules ---
+        let intentRulesLoaded = false;
+        async function loadIntentRules(force = false) {
+            if (intentRulesLoaded && !force) return;
+            const table = document.getElementById('intentRulesTable');
+            const status = document.getElementById('intentRuleStatus');
+            table.innerHTML = '<tr><td>加载中...</td></tr>';
+            try {
+                const resp = await fetch('/api/admin/intent-rules');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                const items = data.items || [];
+                if (!items.length) {
+                    table.innerHTML = '<tr><td class="eval-muted">暂无规则。未配置规则时，意图识别完全由 LLM 判断。</td></tr>';
+                } else {
+                    table.innerHTML = '<thead><tr><th>规则</th><th>意图</th><th>匹配</th><th>重写</th><th>优先级</th><th>状态</th><th>操作</th></tr></thead><tbody>'
+                        + items.map(renderIntentRuleRow).join('')
+                        + '</tbody>';
+                }
+                status.textContent = `已加载 ${items.length} 条规则`;
+                intentRulesLoaded = true;
+            } catch (e) {
+                table.innerHTML = '<tr><td class="eval-muted">加载失败：' + escHtml(e.message) + '</td></tr>';
+                status.textContent = '';
+            }
+        }
+
+        function renderIntentRuleRow(rule) {
+            const encoded = encodeURIComponent(JSON.stringify(rule));
+            return `<tr>
+                <td><strong>${escHtml(rule.name || '')}</strong><br><span class="eval-muted">${escHtml(rule.description || '')}</span></td>
+                <td><code>${escHtml(rule.target_intent || '')}</code></td>
+                <td><code>${escHtml(rule.match_type || '')}</code><br>${escHtml(rule.pattern || '')}</td>
+                <td>${rule.rewrite_template ? `<code>${escHtml(rule.rewrite_template)}</code>` : '<span class="eval-muted">原样使用 LLM 重写</span>'}</td>
+                <td>${escHtml(String(rule.priority ?? ''))}<br><span class="eval-muted">conf ${escHtml(String(rule.confidence ?? ''))}</span></td>
+                <td>${rule.enabled ? '启用' : '停用'}</td>
+                <td>
+                    <button class="admin-btn secondary" type="button" onclick="editIntentRule('${encoded}')">编辑</button>
+                    <button class="admin-btn secondary" type="button" onclick="deleteIntentRule(${Number(rule.id)})">删除</button>
+                </td>
+            </tr>`;
+        }
+
+        function editIntentRule(encoded) {
+            const rule = JSON.parse(decodeURIComponent(encoded));
+            document.getElementById('intentRuleId').value = rule.id || '';
+            document.getElementById('intentRuleName').value = rule.name || '';
+            document.getElementById('intentRuleIntent').value = rule.target_intent || 'chat';
+            document.getElementById('intentRuleMatchType').value = rule.match_type || 'contains';
+            document.getElementById('intentRulePattern').value = rule.pattern || '';
+            document.getElementById('intentRuleRewriteTemplate').value = rule.rewrite_template || '';
+            document.getElementById('intentRulePriority').value = rule.priority ?? 100;
+            document.getElementById('intentRuleConfidence').value = rule.confidence ?? 0.9;
+            document.getElementById('intentRuleDescription').value = rule.description || '';
+            document.getElementById('intentRuleEnabled').checked = !!rule.enabled;
+        }
+
+        function resetIntentRuleForm() {
+            document.getElementById('intentRuleId').value = '';
+            document.getElementById('intentRuleName').value = '';
+            document.getElementById('intentRuleIntent').value = 'chat';
+            document.getElementById('intentRuleMatchType').value = 'contains';
+            document.getElementById('intentRulePattern').value = '';
+            document.getElementById('intentRuleRewriteTemplate').value = '';
+            document.getElementById('intentRulePriority').value = 100;
+            document.getElementById('intentRuleConfidence').value = 0.9;
+            document.getElementById('intentRuleDescription').value = '';
+            document.getElementById('intentRuleEnabled').checked = true;
+        }
+
+        async function saveIntentRule(event) {
+            event.preventDefault();
+            const status = document.getElementById('intentRuleStatus');
+            const payload = {
+                id: document.getElementById('intentRuleId').value ? Number(document.getElementById('intentRuleId').value) : null,
+                name: document.getElementById('intentRuleName').value.trim(),
+                target_intent: document.getElementById('intentRuleIntent').value,
+                match_type: document.getElementById('intentRuleMatchType').value,
+                pattern: document.getElementById('intentRulePattern').value,
+                rewrite_template: document.getElementById('intentRuleRewriteTemplate').value,
+                priority: Number(document.getElementById('intentRulePriority').value || 100),
+                confidence: Number(document.getElementById('intentRuleConfidence').value || 0.9),
+                enabled: document.getElementById('intentRuleEnabled').checked,
+                description: document.getElementById('intentRuleDescription').value,
+            };
+            if (!payload.name || !payload.pattern) {
+                status.textContent = '规则名称和匹配表达式不能为空';
+                return;
+            }
+            status.textContent = '保存中...';
+            try {
+                const resp = await fetch('/api/admin/intent-rules', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                resetIntentRuleForm();
+                intentRulesLoaded = false;
+                await loadIntentRules(true);
+            } catch (e) {
+                status.textContent = '保存失败：' + e.message;
+            }
+        }
+
+        async function deleteIntentRule(id) {
+            const status = document.getElementById('intentRuleStatus');
+            status.textContent = '删除中...';
+            try {
+                const resp = await fetch('/api/admin/intent-rules/' + id, {method: 'DELETE'});
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                intentRulesLoaded = false;
+                await loadIntentRules(true);
+            } catch (e) {
+                status.textContent = '删除失败：' + e.message;
+            }
         }
 
         // --- Evaluation ---

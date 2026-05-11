@@ -5,6 +5,7 @@ Runs in order:
   2. Semantic model (seed_semantic_model)
   3. Business knowledge + Milvus index (seed_business_knowledge)
   4. Agent knowledge + Milvus index (seed_agent_knowledge)
+  5. Intent rules (seed_intent_rules)
 
 Usage:
     python -m scripts.seed_all
@@ -22,31 +23,38 @@ def main():
 
     # Step 1: Business tables + data
     print("=" * 60)
-    print("Step 1/4: Creating business tables and seeding data")
+    print("Step 1/5: Creating business tables and seeding data")
     print("=" * 60)
     from scripts.seed_financial import main as seed_financial_main
     seed_financial_main()
 
     # Step 2: Semantic model
     print("=" * 60)
-    print("Step 2/4: Seeding semantic model")
+    print("Step 2/5: Seeding semantic model")
     print("=" * 60)
     from scripts.seed_semantic_model import main as seed_semantic_main
     seed_semantic_main()
 
     # Step 3: Business knowledge
     print("=" * 60)
-    print("Step 3/4: Seeding business knowledge + Milvus index")
+    print("Step 3/5: Seeding business knowledge + Milvus index")
     print("=" * 60)
     from scripts.seed_business_knowledge import main as seed_bk_main
     seed_bk_main()
 
     # Step 4: Agent knowledge
     print("=" * 60)
-    print("Step 4/4: Seeding agent knowledge + Milvus index")
+    print("Step 4/5: Seeding agent knowledge + Milvus index")
     print("=" * 60)
     from scripts.seed_agent_knowledge import main as seed_ak_main
     seed_ak_main()
+
+    # Step 5: Intent rules
+    print("=" * 60)
+    print("Step 5/5: Seeding configurable intent rules")
+    print("=" * 60)
+    from scripts.seed_intent_rules import main as seed_intent_rules_main
+    seed_intent_rules_main()
 
     print("\n" + "=" * 60)
     print("All seeding complete!")
@@ -83,6 +91,7 @@ def _print_summary():
         ("t_semantic_model", "语义模型"),
         ("t_business_knowledge", "业务知识"),
         ("t_agent_knowledge", "智能体知识库"),
+        ("t_intent_rule", "意图规则"),
     ]
     try:
         with conn.cursor() as cur:

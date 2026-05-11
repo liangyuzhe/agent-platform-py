@@ -35,6 +35,7 @@ htmlcov/
 .tox/
 .nox/
 data/eval/
+docs/assets/demos/raw/
 
 # Type checking
 .mypy_cache/

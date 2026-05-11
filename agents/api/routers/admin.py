@@ -309,3 +309,61 @@ async def reindex_agent_knowledge():
     except Exception as e:
         logger.warning("Agent knowledge reindex failed: %s", e)
         return {"success": False, "message": f"Reindex failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Intent Rule CRUD
+# ---------------------------------------------------------------------------
+
+class IntentRuleItem(BaseModel):
+    id: int | None = None
+    name: str
+    target_intent: str
+    match_type: str = "contains"
+    pattern: str
+    rewrite_template: str = ""
+    priority: int = 100
+    confidence: float = 0.9
+    enabled: bool = True
+    description: str = ""
+
+
+@router.get("/intent-rules")
+async def list_intent_rule_items():
+    """List configurable intent rules."""
+    try:
+        from agents.tool.storage.intent_rules import ensure_intent_rule_table, list_intent_rules
+
+        ensure_intent_rule_table()
+        items = list_intent_rules(enabled_only=False)
+        return {"items": items, "count": len(items)}
+    except Exception as e:
+        logger.warning("List intent rules failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/intent-rules")
+async def upsert_intent_rule_item(item: IntentRuleItem):
+    """Create or update a configurable intent rule."""
+    try:
+        from agents.tool.storage.intent_rules import ensure_intent_rule_table, upsert_intent_rule
+
+        ensure_intent_rule_table()
+        rule_id = upsert_intent_rule(item.model_dump())
+        return {"success": True, "id": rule_id, "message": f"Saved intent rule #{rule_id}"}
+    except Exception as e:
+        logger.warning("Save intent rule failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.delete("/intent-rules/{rule_id}")
+async def delete_intent_rule_item(rule_id: int):
+    """Delete a configurable intent rule."""
+    try:
+        from agents.tool.storage.intent_rules import delete_intent_rule
+
+        delete_intent_rule(rule_id)
+        return {"success": True, "message": f"Deleted intent rule #{rule_id}"}
+    except Exception as e:
+        logger.warning("Delete intent rule failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e

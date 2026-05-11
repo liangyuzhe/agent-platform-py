@@ -2004,6 +2004,8 @@ python -m agents.eval.cli run-online-nl2sql \
 
 ## Iteration 34：公司财务查数意图防误判
 
+> 后续已由 Iteration 36 替换为“数据库可配置规则 + LLM + 仲裁”的通用方案，避免把业务关键词写死在代码中。
+
 ### 背景
 
 用户问“去年亏损”时，`classify_intent.llm` 在有历史对话干扰的情况下返回：
@@ -2080,3 +2082,58 @@ execute_sql -> error_analysis -> sql_generate -> safety_check -> approve
 - `Unknown column 'a.account_type' in 'field list'` 被判定为可修复。
 - 权限错误不会进入 LLM SQL 修复。
 - 修复后 SQL 的 approve interrupt 使用用户友好的执行失败修正文案。
+
+---
+
+## Iteration 36：意图规则配置化与 LLM 仲裁
+
+### 背景
+
+Iteration 34 为了解决“去年亏损”被历史 RAG 回答误导成 `chat`，在 `dispatcher.py` 中加入了本公司、时间、财务指标、外部公司等关键词 guard。该方式能解决单个问题，但会带来两个明显风险：
+
+- 业务词、主体词和时间词写在代码里，后续换查询会不断增加 hardcode。
+- 外部主体问题可能被“时间 + 财务词”误判为本地 SQL 查询。
+
+### 解决方案
+
+- 移除 `dispatcher.py` 中的业务关键词常量和 deterministic keyword guard。
+- 新增 `t_intent_rule`，规则字段包括 `target_intent`、`match_type`、`pattern`、`rewrite_template`、`priority`、`confidence`、`enabled`。
+- 新增 `agents.tool.storage.intent_rules`：
+  - 只负责规则表 DDL、CRUD、匹配算法。
+  - 不内置任何业务关键词或公开公司名单。
+  - MySQL 不可用时返回空规则，不影响 LLM 意图识别。
+- 新增 `data/intent_rules_seed.json` 和 `scripts.seed_intent_rules`，用于把默认规则作为数据写入 MySQL，而不是写在 `dispatcher.py`。
+- `classify_intent` 改为并行执行：
+
+```text
+用户问题
+  ├─ LLM 意图识别 + 查询重写
+  └─ 数据库规则引擎匹配
+        ↓
+      仲裁器
+        ↓
+  intent + rewritten_query
+```
+
+- 仲裁策略：
+  - 没有规则命中时，使用 LLM 意图。
+  - 有规则命中且目标意图合法时，使用规则意图。
+  - 有规则命中且配置了 `rewrite_template` 时，用数据里的模板补齐查询主体，例如把“第一季度毛利率”补齐为“公司第一季度毛利率”。
+  - 规则内容由 Admin 页面维护，而不是写入代码。
+- Admin 页面新增意图规则维护入口，可新增、编辑、删除、启停规则和维护重写模板。
+- 移除“只有 intent 没有 rewritten_query 时兼容旧版跳过分类”的分支；只有同时传入 `intent` 和 `rewritten_query` 才视为前端已完成预分类，避免旧状态或旧客户端把后续问题强行路由到错误意图。
+
+### 验证
+
+- 新增回归：无规则命中时，LLM 返回 `chat` 的问题保持 `chat`。
+- 新增回归：规则引擎可通过数据库规则把 LLM 的 `chat` 仲裁为 `sql_query`。
+- 新增回归：规则引擎可通过 `rewrite_template` 把“第一季度毛利率”重写为“公司第一季度毛利率”。
+- 新增回归：只有 `intent` 没有 `rewritten_query` 时必须重新走当前轮 LLM 分类。
+- 新增 API 回归：`/api/admin/intent-rules` 支持列表和保存。
+- 局部回归：
+
+```bash
+.venv/bin/python -m pytest tests/test_dispatcher.py tests/test_intent_rules.py tests/test_api.py -q
+```
+
+结果：`19 passed`。

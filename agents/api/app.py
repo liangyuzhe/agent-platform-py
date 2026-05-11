@@ -54,6 +54,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Failed to schedule doc_metadata table check: %s", e)
 
+    try:
+        from agents.tool.storage.intent_rules import ensure_intent_rule_table
+        await _run_startup_check("intent_rules", ensure_intent_rule_table, logger)
+    except Exception as e:
+        logger.warning("Failed to schedule intent_rules table check: %s", e)
+
     # 初始化模型
     init_chat_models()
     init_embedding_models()

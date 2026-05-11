@@ -6,6 +6,7 @@
 
 - **自然语言查数据**：自然语言 → SQL → 人工审批 → 执行，含 SQL 安全分析 + 自动纠错重试 + 自动补表
 - **多场景意图路由**：意图分类 + 查询重写合并为一次 LLM 调用，自动路由到 SQL/RAG/闲聊
+- **可配置意图规则**：常见路由规则存储在 MySQL，通过 Admin 页面维护；规则引擎与 LLM 并行运行，最终仲裁意图
 - **统一语义模型**：`t_semantic_model` 表存储字段级业务映射（业务名/同义词/描述）+ 技术 schema（类型/注释/PK/FK），binlog 增量自动同步
 - **表关系自动发现**：从 `information_schema.key_column_usage` + 逻辑外键自动提取 JOIN 关系
 - **混合检索 RAG**：向量（Milvus）+ BM25（ES）+ RRF 融合 + Cross-Encoder 重排序
@@ -15,6 +16,26 @@
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
 - **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
+
+## 功能演示
+
+### Chat / Knowledge：外部公开知识路由
+
+在 SQL Agent 入口提问“茅台第一季度盈利”，系统识别为 Chat/Knowledge，不查询本公司数据库。
+
+![Chat / Knowledge: 茅台第一季度盈利](docs/assets/demos/chat-maotai-q1-profit.gif)
+
+### SQL Query：本公司财务查数
+
+提问“我们公司去年盈利”，系统识别为结构化数据查询，生成 SQL 并进入人工审批后执行。
+
+![SQL Query: 我们公司去年盈利](docs/assets/demos/sql-last-year-profit.gif)
+
+### 多轮 SQL 与结果修正
+
+先问“去年亏损”，再追问“去年亏损总和”，展示多轮上下文、SQL 审批、执行进度和异常修正链路。
+
+![Multi-turn SQL + Repair: 去年亏损到亏损总和](docs/assets/demos/sql-loss-followup-repair.gif)
 
 ## 架构概览
 
@@ -94,6 +115,7 @@ financial-copilot-platform/
 │   │   │   ├── redis_client.py     # Redis 连接
 │   │   │   ├── checkpoint.py       # LangGraph Checkpointer
 │   │   │   ├── domain_summary.py   # 领域摘要持久化
+│   │   │   ├── intent_rules.py     # 可配置意图规则
 │   │   │   └── doc_metadata.py     # 文档元数据（MySQL）
 │   │   ├── document/               # 文档处理
 │   │   ├── sql_tools/              # SQL 工具
@@ -206,7 +228,7 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 | Chat UI | http://localhost:8080/ | RAG 对话（Tab 1） |
 | SQL Agent | http://localhost:8080/ | 意图路由 + SQL 生成（Tab 2） |
 | 文档上传 | http://localhost:8080/ | 上传文档并索引到 RAG（Tab 3） |
-| Admin | http://localhost:8080/ | 语义模型 / 业务知识 / 智能体知识管理（Tab 4） |
+| Admin | http://localhost:8080/ | 意图规则 / 语义模型 / 业务知识 / 智能体知识管理（Tab 5） |
 | API 文档 | http://localhost:8080/docs | Swagger UI |
 | 健康检查 | http://localhost:8080/health | 服务状态 |
 
@@ -228,6 +250,9 @@ python -m scripts.seed_all
 2. `seed_semantic_model`：初始化 `t_semantic_model`，同步字段类型、注释、主键、外键和业务映射。
 3. `seed_business_knowledge`：把业务术语、公式、同义词写入 `t_business_knowledge`，并索引到 Milvus/ES。
 4. `seed_agent_knowledge`：写入 SQL Q&A few-shot 示例，并索引到 Milvus/ES。
+5. `seed_intent_rules`：写入可配置意图规则，辅助 LLM 稳定路由。
+
+意图规则表 `t_intent_rule` 由服务启动时自动确保存在。规则内容不写在运行时代码里；需要固化高频路由规则时，可通过 `data/intent_rules_seed.json` 初始化，也可在 Admin 页面新增、编辑、删除。规则还支持可选 `rewrite_template`，用于把“第一季度毛利率”这类省略主体的问题补齐成“公司第一季度毛利率”。
 
 ### 脚本说明
 
@@ -237,6 +262,7 @@ python -m scripts.seed_all
 | `scripts.seed_semantic_model` | 让 NL2SQL 理解字段业务含义，而不只看到物理字段名 | 创建/更新 `t_semantic_model`，从 `information_schema` 同步技术 schema，并写入业务名/同义词/描述 | 表结构变更后、首次搭建 |
 | `scripts.seed_business_knowledge` | 提供业务术语、公式、同义词，例如“亏损”对应某个业务口径 | 创建/更新 `t_business_knowledge`，并写入 Milvus/ES 检索索引 | 业务口径变更后、首次搭建 |
 | `scripts.seed_agent_knowledge` | 提供 SQL few-shot 示例，帮助 LLM 学习项目内常见 SQL 写法 | 创建/更新 `t_agent_knowledge`，并写入 Milvus/ES 检索索引 | 新增高质量 SQL 示例后 |
+| `scripts.seed_intent_rules` | 提供高频、确定性强的路由规则，和 LLM 意图识别并行后仲裁 | 创建/更新 `t_intent_rule`；规则数据来自 `data/intent_rules_seed.json` 或 Admin 页面 | 首次搭建、路由规则调整后 |
 | `scripts.seed_all` | 一键完成完整初始化，减少漏跑脚本 | 顺序执行以上脚本；schema 只进入 MySQL/Redis，不再写入 Milvus/ES | 全新环境优先使用 |
 | `scripts.cleanup_schema_indexes` | 清理旧版本遗留的 schema 向量索引 | 删除 Milvus/ES 中 `source=mysql_schema` 的历史记录 | 升级到 MySQL/Redis schema 检索后执行一次 |
 
@@ -255,7 +281,10 @@ python -m scripts.seed_business_knowledge
 # 4. 只同步 SQL few-shot 示例
 python -m scripts.seed_agent_knowledge
 
-# 5. 清理旧 schema 向量索引（升级后执行一次）
+# 5. 只同步可配置意图规则
+python -m scripts.seed_intent_rules
+
+# 6. 清理旧 schema 向量索引（升级后执行一次）
 python -m scripts.cleanup_schema_indexes
 ```
 
@@ -622,6 +651,7 @@ sequenceDiagram
 ```
 
 - 意图分类基于 `domain_summary`（自动生成的数据库领域摘要），不硬编码
+- 可配置规则引擎与 LLM 并行执行，命中规则时可仲裁最终意图；业务关键词和重写模板维护在 MySQL/Admin 中
 - 重写后的查询直接传递给下游，下游节点跳过重复的 LLM 调用
 
 ### 7. Human-in-the-Loop 审批

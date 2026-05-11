@@ -6,7 +6,7 @@ invoke 端点接收预分类结果，跳过重复 LLM 调用。
 
 import json
 import logging
-import re
+import asyncio
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,6 +17,7 @@ from agents.tool.storage.checkpoint import get_checkpointer
 from agents.tool.storage.domain_summary import get_domain_summary
 from agents.config.settings import settings
 from agents.tool.trace.tracing import child_trace_config, traced_async_tool_call, callbacks_from_config
+from agents.tool.storage.intent_rules import evaluate_intent_rules
 
 logger = logging.getLogger(__name__)
 
@@ -33,21 +34,6 @@ _INTENTS = [
     _INTENT_SQL, _INTENT_ANOMALY, _INTENT_RECONCILIATION,
     _INTENT_REPORT, _INTENT_AUDIT, _INTENT_KNOWLEDGE, _INTENT_CHAT,
 ]
-
-_COMPANY_CUES = ("我们公司", "本公司", "公司", "企业", "我司")
-_TIME_CUES = (
-    "去年", "今年", "本年", "上年", "第一季度", "第二季度", "第三季度", "第四季度",
-    "一季度", "二季度", "三季度", "四季度", "本月", "上月", "本季度", "上季度",
-)
-_FINANCIAL_DATA_CUES = (
-    "亏损", "盈利", "利润", "净利润", "收入", "成本", "费用", "工资", "薪酬",
-    "员工工资", "应付职工薪酬", "余额", "发生额", "预算", "报销", "发票",
-    "应收", "应付", "凭证", "资产", "折旧", "资金", "回款", "付款",
-)
-_PUBLIC_ENTITY_CUES = (
-    "贵州茅台", "腾讯", "阿里", "百度", "京东", "美团", "比亚迪", "宁德时代",
-    "苹果", "微软", "谷歌", "特斯拉", "股票", "股价", "年报", "季报",
-)
 
 
 _CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务：
@@ -66,35 +52,36 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务
 
 重要判断原则：
 - 只有当问题明确指向数据库中的数据时，才归类为 sql_query
-- 如果问题涉及的是公开信息、通用知识、股市行情等非数据库内容，应归类为 chat
+- 如果问题涉及外部主体、公开信息、通用知识、股市行情等非数据库内容，应归类为 chat
+- 不要仅因为问题包含财务词或时间词就归类为 sql_query；必须判断它是否在问当前数据库内的业务数据
+- 如果问题未出现外部主体，且询问数据库领域摘要支持的指标、统计、金额或经营数据，可按当前公司/当前企业的本地业务数据理解
+- 对省略主体的本地业务数据问题，rewritten_query 应补齐当前公司/当前企业主体，使其成为独立完整查询
 - 结合对话历史重写查询时，只补充对话中明确提到的上下文，不要添加对话中没有的信息
 
 请严格按以下 JSON 格式返回，不要有其他内容：
 {{"intent": "意图类别", "rewritten_query": "重写后的独立查询"}}"""
 
 
-def _looks_like_company_data_query(query: str) -> bool:
-    """Heuristic guard for local company finance data queries.
-
-    Intent classification is allowed to use history for rewriting, but history
-    should not turn an explicit company finance data query into generic chat.
-    """
-    if not query:
-        return False
-    text = re.sub(r"\s+", "", query)
-    if any(cue in text for cue in _PUBLIC_ENTITY_CUES) and not any(cue in text for cue in _COMPANY_CUES):
-        return False
-    has_financial_data = any(cue in text for cue in _FINANCIAL_DATA_CUES)
-    has_company = any(cue in text for cue in _COMPANY_CUES)
-    has_time = any(cue in text for cue in _TIME_CUES) or bool(re.search(r"20\d{2}年?|20\d{2}-\d{1,2}", text))
-    return has_financial_data and (has_company or has_time)
+def _arbitrate_intent(llm_intent: str, rule_decision) -> str:
+    """Merge LLM intent with optional database-backed rule signal."""
+    if rule_decision and getattr(rule_decision, "intent", "") in _INTENTS:
+        return rule_decision.intent
+    return llm_intent if llm_intent in _INTENTS else _INTENT_CHAT
 
 
-def _normalize_intent(intent: str, query: str, rewritten_query: str) -> str:
-    """Apply deterministic guardrails after LLM intent classification."""
-    if _looks_like_company_data_query(query) or _looks_like_company_data_query(rewritten_query):
-        return _INTENT_SQL
-    return intent
+def _apply_rule_rewrite_template(query: str, rewritten_query: str, rule_decision) -> str:
+    """Apply an optional data-managed rewrite template from an intent rule."""
+    template = str(getattr(rule_decision, "rewrite_template", "") or "").strip()
+    if not template:
+        return rewritten_query
+
+    rendered = (
+        template
+        .replace("{query}", query or "")
+        .replace("{rewritten_query}", rewritten_query or query or "")
+        .strip()
+    )
+    return rendered or rewritten_query
 
 
 async def classify_intent(state: FinalGraphState, config=None) -> dict:
@@ -108,19 +95,32 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
     if existing_intent and existing_intent in _INTENTS and existing_rewrite:
         return {"intent": existing_intent, "rewritten_query": existing_rewrite}
 
-    # 只有 intent 没有 rewritten_query（兼容旧版），跳过分类但不跳过重写
-    if existing_intent and existing_intent in _INTENTS and not existing_rewrite:
-        return {"intent": existing_intent, "rewritten_query": state.get("query", "")}
-
-    model = get_chat_model(settings.chat_model_type)
     callbacks = callbacks_from_config(config)
-    domain = await traced_async_tool_call(
-        "domain_summary.load",
-        state.get("query", ""),
-        callbacks,
-        get_domain_summary,
-        metadata={"storage": "mysql", "node": "classify_intent"},
+    query = state.get("query", "")
+
+    async def _evaluate_rules():
+        return await evaluate_intent_rules(query, valid_intents=set(_INTENTS))
+
+    rule_task = asyncio.create_task(
+        traced_async_tool_call(
+            "intent_rules.evaluate",
+            query,
+            callbacks,
+            _evaluate_rules,
+            metadata={"storage": "mysql", "node": "classify_intent"},
+        )
     )
+    domain_task = asyncio.create_task(
+        traced_async_tool_call(
+            "domain_summary.load",
+            query,
+            callbacks,
+            get_domain_summary,
+            metadata={"storage": "mysql", "node": "classify_intent"},
+        )
+    )
+    model = get_chat_model(settings.chat_model_type)
+    domain = await domain_task
 
     # 构建对话历史上下文
     chat_history = state.get("chat_history", [])
@@ -134,7 +134,7 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
 {domain if domain else "（暂无领域摘要）"}
 {history_context}
 
-用户问题: {state['query']}"""
+用户问题: {query}"""
 
     response = await model.ainvoke(
         [
@@ -187,9 +187,17 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
                 intent = valid_intent
                 break
 
-    intent = _normalize_intent(intent, state.get("query", ""), rewritten_query)
+    rule_decision = await rule_task
+    intent = _arbitrate_intent(intent, rule_decision)
+    rewritten_query = _apply_rule_rewrite_template(query, rewritten_query, rule_decision)
 
-    logger.info("classify_intent: intent=%s, query='%s' -> '%s'", intent, state["query"], rewritten_query)
+    logger.info(
+        "classify_intent: intent=%s, query='%s' -> '%s', rule=%s",
+        intent,
+        query,
+        rewritten_query,
+        rule_decision.to_dict() if rule_decision else None,
+    )
     return {"intent": intent, "rewritten_query": rewritten_query}
 
 

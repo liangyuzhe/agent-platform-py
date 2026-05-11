@@ -136,6 +136,41 @@ class TestDocumentEndpoint:
         assert resp.status_code == 422
 
 
+class TestAdminIntentRules:
+    """Test configurable intent-rule admin endpoints."""
+
+    @patch("agents.tool.storage.intent_rules.ensure_intent_rule_table")
+    @patch("agents.tool.storage.intent_rules.list_intent_rules")
+    def test_list_intent_rules(self, mock_list, mock_ensure, client):
+        mock_list.return_value = [{"id": 1, "name": "route", "target_intent": "chat"}]
+
+        resp = client.get("/api/admin/intent-rules")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["items"][0]["target_intent"] == "chat"
+
+    @patch("agents.tool.storage.intent_rules.ensure_intent_rule_table")
+    @patch("agents.tool.storage.intent_rules.upsert_intent_rule", return_value=7)
+    def test_upsert_intent_rule(self, mock_upsert, mock_ensure, client):
+        resp = client.post("/api/admin/intent-rules", json={
+            "name": "route",
+            "target_intent": "sql_query",
+            "match_type": "contains",
+            "pattern": "managed outside code",
+            "priority": 100,
+            "confidence": 0.9,
+            "enabled": True,
+            "rewrite_template": "公司{query}",
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()["id"] == 7
+        assert mock_upsert.call_args[0][0]["pattern"] == "managed outside code"
+        assert mock_upsert.call_args[0][0]["rewrite_template"] == "公司{query}"
+
+
 class TestStaticFiles:
     """Test static file serving."""
 
