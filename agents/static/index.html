@@ -814,7 +814,11 @@
                 sqlMessages.scrollTop = sqlMessages.scrollHeight;
             } else if (ev.event === 'result' && ev.data) {
                 const data = JSON.parse(ev.data);
+                const progressHtml = progressBox ? progressBox.outerHTML : '';
                 renderAgentResponse(resultDiv, data);
+                if (progressHtml) {
+                    resultDiv.querySelector('.bubble').insertAdjacentHTML('afterbegin', progressHtml);
+                }
             }
         }
 

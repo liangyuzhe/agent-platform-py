@@ -252,21 +252,59 @@ def _split_terms(value: str) -> list[str]:
     return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
+def _label_value(line: str, labels: tuple[str, ...]) -> str | None:
+    for label in labels:
+        for sep in (":", "："):
+            prefix = f"{label}{sep}"
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+    return None
+
+
 def _parse_business_evidence(evidence: list[str]) -> list[dict[str, str | list[str]]]:
     entries = []
     for item in evidence:
-        entry: dict[str, str | list[str]] = {"term": "", "formula": "", "synonyms": []}
+        entry: dict[str, str | list[str]] = {
+            "term": "",
+            "formula": "",
+            "synonyms": [],
+            "related_tables": [],
+        }
         for line in item.splitlines():
             line = line.strip()
-            if line.startswith("术语:"):
-                entry["term"] = line.split(":", 1)[1].strip()
-            elif line.startswith("公式:") or line.startswith("定义:"):
-                entry["formula"] = line.split(":", 1)[1].strip()
-            elif line.startswith("同义词:"):
-                entry["synonyms"] = _split_terms(line.split(":", 1)[1].strip())
+            term = _label_value(line, ("术语",))
+            formula = _label_value(line, ("公式", "定义"))
+            synonyms = _label_value(line, ("同义词",))
+            related_tables = _label_value(line, ("关联表",))
+            if term is not None:
+                entry["term"] = term
+            elif formula is not None:
+                entry["formula"] = formula
+            elif synonyms is not None:
+                entry["synonyms"] = _split_terms(synonyms)
+            elif related_tables is not None:
+                entry["related_tables"] = _split_terms(related_tables)
         if entry.get("term"):
             entries.append(entry)
     return entries
+
+
+def _related_tables_from_business_evidence(evidence: list[str], candidate_tables: list[str]) -> list[str]:
+    candidate_set = set(candidate_tables)
+    related = []
+    for entry in _parse_business_evidence(evidence):
+        for table in entry.get("related_tables", []):  # type: ignore[union-attr]
+            if table in candidate_set and table not in related:
+                related.append(table)
+    return related
+
+
+def _merge_selected_tables(selected: list[str], evidence_tables: list[str]) -> list[str]:
+    merged = []
+    for table in [*evidence_tables, *selected]:
+        if table and table not in merged:
+            merged.append(table)
+    return merged
 
 
 def _heuristic_enhance_query(query: str, evidence: list[str]) -> str:
@@ -420,10 +458,14 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
         return {"selected_tables": []}
 
     candidate_tables = [m["table_name"] for m in metadata_list]
+    evidence_tables = _related_tables_from_business_evidence(
+        state.get("evidence", []),
+        candidate_tables,
+    )
 
     # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
     if len(candidate_tables) <= 3:
-        selected = candidate_tables
+        selected = _merge_selected_tables(candidate_tables, evidence_tables)
         relationships = []
         try:
             relationships = await asyncio.wait_for(
@@ -480,6 +522,7 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
         selected = [n.strip() for n in raw.split(",") if n.strip() in candidate_tables]
         if not selected:
             selected = candidate_tables
+    selected = _merge_selected_tables(selected, evidence_tables)
 
     relationships = []
     try:

@@ -27,15 +27,15 @@
 
 ### SQL Query：本公司财务查数
 
-提问“我们公司去年盈利”，系统识别为结构化数据查询，生成 SQL 并进入人工审批后执行。
+提问“公司盈利”，系统识别为结构化数据查询，生成 SQL 并进入人工审批后执行。
 
-![SQL Query: 我们公司去年盈利](docs/assets/demos/sql-last-year-profit.gif)
+![SQL Query: 公司盈利](docs/assets/demos/sql-last-year-profit-approved.gif)
 
 ### 多轮 SQL 与结果修正
 
-先问“去年亏损”，再追问“去年亏损总和”，展示多轮上下文、SQL 审批、执行进度和异常修正链路。
+提问“2024年每月亏损金额”，展示 SQL 执行失败或结果异常后自动分析、生成修正 SQL、再次审批和最终执行结果。
 
-![Multi-turn SQL + Repair: 去年亏损到亏损总和](docs/assets/demos/sql-loss-followup-repair.gif)
+![Multi-turn SQL + Repair: 去年亏损到亏损总和](docs/assets/demos/sql-loss-followup-repair-approved.gif)
 
 ## 架构概览
 

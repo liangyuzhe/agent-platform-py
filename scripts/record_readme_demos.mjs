@@ -16,16 +16,18 @@ const demos = [
     approvals: 0,
   },
   {
-    slug: "sql-last-year-profit",
-    title: "SQL Query: 我们公司去年盈利",
-    questions: ["我们公司去年盈利"],
+    slug: "sql-last-year-profit-approved",
+    title: "SQL Query: 公司盈利",
+    questions: ["公司盈利"],
     approvals: 2,
+    waitForReflection: false,
   },
   {
-    slug: "sql-loss-followup-repair",
-    title: "Multi-turn SQL + Repair: 去年亏损 -> 亏损总和",
-    questions: ["去年亏损", "去年亏损总和"],
-    approvals: 4,
+    slug: "sql-loss-followup-repair-approved",
+    title: "SQL Repair: 执行失败 -> 反思修正 -> 结果",
+    questions: ["2024年每月亏损金额"],
+    approvals: 5,
+    waitForReflection: true,
   },
 ];
 
@@ -94,11 +96,48 @@ async function approveVisibleSql(page, maxApprovals) {
     } catch {
       break;
     }
+    const assistantCount = await page.locator("#sqlMessages .sql-message.assistant .bubble").count();
     await sleep(800);
     await approve.click();
-    await waitForAgentIdle(page);
-    await sleep(1_500);
+    await waitForApproveSettled(page, assistantCount);
+    await sleep(2_500);
   }
+}
+
+async function waitForApproveSettled(page, previousAssistantCount) {
+  await page.waitForFunction((before) => {
+    const bubbles = Array.from(document.querySelectorAll("#sqlMessages .sql-message.assistant .bubble"));
+    if (bubbles.length <= before) return false;
+    const last = bubbles[bubbles.length - 1];
+    const text = last.innerText || "";
+    const hasFinalResult = Boolean(last.querySelector(".intent-tag.result"))
+      || text.includes("查询已执行完成")
+      || text.includes("共返回")
+      || text.includes("SQL 执行完成");
+    const hasNextApproval = Boolean(last.querySelector(".btn-approve:not([disabled])"));
+    const hasTerminalError = text.includes("系统错误") || text.includes("SQL 执行失败");
+    return hasFinalResult || hasNextApproval || hasTerminalError;
+  }, previousAssistantCount, { timeout: 180_000 });
+}
+
+async function waitForFinalSqlResult(page) {
+  await page.waitForFunction(() => {
+    const bubbles = Array.from(document.querySelectorAll("#sqlMessages .sql-message.assistant .bubble"));
+    return bubbles.some((bubble) => {
+      const text = bubble.innerText || "";
+      return Boolean(bubble.querySelector(".intent-tag.result"))
+        && (text.includes("查询已执行完成") || text.includes("共返回"));
+    });
+  }, undefined, { timeout: 180_000 });
+}
+
+async function waitForReflectionFlowVisible(page) {
+  await page.waitForFunction(() => {
+    const text = document.querySelector("#sqlMessages")?.innerText || "";
+    return text.includes("检测到执行失败或结果异常")
+      && text.includes("请确认是否执行修正后的 SQL")
+      && text.includes("查询已执行完成");
+  }, undefined, { timeout: 240_000 });
 }
 
 function convertToGif(webmPath, gifPath) {
@@ -138,7 +177,13 @@ async function recordDemo(browser, demo) {
     await sleep(900);
   }
 
-  await sleep(2_000);
+  if (demo.approvals > 0) {
+    await waitForFinalSqlResult(page);
+  }
+  if (demo.waitForReflection) {
+    await waitForReflectionFlowVisible(page);
+  }
+  await sleep(5_000);
   const video = page.video();
   await context.close();
   const recorded = await video.path();

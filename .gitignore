@@ -35,6 +35,7 @@ htmlcov/
 .tox/
 .nox/
 data/eval/
+outputs/
 docs/assets/demos/raw/
 
 # Type checking

@@ -302,6 +302,54 @@ class TestQueryEnhance:
 # safety_check node
 # ---------------------------------------------------------------------------
 
+class TestSelectTables:
+    """Test table selection uses data-managed business evidence."""
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_merges_business_evidence_related_tables(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+    ):
+        """Related tables from business knowledge should survive an LLM under-selection."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "domain_summary", "table_comment": "领域摘要"},
+            {"table_name": "t_journal_item", "table_comment": "凭证明细"},
+            {"table_name": "t_account", "table_comment": "会计科目"},
+            {"table_name": "t_expense_claim", "table_comment": "费用报销"},
+        ]
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="domain_summary"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "公司盈利",
+            "enhanced_query": "公司净利润 > 0",
+            "evidence": [
+                "术语: 净利润\n"
+                "公式: 收入 - 成本 - 费用\n"
+                "关联表: t_journal_item,t_account,t_expense_claim"
+            ],
+        })
+
+        assert result["selected_tables"][:3] == [
+            "t_journal_item",
+            "t_account",
+            "t_expense_claim",
+        ]
+        assert "domain_summary" in result["selected_tables"]
+
+
+# ---------------------------------------------------------------------------
+# safety_check node
+# ---------------------------------------------------------------------------
+
 class TestSafetyCheck:
     """Test safety_check node."""
 
