@@ -289,10 +289,21 @@ def _parse_business_evidence(evidence: list[str]) -> list[dict[str, str | list[s
     return entries
 
 
-def _related_tables_from_business_evidence(evidence: list[str], candidate_tables: list[str]) -> list[str]:
+def _business_evidence_matches_query(entry: dict[str, str | list[str]], query: str) -> bool:
+    aliases = [str(entry.get("term") or ""), *entry.get("synonyms", [])]  # type: ignore[list-item]
+    return any(alias and alias in query for alias in aliases)
+
+
+def _related_tables_from_business_evidence(
+    evidence: list[str],
+    candidate_tables: list[str],
+    query: str = "",
+) -> list[str]:
     candidate_set = set(candidate_tables)
     related = []
     for entry in _parse_business_evidence(evidence):
+        if query and not _business_evidence_matches_query(entry, query):
+            continue
         for table in entry.get("related_tables", []):  # type: ignore[union-attr]
             if table in candidate_set and table not in related:
                 related.append(table)
@@ -305,6 +316,133 @@ def _merge_selected_tables(selected: list[str], evidence_tables: list[str]) -> l
         if table and table not in merged:
             merged.append(table)
     return merged
+
+
+def _semantic_fk_edges(semantic_model: dict) -> list[dict[str, str]]:
+    edges = []
+    for table, columns in semantic_model.items():
+        for column, meta in (columns or {}).items():
+            ref_table = str(meta.get("ref_table") or "")
+            ref_column = str(meta.get("ref_column") or "")
+            if not ref_table:
+                continue
+            is_fk = meta.get("is_fk")
+            if str(is_fk).lower() not in {"1", "true", "yes", "y", "是"}:
+                continue
+            edges.append({
+                "from_table": str(table),
+                "from_column": str(column),
+                "to_table": ref_table,
+                "to_column": ref_column,
+            })
+    return edges
+
+
+def _expand_selected_tables_by_semantic_relationships(
+    selected: list[str],
+    candidate_tables: list[str],
+    semantic_model: dict,
+) -> list[str]:
+    """Add join tables and endpoint tables using FK metadata from t_semantic_model."""
+    selected_set = set(selected)
+    candidate_set = set(candidate_tables)
+    expanded = list(selected)
+    edges = _semantic_fk_edges(semantic_model)
+
+    def append(table: str) -> None:
+        if table in candidate_set and table not in expanded:
+            expanded.append(table)
+            selected_set.add(table)
+
+    # If a selected relation table references another candidate table, keep the
+    # endpoint so SQL generation has enough schema to build the join.
+    for edge in edges:
+        if edge["from_table"] in selected_set:
+            append(edge["to_table"])
+
+    # If two selected tables are connected through an unselected bridge table,
+    # keep that bridge table. This is driven by semantic FK metadata, not by
+    # business keyword rules.
+    refs_by_from: dict[str, set[str]] = {}
+    for edge in edges:
+        refs_by_from.setdefault(edge["from_table"], set()).add(edge["to_table"])
+    for bridge, refs in refs_by_from.items():
+        if bridge in selected_set or bridge not in candidate_set:
+            continue
+        if len(refs & selected_set) >= 2:
+            append(bridge)
+
+    return expanded
+
+
+def _ranking_terms(text: str) -> set[str]:
+    normalized = str(text or "").lower()
+    terms = set(re.findall(r"[a-z0-9_]+", normalized))
+    terms.update(ch for ch in normalized if "\u4e00" <= ch <= "\u9fff")
+    for size in (2, 3, 4):
+        for i in range(0, max(0, len(normalized) - size + 1)):
+            chunk = normalized[i : i + size]
+            if any("\u4e00" <= ch <= "\u9fff" for ch in chunk):
+                terms.add(chunk)
+    return terms
+
+
+def _table_semantic_text(table: str, table_metadata: dict[str, str], semantic_model: dict) -> str:
+    parts = [table, table_metadata.get(table, "")]
+    for col_name, meta in (semantic_model.get(table) or {}).items():
+        parts.extend([
+            str(col_name),
+            str(meta.get("column_comment") or ""),
+            str(meta.get("business_name") or ""),
+            str(meta.get("synonyms") or ""),
+            str(meta.get("business_description") or ""),
+        ])
+    return "\n".join(part for part in parts if part)
+
+
+def _table_semantic_score(table: str, query: str, table_metadata: dict[str, str], semantic_model: dict) -> float:
+    query_terms = _ranking_terms(query)
+    if not query_terms:
+        return 0.0
+
+    text = _table_semantic_text(table, table_metadata, semantic_model)
+    table_terms = _ranking_terms(text)
+    overlap = query_terms & table_terms
+    score = sum(max(1, len(term)) for term in overlap)
+
+    # Phrase matches are stronger than isolated character overlap.
+    for meta in (semantic_model.get(table) or {}).values():
+        phrases = [
+            str(meta.get("business_name") or ""),
+            str(meta.get("column_comment") or ""),
+            *_split_terms(str(meta.get("synonyms") or "")),
+        ]
+        for phrase in phrases:
+            if phrase and phrase in query:
+                score += 6 + min(len(phrase), 8)
+
+    comment = table_metadata.get(table, "")
+    if comment and any(term in comment for term in query_terms if len(term) >= 2):
+        score += 2
+    return float(score)
+
+
+def _rerank_selected_tables(
+    selected: list[str],
+    query: str,
+    table_metadata: dict[str, str],
+    semantic_model: dict,
+    evidence_tables: list[str],
+) -> list[str]:
+    evidence_set = set(evidence_tables)
+    indexed = []
+    for index, table in enumerate(selected):
+        score = _table_semantic_score(table, query, table_metadata, semantic_model)
+        if table in evidence_set:
+            score += 10
+        indexed.append((score, -index, table))
+    indexed.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [table for _, _, table in indexed]
 
 
 def _heuristic_enhance_query(query: str, evidence: list[str]) -> str:
@@ -458,14 +596,33 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
         return {"selected_tables": []}
 
     candidate_tables = [m["table_name"] for m in metadata_list]
+    table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
     evidence_tables = _related_tables_from_business_evidence(
         state.get("evidence", []),
         candidate_tables,
+        query,
     )
+    semantic_model = {}
+    try:
+        semantic_model = await asyncio.wait_for(
+            asyncio.to_thread(
+                traced_tool_call,
+                "schema.get_semantic_model_for_table_ranking",
+                ",".join(candidate_tables),
+                callbacks,
+                lambda: get_semantic_model_by_tables(candidate_tables),
+                {"storage": "redis_mysql", "node": "select_tables"},
+            ),
+            timeout=settings.resilience.milvus_timeout,
+        )
+    except Exception as e:
+        logger.warning("Failed to load semantic model for table ranking: %s", e)
 
     # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
     if len(candidate_tables) <= 3:
         selected = _merge_selected_tables(candidate_tables, evidence_tables)
+        selected = _expand_selected_tables_by_semantic_relationships(selected, candidate_tables, semantic_model)
+        selected = _rerank_selected_tables(selected, query, table_metadata, semantic_model, evidence_tables)
         relationships = []
         try:
             relationships = await asyncio.wait_for(
@@ -488,7 +645,6 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
 
-    table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
     names_with_desc = []
     for t in candidate_tables:
         desc = table_metadata.get(t, "")
@@ -523,6 +679,8 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
         if not selected:
             selected = candidate_tables
     selected = _merge_selected_tables(selected, evidence_tables)
+    selected = _expand_selected_tables_by_semantic_relationships(selected, candidate_tables, semantic_model)
+    selected = _rerank_selected_tables(selected, query, table_metadata, semantic_model, evidence_tables)
 
     relationships = []
     try:

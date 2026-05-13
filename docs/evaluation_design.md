@@ -205,6 +205,17 @@ python -m agents.eval.cli run \
   --include-online-pipeline
 ```
 
+### 最近一次评测结果
+
+数据集：`data/eval/eval_dataset.jsonl`，45 条 schema 标注样本。时间：2026-05-13。
+
+| 策略 | MRR | Accuracy@5 | Precision@5 | Recall@5 | NDCG@5 | 平均延迟 | P50 延迟 | P95 延迟 |
+|------|----:|-----------:|------------:|---------:|-------:|---------:|---------:|---------:|
+| `schema_lexical` | 96.67% | 77.78% | 35.56% | 90.63% | 90.03% | 0.1 ms | 0.0 ms | 0.1 ms |
+| `preselect_pipeline` | 96.67% | 88.89% | 84.93% | 94.07% | 94.13% | 7545.6 ms | 7426.8 ms | 10541.4 ms |
+
+管理表专项评测（`management_eval_dataset.jsonl`，12 条）中，`preselect_pipeline` 的 `Recall@5 = 100%`、`MRR = 100%`。该结果只说明用户/角色/部门等管理表链路已被修复，不能替代全量业务集指标。
+
 旧版通用文档检索策略（Milvus/ES/RRF）默认不再运行，因为 schema 评测集标注的是 `schema_<table>`，当前线上 schema 权威来源也是 MySQL/Redis。如果需要兼容测试旧链路，可显式开启：
 
 ```bash

@@ -340,6 +340,15 @@ python -m agents.eval.cli run \
   --include-online-pipeline
 ```
 
+最近一次全量线上预选链路评测（`eval_dataset.jsonl`，45 条，2026-05-13）：
+
+| 策略 | 样本数 | MRR | Accuracy@5 | Recall@5 | NDCG@5 | P50/P95 延迟 |
+|------|------:|----:|-----------:|---------:|-------:|-------------:|
+| `schema_lexical` | 45 | 96.67% | 77.78% | 90.63% | 90.03% | 0.0 / 0.1 ms |
+| `preselect_pipeline` | 45 | 96.67% | 88.89% | 94.07% | 94.13% | 7426.8 / 10541.4 ms |
+
+管理表专项线上评测（12 条）中，`preselect_pipeline` 的 `Recall@5` 和 `MRR` 均为 `100%`；该专项指标不等同于全量业务指标。
+
 默认不再加载旧版 Milvus/ES schema 文档检索和 CrossEncoder reranker。完整原理、指标解释和报告格式见 [评测体系设计](docs/evaluation_design.md)。
 
 评测集默认排除 `domain_summary`、`t_semantic_model` 等系统内部表，避免把 Agent 元数据表误当成业务查询目标。

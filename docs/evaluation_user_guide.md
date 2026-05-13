@@ -54,6 +54,15 @@ python -m agents.eval.cli run \
 
 注意：`--include-online-pipeline` 会调用 `query_enhance` 和 `select_tables` 的 LLM。
 
+最近一次全量线上预选链路评测结果（45 条，2026-05-13）：
+
+| 策略 | MRR | Accuracy@5 | Recall@5 | P50/P95 延迟 |
+|------|----:|-----------:|---------:|-------------:|
+| `schema_lexical` | 96.67% | 77.78% | 90.63% | 0.0 / 0.1 ms |
+| `preselect_pipeline` | 96.67% | 88.89% | 94.07% | 7426.8 / 10541.4 ms |
+
+管理表专项线上评测（12 条）中，`preselect_pipeline Recall@5 = 100%`、`MRR = 100%`。专项数据只用于验证用户/角色/部门等管理表问题，不代表全量业务指标。
+
 ## 2. 离线 NL2SQL 评测
 
 初始化模板：

@@ -34,8 +34,10 @@ async def run_preselect_pipeline(query: str) -> StrategyRunResult:
     This evaluates the table-selection path as it is used before SQL
     generation, including business knowledge driven query enhancement.
     """
+    from agents.model.chat_model import init_chat_models
     from agents.flow.sql_react import recall_evidence, query_enhance, select_tables
 
+    init_chat_models()
     state = {"query": query, "rewritten_query": query}
     t0 = time.monotonic()
     evidence_update = await recall_evidence(state)

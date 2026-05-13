@@ -306,6 +306,7 @@ class TestSelectTables:
     """Test table selection uses data-managed business evidence."""
 
     @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables", return_value={})
     @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
     @patch("agents.flow.sql_react.load_full_table_metadata")
     @patch("agents.flow.sql_react.get_chat_model")
@@ -314,6 +315,7 @@ class TestSelectTables:
         mock_get_model,
         mock_load_metadata,
         _mock_relationships,
+        _mock_semantic,
     ):
         """Related tables from business knowledge should survive an LLM under-selection."""
         from agents.flow.sql_react import select_tables
@@ -344,6 +346,259 @@ class TestSelectTables:
             "t_expense_claim",
         ]
         assert "domain_summary" in result["selected_tables"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_ignores_unmatched_business_evidence_related_tables(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """Unmatched business evidence should not push unrelated finance tables into selection."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_user", "table_comment": "用户/员工账号信息表，包含真实姓名、联系电话、注册时间"},
+            {"table_name": "t_expense_claim", "table_comment": "费用报销表"},
+            {"table_name": "t_journal_entry", "table_comment": "记账凭证主表"},
+            {"table_name": "t_account", "table_comment": "会计科目表"},
+        ]
+        mock_semantic.return_value = {
+            "t_user": {
+                "real_name": {
+                    "column_name": "real_name",
+                    "business_name": "真实姓名",
+                    "synonyms": "员工姓名, 用户姓名",
+                    "business_description": "用户或员工的真实姓名",
+                }
+            }
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_user"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询所有用户的真实姓名",
+            "enhanced_query": "查询所有用户的真实姓名",
+            "evidence": [
+                "术语: 费用总额\n"
+                "公式: SUM(total_amount)\n"
+                "同义词: 总费用, 费用合计\n"
+                "关联表: t_expense_claim,t_journal_entry"
+            ],
+        })
+
+        assert result["selected_tables"] == ["t_user"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_reranks_selected_tables_by_local_semantics(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """Local semantic matches should move directly relevant management tables ahead of generic finance tables."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_expense_claim", "table_comment": "费用报销表"},
+            {"table_name": "t_journal_entry", "table_comment": "记账凭证主表"},
+            {"table_name": "t_account", "table_comment": "会计科目表"},
+            {"table_name": "t_user", "table_comment": "用户/员工账号信息表，包含真实姓名、联系电话、注册时间"},
+            {"table_name": "t_user_role", "table_comment": "用户角色绑定关系表，关联用户与系统角色"},
+            {"table_name": "t_role", "table_comment": "系统角色信息表，包含角色名称、角色编码"},
+        ]
+        mock_semantic.return_value = {
+            "t_user": {
+                "real_name": {
+                    "column_name": "real_name",
+                    "business_name": "真实姓名",
+                    "synonyms": "员工姓名, 用户姓名",
+                    "business_description": "用户或员工的真实姓名",
+                }
+            },
+            "t_user_role": {
+                "user_id": {
+                    "column_name": "user_id",
+                    "business_name": "用户ID",
+                    "synonyms": "员工ID",
+                    "business_description": "关联 t_user.id",
+                },
+                "role_id": {
+                    "column_name": "role_id",
+                    "business_name": "角色ID",
+                    "synonyms": "系统角色ID",
+                    "business_description": "关联 t_role.id",
+                },
+            },
+            "t_role": {
+                "name": {
+                    "column_name": "name",
+                    "business_name": "角色名称",
+                    "synonyms": "系统角色",
+                    "business_description": "系统角色的中文名称",
+                }
+            },
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(
+            content="t_expense_claim,t_journal_entry,t_account,t_user,t_user_role,t_role"
+        ))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询所有用户的真实姓名以及他们被分配的角色名称",
+            "enhanced_query": "查询所有用户的真实姓名以及他们被分配的角色名称",
+            "evidence": [],
+        })
+
+        assert set(result["selected_tables"][:3]) == {"t_user", "t_user_role", "t_role"}
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_adds_bridge_table_from_semantic_relationships(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """A table that bridges two selected tables should be kept for SQL joins."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_department", "table_comment": "组织部门信息表，包含部门名称和部门负责人"},
+            {"table_name": "t_user", "table_comment": "用户/员工账号信息表，包含真实姓名"},
+            {"table_name": "t_user_department", "table_comment": "用户部门归属关系表，关联用户与部门"},
+            {"table_name": "t_journal_entry", "table_comment": "记账凭证主表"},
+        ]
+        mock_semantic.return_value = {
+            "t_department": {
+                "name": {"business_name": "部门名称", "synonyms": "组织名称"},
+                "manager": {"business_name": "部门负责人", "synonyms": "负责人"},
+            },
+            "t_user": {
+                "real_name": {"business_name": "真实姓名", "synonyms": "员工姓名"},
+            },
+            "t_user_department": {
+                "user_id": {
+                    "business_name": "用户ID",
+                    "is_fk": 1,
+                    "ref_table": "t_user",
+                    "ref_column": "id",
+                },
+                "department_id": {
+                    "business_name": "部门ID",
+                    "is_fk": 1,
+                    "ref_table": "t_department",
+                    "ref_column": "id",
+                },
+            },
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_department,t_user"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询公司各部门的负责人姓名以及对应的部门名称",
+            "enhanced_query": "查询公司各部门的负责人姓名以及对应的部门名称",
+            "evidence": [],
+        })
+
+        assert set(result["selected_tables"][:3]) == {"t_department", "t_user", "t_user_department"}
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_adds_endpoint_tables_from_selected_relation_tables(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """Selected relation tables should bring their referenced endpoint tables."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_user_role", "table_comment": "用户角色绑定关系表"},
+            {"table_name": "t_user_department", "table_comment": "用户部门归属关系表"},
+            {"table_name": "t_role", "table_comment": "系统角色信息表，包含角色名称"},
+            {"table_name": "t_user", "table_comment": "用户/员工账号信息表，包含真实姓名"},
+            {"table_name": "t_department", "table_comment": "组织部门信息表，包含部门名称"},
+            {"table_name": "t_invoice", "table_comment": "发票信息表"},
+        ]
+        mock_semantic.return_value = {
+            "t_user_role": {
+                "user_id": {
+                    "business_name": "用户ID",
+                    "is_fk": 1,
+                    "ref_table": "t_user",
+                    "ref_column": "id",
+                },
+                "role_id": {
+                    "business_name": "角色ID",
+                    "is_fk": 1,
+                    "ref_table": "t_role",
+                    "ref_column": "id",
+                },
+            },
+            "t_user_department": {
+                "user_id": {
+                    "business_name": "用户ID",
+                    "is_fk": 1,
+                    "ref_table": "t_user",
+                    "ref_column": "id",
+                },
+                "department_id": {
+                    "business_name": "部门ID",
+                    "is_fk": 1,
+                    "ref_table": "t_department",
+                    "ref_column": "id",
+                },
+            },
+            "t_role": {
+                "name": {"business_name": "角色名称", "synonyms": "系统角色"},
+            },
+            "t_user": {
+                "real_name": {"business_name": "真实姓名", "synonyms": "员工姓名"},
+            },
+            "t_department": {
+                "name": {"business_name": "部门名称", "synonyms": "组织名称"},
+            },
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_user_role,t_user_department,t_role"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询所有拥有财务审核角色的用户分别属于哪个部门",
+            "enhanced_query": "查询所有拥有财务审核角色的用户分别属于哪个部门",
+            "evidence": [],
+        })
+
+        assert set(result["selected_tables"][:5]) == {
+            "t_user_role",
+            "t_user_department",
+            "t_role",
+            "t_user",
+            "t_department",
+        }
 
 
 # ---------------------------------------------------------------------------

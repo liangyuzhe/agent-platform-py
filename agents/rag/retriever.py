@@ -527,7 +527,7 @@ def _load_table_metadata_from_mysql() -> list[dict]:
                 "WHERE table_schema = DATABASE() "
                 "ORDER BY table_name"
             )
-            rows = cur.fetchall()
+            rows = list(cur.fetchall())
         conn.close()
         # information_schema returns UPPERCASE keys (TABLE_NAME, TABLE_COMMENT)
         result = [
@@ -715,7 +715,7 @@ def _load_business_knowledge_from_mysql() -> list[dict]:
         )
         with conn.cursor() as cur:
             cur.execute("SELECT term, formula, synonyms, related_tables FROM t_business_knowledge")
-            rows = cur.fetchall()
+            rows = list(cur.fetchall())
         conn.close()
         return rows
     except Exception as e:
@@ -949,7 +949,21 @@ def get_table_relationships(table_names: list[str]) -> list[dict]:
                 f"AND (table_name IN ({placeholders}) OR referenced_table_name IN ({placeholders}))",
                 table_names + table_names,
             )
-            rows = cur.fetchall()
+            rows = list(cur.fetchall())
+            try:
+                cur.execute(
+                    f"SELECT table_name AS from_table, column_name AS from_column, "
+                    f"ref_table AS to_table, ref_column AS to_column "
+                    f"FROM t_semantic_model "
+                    f"WHERE is_fk = 1 "
+                    f"AND ref_table IS NOT NULL "
+                    f"AND ref_table <> '' "
+                    f"AND (table_name IN ({placeholders}) OR ref_table IN ({placeholders}))",
+                    table_names + table_names,
+                )
+                rows.extend(list(cur.fetchall()))
+            except Exception as e:
+                logger.warning("semantic FK relationship lookup failed: %s", e)
         conn.close()
 
         # 去重

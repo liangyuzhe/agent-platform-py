@@ -40,6 +40,23 @@ def test_preselect_pipeline_runs_real_node_order(mock_select, mock_enhance, mock
     assert mock_select.call_count == 1
 
 
+@patch("agents.model.chat_model.init_chat_models")
+@patch("agents.flow.sql_react.recall_evidence", side_effect=_fake_recall_evidence)
+@patch("agents.flow.sql_react.query_enhance", side_effect=_fake_query_enhance)
+@patch("agents.flow.sql_react.select_tables", side_effect=_fake_select_tables)
+def test_preselect_pipeline_initializes_chat_model_registry(
+    mock_select,
+    mock_enhance,
+    mock_recall,
+    mock_init_models,
+):
+    import asyncio
+
+    asyncio.run(run_preselect_pipeline("去年亏损多少"))
+
+    mock_init_models.assert_called_once()
+
+
 @patch("agents.rag.retriever.recall_business_knowledge")
 def test_business_knowledge_strategy_uses_business_labels_only(mock_recall):
     mock_recall.return_value = [

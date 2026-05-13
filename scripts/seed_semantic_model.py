@@ -27,6 +27,20 @@ def get_conn():
     )
 
 
+_TABLE_VISIBLE_SEMANTICS = {
+    "t_user": "用户/员工账号信息表，包含真实姓名、联系电话、邮箱、注册时间、账号状态",
+    "t_role": "系统角色信息表，包含角色名称、角色编码、角色状态和创建时间",
+    "t_user_role": "用户角色绑定关系表，关联用户与系统角色，用于查询用户拥有哪些角色",
+    "t_department": "组织部门信息表，包含部门名称、上级部门、部门负责人、联系电话和状态",
+    "t_user_department": "用户部门归属关系表，关联用户与部门，并标识是否部门负责人",
+}
+
+
+def table_visible_semantics() -> dict[str, str]:
+    """Return table-level business descriptions used by select_tables."""
+    return dict(_TABLE_VISIBLE_SEMANTICS)
+
+
 def create_table(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -124,12 +138,13 @@ def sync_schema_from_information_schema(conn):
     print(f"Synced {updated} columns from information_schema")
 
 
-def seed_data(conn):
-    """Seed semantic model for financial tables.
+def semantic_model_records() -> list[tuple[str, str, str, str, str]]:
+    """Return field-level semantic model seed records.
 
-    Column names match seed_financial.py table definitions exactly.
+    Column names must match the actual table schemas. Records are metadata, not
+    runtime routing rules; select_tables remains driven by database semantics.
     """
-    records = [
+    return [
         # t_account
         ("t_account", "account_code", "科目编码", "会计科目代码", "财务科目唯一编码，如 1001=库存现金"),
         ("t_account", "account_name", "科目名称", "会计科目, 账户名称", "财务科目名称"),
@@ -144,6 +159,37 @@ def seed_data(conn):
         ("t_cost_center", "center_name", "成本中心名称", "部门名称", "如：研发部、市场部、财务部"),
         ("t_cost_center", "manager", "负责人", "部门经理, 主管", "成本中心负责人姓名"),
         ("t_cost_center", "annual_budget", "年度预算", "全年预算", "该成本中心的年度预算金额"),
+
+        # organization / access management tables
+        ("t_user", "username", "用户名", "登录名, 账号, 用户账号", "系统登录账号"),
+        ("t_user", "real_name", "真实姓名", "员工姓名, 用户姓名, 姓名", "用户或员工的真实姓名"),
+        ("t_user", "gender", "性别", "", "用户性别编码"),
+        ("t_user", "email", "邮箱地址", "电子邮箱, 邮箱", "用户联系邮箱"),
+        ("t_user", "phone", "联系电话", "手机号, 电话, 联系方式", "用户联系电话"),
+        ("t_user", "register_time", "注册时间", "创建时间, 入库时间", "用户账号注册时间"),
+        ("t_user", "status", "用户状态", "账号状态, 是否正常", "0=停用, 1=正常"),
+
+        ("t_role", "name", "角色名称", "系统角色, 权限角色", "系统角色的中文名称"),
+        ("t_role", "code", "角色编码", "角色代码", "系统角色唯一编码"),
+        ("t_role", "description", "角色描述", "角色说明", "角色职责或权限说明"),
+        ("t_role", "status", "角色状态", "是否正常, 是否启用", "0=停用, 1=正常"),
+        ("t_role", "created_at", "角色创建时间", "创建时间", "角色记录创建时间"),
+
+        ("t_user_role", "user_id", "用户ID", "员工ID, 用户编号", "关联 t_user.id"),
+        ("t_user_role", "role_id", "角色ID", "系统角色ID", "关联 t_role.id"),
+        ("t_user_role", "created_at", "绑定时间", "分配时间, 创建时间", "用户角色绑定关系创建时间"),
+
+        ("t_department", "name", "部门名称", "组织名称, 部门", "组织部门名称"),
+        ("t_department", "parent_id", "上级部门ID", "父部门, 上级组织", "关联 t_department.id，表示部门层级"),
+        ("t_department", "manager", "部门负责人", "负责人, 部门经理, 主管", "部门负责人姓名"),
+        ("t_department", "phone", "联系电话", "部门电话, 联系方式", "部门联系电话"),
+        ("t_department", "status", "部门状态", "是否正常, 是否启用", "0=停用, 1=正常"),
+        ("t_department", "created_at", "部门创建时间", "创建时间", "部门记录创建时间"),
+
+        ("t_user_department", "user_id", "用户ID", "员工ID, 用户编号", "关联 t_user.id"),
+        ("t_user_department", "department_id", "部门ID", "组织ID", "关联 t_department.id"),
+        ("t_user_department", "is_leader", "是否部门负责人", "是否负责人, 是否主管", "1=是部门负责人, 0=不是部门负责人"),
+        ("t_user_department", "created_at", "归属创建时间", "分配时间, 创建时间", "用户部门归属关系创建时间"),
 
         # t_journal_entry
         ("t_journal_entry", "entry_no", "凭证号", "记账凭证编号", "会计凭证唯一编号"),
@@ -242,6 +288,14 @@ def seed_data(conn):
         ("t_fixed_asset", "status", "资产状态", "", "在用/闲置/已报废/已处置"),
     ]
 
+
+def seed_data(conn):
+    """Seed semantic model for financial and management tables.
+
+    Column names match seed_financial.py and the active database schemas.
+    """
+    records = semantic_model_records()
+
     with conn.cursor() as cur:
         for table_name, column_name, business_name, synonyms, description in records:
             cur.execute(
@@ -255,6 +309,45 @@ def seed_data(conn):
             )
     conn.commit()
     print(f"Seeded {len(records)} semantic model business entries")
+
+
+def clear_table_metadata_cache():
+    """Clear table metadata cache so select_tables sees updated comments."""
+    try:
+        import redis as redis_mod
+        addr = settings.redis.addr
+        host, port = addr.rsplit(":", 1) if ":" in addr else (addr, "6379")
+        client = redis_mod.Redis(
+            host=host,
+            port=int(port),
+            db=settings.redis.db,
+            password=settings.redis.password or None,
+            decode_responses=True,
+            socket_timeout=2,
+        )
+        client.delete("schema:table_metadata")
+        print("Cleared Redis schema:table_metadata cache")
+    except Exception as e:
+        print(f"Skipped Redis table metadata cache clear: {e}")
+
+
+def seed_table_visible_semantics(conn):
+    """Backfill table comments used by select_tables.
+
+    Existing databases may have been created before table comments were added.
+    Missing tables are ignored so the seed remains safe across environments.
+    """
+    updated = 0
+    with conn.cursor() as cur:
+        for table_name, comment in table_visible_semantics().items():
+            try:
+                cur.execute(f"ALTER TABLE `{table_name}` COMMENT=%s", (comment,))
+                updated += 1
+            except Exception as e:
+                print(f"  [SKIP] table comment {table_name}: {e}")
+    conn.commit()
+    clear_table_metadata_cache()
+    print(f"Updated {updated} table visible semantics")
 
 
 def seed_logical_foreign_keys(conn):
@@ -274,6 +367,15 @@ def seed_logical_foreign_keys(conn):
 
         # t_expense_claim
         ("t_expense_claim", "cost_center_id", "t_cost_center", "id"),
+        ("t_expense_claim", "department_id", "t_department", "id"),
+
+        # organization / access management
+        ("t_cost_center", "department_id", "t_department", "id"),
+        ("t_department", "parent_id", "t_department", "id"),
+        ("t_user_role", "user_id", "t_user", "id"),
+        ("t_user_role", "role_id", "t_role", "id"),
+        ("t_user_department", "user_id", "t_user", "id"),
+        ("t_user_department", "department_id", "t_department", "id"),
 
         # t_receivable_payable (如果有外键)
         # t_invoice (如果有外键)
@@ -295,6 +397,7 @@ def main():
     conn = get_conn()
     try:
         create_table(conn)
+        seed_table_visible_semantics(conn)
         sync_schema_from_information_schema(conn)
         seed_data(conn)
         seed_logical_foreign_keys(conn)
