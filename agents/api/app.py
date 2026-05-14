@@ -60,6 +60,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Failed to schedule intent_rules table check: %s", e)
 
+    try:
+        from agents.tool.storage.query_route_rules import ensure_query_route_rule_table
+        await _run_startup_check("query_route_rules", ensure_query_route_rule_table, logger)
+    except Exception as e:
+        logger.warning("Failed to schedule query_route_rules table check: %s", e)
+
     # 初始化模型
     init_chat_models()
     init_embedding_models()

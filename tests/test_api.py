@@ -171,6 +171,40 @@ class TestAdminIntentRules:
         assert mock_upsert.call_args[0][0]["rewrite_template"] == "公司{query}"
 
 
+class TestAdminQueryRouteRules:
+    """Test configurable complex-query route-rule admin endpoints."""
+
+    @patch("agents.tool.storage.query_route_rules.ensure_query_route_rule_table")
+    @patch("agents.tool.storage.query_route_rules.list_query_route_rules")
+    def test_list_query_route_rules(self, mock_list, mock_ensure, client):
+        mock_list.return_value = [{"id": 1, "name": "broad analysis", "route_signal": "analysis"}]
+
+        resp = client.get("/api/admin/query-route-rules")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["items"][0]["route_signal"] == "analysis"
+
+    @patch("agents.tool.storage.query_route_rules.ensure_query_route_rule_table")
+    @patch("agents.tool.storage.query_route_rules.upsert_query_route_rule", return_value=7)
+    def test_upsert_query_route_rule(self, mock_upsert, mock_ensure, client):
+        resp = client.post("/api/admin/query-route-rules", json={
+            "name": "broad analysis",
+            "route_signal": "analysis",
+            "match_type": "contains",
+            "pattern": "configured-analysis-pattern",
+            "priority": 100,
+            "confidence": 0.9,
+            "enabled": True,
+            "description": "test",
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()["id"] == 7
+        assert mock_upsert.call_args[0][0]["pattern"] == "configured-analysis-pattern"
+
+
 class TestStaticFiles:
     """Test static file serving."""
 

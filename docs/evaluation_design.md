@@ -32,8 +32,14 @@ Schema 评测数据从 MySQL `t_semantic_model` 生成，不再依赖历史 Milv
 | `p50_latency_ms` | 中位延迟 | 最小 0ms，无理论上限 | 越小越好 | 衡量典型请求体验 |
 | `p95_latency_ms` | 长尾延迟 | 最小 0ms，无理论上限 | 越小越好 | 生产环境更关注长尾稳定性 |
 | `first_token_latency_ms` | 首字延迟，当前报告格式已预留 | 最小 0ms，无理论上限 | 越小越好 | 后续接入端到端流式评测，用于衡量用户等待体感 |
+| `route_accuracy` | 复杂查询路由模式是否命中标注结果 | 0-1，最大 1.0 | 越大越好 | 衡量超过单 SQL 表数预算时，是进入计划模式还是澄清 |
+| `plan_validity_rate` | 复杂计划通过结构校验的比例 | 0-1，最大 1.0 | 越大越好 | 防止不可执行、不可审计的多步骤计划进入执行 |
+| `step_success_rate` | 计划执行步骤成功数 / 总步骤数 | 0-1，最大 1.0 | 越大越好 | 衡量多 SQL/本地聚合链路稳定性 |
+| `final_answer_correctness` | 复杂计划最终答案是否符合预期 | 0-1，最大 1.0 | 越大越好 | 衡量拆分、合并、展示是否共同回答了用户问题 |
 
 说明：比例类指标的理论最优值都是 `1.0`，页面展示为 `100%`；延迟类指标理论最小值是 `0ms`，没有固定最大值，生产环境应按业务 SLA 设定告警阈值，例如检索 P95、端到端 P95 和 TTFT P95。
+
+复杂查询路由评测与 Schema Recall@K 不同：Recall@K 衡量“有没有把正确表召回到 TopK”，而 `route_accuracy` 衡量“当选表结果已经超过单 SQL 预算时，系统是否选择正确执行模式”。例如超过 8 张表的分析型问题应该进入 `complex_plan`，明细导出或敏感数据问题应该进入 `clarify`。这类评测不要求调用外部 LLM，可用 `route_signal` 标注模拟数据库规则或 LLM 仲裁后的语义信号。
 
 ## 报告格式
 
@@ -222,6 +228,25 @@ python -m agents.eval.cli run \
 ENABLE_LEGACY_EVAL_RETRIEVERS=1 \
   python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output data/eval/eval_report.json
 ```
+
+### 复杂查询路由专项评测
+
+复杂查询专项样本建议单独维护，不和 schema 召回样本混在一起：
+
+```json
+{"query": "收入成本预算回款费用之间的关系", "tables": ["t_1", "t_2", "..."], "route_signal": "analysis", "expected_route": "complex_plan"}
+{"query": "员工工资和部门角色权限", "tables": ["t_1", "t_2", "..."], "route_signal": "detail", "expected_route": "clarify"}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+|------|------|
+| `tables` | `select_tables` 和逻辑外键补表后的最终表集合 |
+| `route_signal` | 数据库规则或 LLM 仲裁后的语义信号，不在代码里写死关键词 |
+| `expected_route` | 标注的目标路由：`single_sql`、`single_sql_with_strict_checks`、`complex_plan`、`clarify` |
+
+当前已提供本地 helper `run_complex_route_eval_case()` 和 `route_accuracy()`，用于单元测试和后续 CLI 接入。下一步可以把它接入评测报告 JSON 与前端 Evaluation 页面，展示 `route_accuracy`、`plan_validity_rate`、`step_success_rate` 和 `final_answer_correctness`。
 
 评测报告会包含两层信息：
 

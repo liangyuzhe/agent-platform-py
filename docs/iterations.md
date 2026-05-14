@@ -2379,3 +2379,262 @@ git diff --check
 ```
 
 结果：通过。
+
+## Iteration 39：复杂多表查询的单 SQL 与计划模式切换
+
+### 背景
+
+当前 `select_tables` 默认围绕 Top5 表做评测和选表，逻辑外键补表后可能超过 5 张。这个默认值对大多数财务 NL2SQL 是合理的：
+
+- “去年亏损”：通常需要 `t_journal_entry + t_journal_item + t_account`。
+- “第一季度员工工资”：通常需要凭证主表、分录表、会计科目，必要时补部门/成本中心。
+- “用户角色部门”：通常需要 `t_user + t_role + t_user_role + t_department + t_user_department`。
+
+问题在于：如果逻辑外键补表后超过 8 张表，继续把所有 schema 直接塞给单个 `sql_generate` 节点，会带来三个风险：
+
+1. **上下文膨胀**：字段、关系和业务知识会占用大量 token，压缩 SQL 生成可用上下文。
+2. **JOIN 幻觉**：LLM 更容易生成错误 JOIN、重复 JOIN 或漏掉关键过滤条件。
+3. **业务目标不清**：很多超过 8 张表的问题，本质上不是一条明细 SQL，而是多个指标、多个业务域的分析任务。
+
+早期想法是“超过 8 张表就提示用户缩小范围或拆成多步查询”。这个策略安全，但过于保守，会把一部分真实复杂分析需求挡掉。
+
+### DataAgent 参考
+
+DataAgent 的处理不是简单扩大单条 SQL 的表数量，也不是超过阈值直接拒绝：
+
+- `TableRelationNode` 先基于 query/evidence 构建初始 schema，用 LLM 精选相关表，再通过外键/逻辑外键找到缺失表，并加载语义模型。
+- `PlannerNode` 基于 evidence、schema 和语义模型生成执行计划。
+- `PlanExecutorNode` 按计划逐步路由到 SQL、Python、Report 等节点。
+- SQL/Python 执行后再回到 step select，最终生成报告。
+
+这说明复杂问题应该进入 **Planner 多步执行模式**，但不等同于“LLM 自动并行拆很多 SQL”。是否拆分、怎么合并、是否需要用户确认，都需要计划层治理。
+
+### 方案取舍
+
+#### 方案 A：超过 8 张表直接提示用户缩小范围
+
+优点：
+
+- 实现简单，风险低。
+- 不会生成非常复杂、不可读、不可审计的 SQL。
+- 适合明细查询和权限敏感场景。
+
+缺点：
+
+- 对真实复杂分析问题不友好。
+- 用户明明希望系统完成分析，却被迫手动拆问题。
+- 不能充分发挥 Agent 的计划和工具编排能力。
+
+#### 方案 B：LLM 拆分任务，多步查询后综合
+
+优点：
+
+- 能处理多指标、多业务域、多阶段分析。
+- 每个子 SQL 可控制在 3-5 张表，降低单 SQL 复杂度。
+- 可引入 Python/本地代码做合并、同比环比、排序、异常归因。
+
+缺点：
+
+- 需要计划校验、依赖管理、结果合并和失败恢复。
+- 并行拆分不一定安全；有些步骤必须串行。
+- 如果没有稳定 join key 或业务口径，LLM 硬拆会产生错误结论。
+
+### 推荐策略：8 张表作为“计划模式切换阈值”
+
+不把 8 张表作为拒绝阈值，而作为从 **单 SQL 模式** 切换到 **Complex Query Planner 模式** 的阈值。
+
+```text
+候选召回层：Top10-20，用于保证召回，不直接全部给 SQL 生成
+LLM 主动选表：默认最多 5 张主表
+逻辑外键补表后：允许最多 8 张表进入单 SQL
+超过 8 张表：进入 Complex Query Planner，先判断是否可拆
+```
+
+#### 单 SQL 模式
+
+适用条件：
+
+- 最终表数不超过 8 张。
+- 查询目标明确，能用一条聚合或明细 SQL 回答。
+- JOIN 路径能由物理外键或逻辑外键解释。
+- 不需要多个业务域结果再二次合并。
+
+处理方式：
+
+```text
+select_tables -> sql_retrieve -> sql_generate -> safety_check -> approve -> execute_sql
+```
+
+#### Complex Query Planner 模式
+
+适用条件：
+
+- 逻辑外键补表后超过 8 张。
+- 用户问题包含多个指标、多个业务域或分析型诉求。
+- 每个子任务可拆成 3-5 张表的独立查询。
+- 子任务之间有清晰的公共维度，例如期间、部门、项目、客户、供应商。
+- 最终目标是汇总、对比、分析、报告，而不是一张强一致明细表。
+
+Planner 需要输出结构化计划：
+
+```json
+{
+  "mode": "complex_plan",
+  "reason": "涉及多个业务域和超过 8 张表，拆分为多个可执行 SQL 子任务",
+  "steps": [
+    {
+      "step": 1,
+      "type": "sql",
+      "goal": "查询 2025 年各月收入和成本费用",
+      "tables": ["t_journal_entry", "t_journal_item", "t_account"],
+      "depends_on": [],
+      "merge_keys": ["period"]
+    },
+    {
+      "step": 2,
+      "type": "sql",
+      "goal": "查询 2025 年各部门预算执行情况",
+      "tables": ["t_budget", "t_cost_center", "t_department"],
+      "depends_on": [],
+      "merge_keys": ["period", "department_id"]
+    },
+    {
+      "step": 3,
+      "type": "python_merge",
+      "goal": "按期间和部门合并结果，生成综合分析",
+      "depends_on": [1, 2],
+      "merge_keys": ["period", "department_id"]
+    }
+  ],
+  "requires_user_confirmation": true
+}
+```
+
+#### 需要澄清或拒绝自动拆分的场景
+
+以下场景不应该直接让 LLM 自动拆分执行：
+
+- 用户要的是强一致明细表，必须跨很多表精确 JOIN。
+- 子任务之间没有稳定 join key。
+- 用户问题过宽泛，例如“分析公司所有经营情况”。
+- 涉及工资、个人信息、银行账号等敏感字段。
+- 需要事务一致性或同一时间点快照，但系统无法保证。
+- Planner 无法说明每一步的表、目标、依赖和合并键。
+
+这类请求应该返回澄清问题，或者先给前端一个计划预览，让用户确认范围后再执行。
+
+### 迭代开发拆分
+
+#### Task 1：复杂度评分与路由决策
+
+目标：在 `select_tables` 之后增加复杂度判定，不改变现有 SQL 生成行为。
+
+输出：
+
+- `selected_tables_count`
+- `relationship_count`
+- `estimated_join_count`
+- `query_intent_complexity`
+- `route_mode`: `single_sql | complex_plan | clarify`
+
+路由原则：
+
+```text
+selected_tables <= 5: single_sql
+6 <= selected_tables <= 8: single_sql_with_strict_checks
+selected_tables > 8: 进入复杂查询路由仲裁
+```
+
+复杂查询路由仲裁不能在 Python 代码里硬编码“分析、明细、敏感字段”等业务关键词。可执行方案是：
+
+1. **结构信号走本地代码**：表数、关系数、估算 JOIN 数、是否有逻辑外键路径，这些是稳定工程规则。
+2. **语义信号走配置或模型**：分析型、报表型、明细导出型、敏感数据型等判断由数据库规则表或 LLM 仲裁给出，不把关键词写死在代码里。
+3. **默认保守**：超过 8 张表但无法确认可拆分、无法给出公共合并维度时，返回 `clarify`，要求用户缩小范围。
+
+验证：
+
+- 财务核心三表查询仍走 `single_sql`。
+- 用户/角色/部门五表查询仍走 `single_sql`。
+- 超过 8 张且规则/LLM 仲裁为可拆分析问题时进入 `complex_plan`。
+- 超过 8 张且规则/LLM 仲裁为明细导出、敏感数据或不可稳定合并时进入 `clarify`。
+
+#### Task 2：Complex Query Planner 节点
+
+目标：新增计划节点，只生成结构化计划，不执行 SQL。
+
+计划必须包含：
+
+- 每步 `type`: `sql | python_merge | report`
+- 每步 `goal`
+- 每步 `tables`
+- 每步 `depends_on`
+- 每步 `merge_keys`
+- 是否需要用户确认
+
+约束：
+
+- SQL 子任务表数建议不超过 5。
+- 无法给出 merge key 时必须转 `clarify`。
+- 涉及敏感字段时必须转 `clarify` 或要求权限确认。
+
+#### Task 3：计划校验与用户确认
+
+目标：防止 LLM 生成不可执行或不可审计的计划。
+
+校验规则：
+
+- 所有表必须来自当前 schema 候选。
+- `depends_on` 必须引用已存在步骤。
+- `python_merge` 必须至少依赖一个 SQL 步骤。
+- 有多个 SQL 步骤需要合并时必须提供 `merge_keys`。
+- 步骤数设置上限，例如 5 步。
+
+前端/SSE 展示：
+
+```text
+检测到这是复杂多表分析问题，系统已拆分为 3 个步骤：
+1. 查询收入和成本费用
+2. 查询预算执行情况
+3. 按期间和部门合并分析
+请确认是否按该计划执行？
+```
+
+#### Task 4：多 SQL 执行与结果聚合
+
+目标：复用现有 `sql_generate -> safety_check -> approve -> execute_sql`，逐步执行计划。
+
+执行策略：
+
+- 无依赖 SQL 步骤可以并行，但初期建议先串行，降低状态复杂度。
+- 每个 SQL 仍必须 safety_check 和 approve。
+- 每步结果写入 `plan_execution_results[step_id]`。
+- `python_merge` 或本地聚合节点只消费已完成步骤结果。
+
+#### Task 5：评测与回归
+
+新增复杂查询专项数据集：
+
+- 3-5 张表单 SQL 样本。
+- 6-8 张表单 SQL 样本。
+- 超过 8 张且可拆分析样本。
+- 超过 8 张但应该澄清的明细/敏感样本。
+
+指标：
+
+- route accuracy：路由模式是否正确。
+- plan validity：计划结构是否合法。
+- step success rate：每步执行成功率。
+- final answer correctness：最终回答是否符合预期。
+- latency P50/P95：复杂计划整体耗时。
+
+### 当前结论
+
+Top5 仍然适合作为默认选表和评测指标，因为绝大多数 NL2SQL 问题不应依赖很多表。
+
+8 张表不应作为拒绝阈值，而应作为从单 SQL 模式切换到复杂计划模式的阈值。
+
+复杂多表查询的关键不是“给 LLM 更多表”，而是“让 Agent 先规划、再分步执行、最后可审计地合并结果”。
+
+### 开发计划链接
+
+详细 TDD 拆分见：[Complex Query Planner Implementation Plan](superpowers/plans/2026-05-14-complex-query-planner.md)。

@@ -328,6 +328,18 @@ class IntentRuleItem(BaseModel):
     description: str = ""
 
 
+class QueryRouteRuleItem(BaseModel):
+    id: int | None = None
+    name: str
+    route_signal: str
+    match_type: str = "contains"
+    pattern: str
+    priority: int = 100
+    confidence: float = 0.9
+    enabled: bool = True
+    description: str = ""
+
+
 @router.get("/intent-rules")
 async def list_intent_rule_items():
     """List configurable intent rules."""
@@ -366,4 +378,49 @@ async def delete_intent_rule_item(rule_id: int):
         return {"success": True, "message": f"Deleted intent rule #{rule_id}"}
     except Exception as e:
         logger.warning("Delete intent rule failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# Complex Query Route Rule CRUD
+# ---------------------------------------------------------------------------
+
+@router.get("/query-route-rules")
+async def list_query_route_rule_items():
+    """List configurable complex-query route rules."""
+    try:
+        from agents.tool.storage.query_route_rules import ensure_query_route_rule_table, list_query_route_rules
+
+        ensure_query_route_rule_table()
+        items = list_query_route_rules(enabled_only=False)
+        return {"items": items, "count": len(items)}
+    except Exception as e:
+        logger.warning("List query route rules failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/query-route-rules")
+async def upsert_query_route_rule_item(item: QueryRouteRuleItem):
+    """Create or update a configurable complex-query route rule."""
+    try:
+        from agents.tool.storage.query_route_rules import ensure_query_route_rule_table, upsert_query_route_rule
+
+        ensure_query_route_rule_table()
+        rule_id = upsert_query_route_rule(item.model_dump())
+        return {"success": True, "id": rule_id, "message": f"Saved query route rule #{rule_id}"}
+    except Exception as e:
+        logger.warning("Save query route rule failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.delete("/query-route-rules/{rule_id}")
+async def delete_query_route_rule_item(rule_id: int):
+    """Delete a configurable complex-query route rule."""
+    try:
+        from agents.tool.storage.query_route_rules import delete_query_route_rule
+
+        delete_query_route_rule(rule_id)
+        return {"success": True, "message": f"Deleted query route rule #{rule_id}"}
+    except Exception as e:
+        logger.warning("Delete query route rule failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e

@@ -467,6 +467,7 @@
                     <strong>管理面板</strong><br>
                     意图识别默认由 LLM 判断。这里维护的是可选规则信号，适合把高频、确定性强的路由策略沉淀到数据库；规则与 LLM 并行执行，最终由仲裁器给出意图。
                 </div>
+                <h3 style="margin-top:18px;">意图规则</h3>
                 <div class="admin-grid" style="margin-top:16px;">
                     <form class="admin-form" onsubmit="saveIntentRule(event)">
                         <input type="hidden" id="intentRuleId">
@@ -520,6 +521,60 @@
                         <table class="admin-table" id="intentRulesTable"></table>
                     </div>
                 </div>
+                <h3 style="margin-top:24px;">复杂查询路由规则</h3>
+                <div class="admin-note">
+                    这些规则只作为超过单 SQL 表数预算后的语义信号，帮助系统判断进入多步计划还是先澄清。规则内容维护在数据库中，运行时代码不写业务关键词。
+                </div>
+                <div class="admin-grid" style="margin-top:16px;">
+                    <form class="admin-form" onsubmit="saveQueryRouteRule(event)">
+                        <input type="hidden" id="queryRouteRuleId">
+                        <label>规则名称
+                            <input id="queryRouteRuleName" placeholder="例如：复杂分析问题">
+                        </label>
+                        <label>路由信号
+                            <select id="queryRouteRuleSignal">
+                                <option value="analysis">analysis</option>
+                                <option value="report">report</option>
+                                <option value="comparison">comparison</option>
+                                <option value="detail">detail</option>
+                                <option value="export">export</option>
+                                <option value="sensitive">sensitive</option>
+                                <option value="ambiguous">ambiguous</option>
+                            </select>
+                        </label>
+                        <label>匹配方式
+                            <select id="queryRouteRuleMatchType">
+                                <option value="contains">contains</option>
+                                <option value="exact">exact</option>
+                                <option value="regex">regex</option>
+                            </select>
+                        </label>
+                        <label>匹配表达式
+                            <textarea id="queryRouteRulePattern" placeholder="关键词、完整问题或正则表达式"></textarea>
+                        </label>
+                        <label>优先级
+                            <input id="queryRouteRulePriority" type="number" value="100">
+                        </label>
+                        <label>置信度
+                            <input id="queryRouteRuleConfidence" type="number" min="0" max="1" step="0.01" value="0.9">
+                        </label>
+                        <label>说明
+                            <textarea id="queryRouteRuleDescription" placeholder="规则适用场景"></textarea>
+                        </label>
+                        <label style="display:flex;grid-template-columns:auto 1fr;align-items:center;">
+                            <input id="queryRouteRuleEnabled" type="checkbox" checked style="width:auto;">
+                            启用规则
+                        </label>
+                        <div class="admin-actions">
+                            <button class="admin-btn" type="submit">保存规则</button>
+                            <button class="admin-btn secondary" type="button" onclick="resetQueryRouteRuleForm()">清空</button>
+                        </div>
+                        <div id="queryRouteRuleStatus" class="eval-muted"></div>
+                    </form>
+                    <div class="eval-scroll">
+                        <table class="admin-table" id="queryRouteRulesTable"></table>
+                    </div>
+                </div>
               </div>
             </section>
         </div>
@@ -557,7 +612,10 @@
             document.getElementById('pageTitle').textContent = titles[name][0];
             document.getElementById('pageMeta').textContent = titles[name][1];
             if (name === 'eval') loadEvalReport();
-            if (name === 'admin') loadIntentRules();
+            if (name === 'admin') {
+                loadIntentRules();
+                loadQueryRouteRules();
+            }
         }
 
         // --- Chat ---
@@ -726,15 +784,20 @@
         function renderAgentResponse(div, data) {
             const bubble = div.querySelector('.bubble');
             let html = '';
+            const approvalType = data.approval_type || (data.sql ? 'sql' : '');
 
-            if (data.pending_approval && data.sql) {
-                // SQL approval flow
-                html += '<span class="intent-tag sql">SQL</span>';
-                html += '<div class="answer-text">' + escHtml(data.answer || '请确认是否执行该 SQL') + '</div>';
-                html += '<details class="sql-detail" open><summary>SQL 语句</summary>';
-                html += '<pre>' + escHtml(data.sql) + '</pre></details>';
+            if (data.pending_approval) {
+                const isSqlApproval = approvalType !== 'complex_plan';
+                html += `<span class="intent-tag ${isSqlApproval ? 'sql' : 'chat'}">${isSqlApproval ? 'SQL' : 'Plan'}</span>`;
+                html += '<div class="answer-text">' + escHtml(data.answer || (isSqlApproval ? '请确认是否执行该 SQL' : '请确认是否执行该计划')) + '</div>';
+                if (data.sql) {
+                    html += '<details class="sql-detail" open><summary>SQL 语句</summary>';
+                    html += '<pre>' + escHtml(data.sql) + '</pre></details>';
+                } else if (approvalType === 'complex_plan') {
+                    html += '<div class="result-card"><div class="answer-text">该复杂查询已进入计划审批模式，确认后将进入分步执行。</div></div>';
+                }
                 html += '<div class="approval-actions">';
-                html += '<button class="btn-approve" onclick="approveSql(this, true)">执行</button>';
+                html += `<button class="btn-approve" onclick="approveSql(this, true)">${isSqlApproval ? '执行' : '确认计划'}</button>`;
                 html += '<button class="btn-reject" onclick="approveSql(this, false)">拒绝</button>';
                 html += '</div>';
             } else {
@@ -941,6 +1004,120 @@
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 intentRulesLoaded = false;
                 await loadIntentRules(true);
+            } catch (e) {
+                status.textContent = '删除失败：' + e.message;
+            }
+        }
+
+        // --- Admin: complex query route rules ---
+        let queryRouteRulesLoaded = false;
+        async function loadQueryRouteRules(force = false) {
+            if (queryRouteRulesLoaded && !force) return;
+            const table = document.getElementById('queryRouteRulesTable');
+            const status = document.getElementById('queryRouteRuleStatus');
+            table.innerHTML = '<tr><td>加载中...</td></tr>';
+            try {
+                const resp = await fetch('/api/admin/query-route-rules');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                const items = data.items || [];
+                if (!items.length) {
+                    table.innerHTML = '<tr><td class="eval-muted">暂无规则。超过表数预算时将由 LLM 仲裁。</td></tr>';
+                } else {
+                    table.innerHTML = '<thead><tr><th>规则</th><th>信号</th><th>匹配</th><th>优先级</th><th>状态</th><th>操作</th></tr></thead><tbody>'
+                        + items.map(renderQueryRouteRuleRow).join('')
+                        + '</tbody>';
+                }
+                status.textContent = `已加载 ${items.length} 条规则`;
+                queryRouteRulesLoaded = true;
+            } catch (e) {
+                table.innerHTML = '<tr><td class="eval-muted">加载失败：' + escHtml(e.message) + '</td></tr>';
+                status.textContent = '';
+            }
+        }
+
+        function renderQueryRouteRuleRow(rule) {
+            const encoded = encodeURIComponent(JSON.stringify(rule));
+            return `<tr>
+                <td><strong>${escHtml(rule.name || '')}</strong><br><span class="eval-muted">${escHtml(rule.description || '')}</span></td>
+                <td><code>${escHtml(rule.route_signal || '')}</code></td>
+                <td><code>${escHtml(rule.match_type || '')}</code><br>${escHtml(rule.pattern || '')}</td>
+                <td>${escHtml(String(rule.priority ?? ''))}<br><span class="eval-muted">conf ${escHtml(String(rule.confidence ?? ''))}</span></td>
+                <td>${rule.enabled ? '启用' : '停用'}</td>
+                <td>
+                    <button class="admin-btn secondary" type="button" onclick="editQueryRouteRule('${encoded}')">编辑</button>
+                    <button class="admin-btn secondary" type="button" onclick="deleteQueryRouteRule(${Number(rule.id)})">删除</button>
+                </td>
+            </tr>`;
+        }
+
+        function editQueryRouteRule(encoded) {
+            const rule = JSON.parse(decodeURIComponent(encoded));
+            document.getElementById('queryRouteRuleId').value = rule.id || '';
+            document.getElementById('queryRouteRuleName').value = rule.name || '';
+            document.getElementById('queryRouteRuleSignal').value = rule.route_signal || 'analysis';
+            document.getElementById('queryRouteRuleMatchType').value = rule.match_type || 'contains';
+            document.getElementById('queryRouteRulePattern').value = rule.pattern || '';
+            document.getElementById('queryRouteRulePriority').value = rule.priority ?? 100;
+            document.getElementById('queryRouteRuleConfidence').value = rule.confidence ?? 0.9;
+            document.getElementById('queryRouteRuleDescription').value = rule.description || '';
+            document.getElementById('queryRouteRuleEnabled').checked = !!rule.enabled;
+        }
+
+        function resetQueryRouteRuleForm() {
+            document.getElementById('queryRouteRuleId').value = '';
+            document.getElementById('queryRouteRuleName').value = '';
+            document.getElementById('queryRouteRuleSignal').value = 'analysis';
+            document.getElementById('queryRouteRuleMatchType').value = 'contains';
+            document.getElementById('queryRouteRulePattern').value = '';
+            document.getElementById('queryRouteRulePriority').value = 100;
+            document.getElementById('queryRouteRuleConfidence').value = 0.9;
+            document.getElementById('queryRouteRuleDescription').value = '';
+            document.getElementById('queryRouteRuleEnabled').checked = true;
+        }
+
+        async function saveQueryRouteRule(event) {
+            event.preventDefault();
+            const status = document.getElementById('queryRouteRuleStatus');
+            const payload = {
+                id: document.getElementById('queryRouteRuleId').value ? Number(document.getElementById('queryRouteRuleId').value) : null,
+                name: document.getElementById('queryRouteRuleName').value.trim(),
+                route_signal: document.getElementById('queryRouteRuleSignal').value,
+                match_type: document.getElementById('queryRouteRuleMatchType').value,
+                pattern: document.getElementById('queryRouteRulePattern').value,
+                priority: Number(document.getElementById('queryRouteRulePriority').value || 100),
+                confidence: Number(document.getElementById('queryRouteRuleConfidence').value || 0.9),
+                enabled: document.getElementById('queryRouteRuleEnabled').checked,
+                description: document.getElementById('queryRouteRuleDescription').value,
+            };
+            if (!payload.name || !payload.pattern) {
+                status.textContent = '规则名称和匹配表达式不能为空';
+                return;
+            }
+            status.textContent = '保存中...';
+            try {
+                const resp = await fetch('/api/admin/query-route-rules', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                resetQueryRouteRuleForm();
+                queryRouteRulesLoaded = false;
+                await loadQueryRouteRules(true);
+            } catch (e) {
+                status.textContent = '保存失败：' + e.message;
+            }
+        }
+
+        async function deleteQueryRouteRule(id) {
+            const status = document.getElementById('queryRouteRuleStatus');
+            status.textContent = '删除中...';
+            try {
+                const resp = await fetch('/api/admin/query-route-rules/' + id, {method: 'DELETE'});
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                queryRouteRulesLoaded = false;
+                await loadQueryRouteRules(true);
             } catch (e) {
                 status.textContent = '删除失败：' + e.message;
             }

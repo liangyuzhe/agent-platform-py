@@ -38,6 +38,16 @@ class SQLReactState(TypedDict):
     table_names: list[str]                       # 所有可用表名（启动时缓存）
     selected_tables: list[str]                   # LLM 选中的相关表名
     table_relationships: list[dict]              # 表关系 [{from_table, from_column, to_table, to_column}]
+    route_mode: str                              # single_sql | single_sql_with_strict_checks | complex_plan | clarify
+    route_reason: str                            # 路由原因
+    route_signal: str                            # analysis | report | comparison | detail | export | sensitive | ambiguous
+    route_signal_source: str                     # rules | llm | default | not_needed
+    complexity_report: dict                      # 表数、关系数、估算 JOIN 数等复杂度信息
+    complex_plan: dict                           # 复杂查询执行计划
+    plan_validation_error: str                   # 复杂计划校验错误
+    plan_approved: bool                          # 复杂计划是否已确认
+    plan_current_step: int                       # 当前计划步骤编号
+    plan_execution_results: dict                 # step_id -> result/error/sql
     evidence: list[str]                          # 业务知识检索结果
     few_shot_examples: list[str]                 # SQL Q&A few-shot 参考
     docs: list[Document]                         # 检索到的表结构（从 t_semantic_model 构建）

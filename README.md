@@ -25,17 +25,35 @@
 
 ![Chat / Knowledge: 茅台第一季度盈利](docs/assets/demos/chat-maotai-q1-profit.gif)
 
-### SQL Query：本公司财务查数
+### SQL Query：去年亏损
 
-提问“公司盈利”，系统识别为结构化数据查询，生成 SQL 并进入人工审批后执行。
+提问“去年亏损”，系统识别为结构化数据查询，生成 SQL，经人工审批后执行并返回结果。
 
-![SQL Query: 公司盈利](docs/assets/demos/sql-last-year-profit-approved.gif)
+![SQL Query: 去年亏损](docs/assets/demos/sql-last-year-loss-approved.gif)
 
-### 多轮 SQL 与结果修正
+### 多轮追问：亏损多少
 
-提问“2024年每月亏损金额”，展示 SQL 执行失败或结果异常后自动分析、生成修正 SQL、再次审批和最终执行结果。
+先问“去年亏损”，再追问“亏损多少”，系统会沿用上一轮 SQL 口径完成多轮 NL2SQL 追问。
 
-![Multi-turn SQL + Repair: 去年亏损到亏损总和](docs/assets/demos/sql-loss-followup-repair-approved.gif)
+![Multi-turn SQL: 亏损多少](docs/assets/demos/sql-loss-followup-amount-approved.gif)
+
+### SQL Query：第一季度员工工资
+
+提问“第一季度员工工资”，系统完成意图识别、生成 SQL、审批执行，并返回按期间聚合的工资相关结果。
+
+![SQL Query: 第一季度员工工资](docs/assets/demos/sql-q1-salary-approved.gif)
+
+### SQL Query：用户与角色管理表查询
+
+提问“查询所有用户的真实姓名以及他们被分配的角色名称”，系统命中管理类表语义，完成跨用户和角色关系的 SQL 查询。
+
+![SQL Query: 用户与角色](docs/assets/demos/sql-management-user-role-approved.gif)
+
+### Complex Routing：复杂跨域问题友好拦截
+
+提问超出当前 schema 关系覆盖范围的复杂跨域问题时，系统不会硬拼 SQL，而是返回清晰的缺表/缺关系说明，引导用户补充范围或元数据。
+
+![Complex Routing: 复杂跨域问题友好拦截](docs/assets/demos/sql-complex-route-guardrail.gif)
 
 ## 架构概览
 

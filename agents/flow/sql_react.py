@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 
 from agents.flow.state import SQLReactState
+from agents.flow.complex_query import classify_query_complexity, validate_complex_plan
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.tool.sql_tools.safety import SQLSafetyChecker
@@ -19,6 +20,7 @@ from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.rag.query_rewrite import rewrite_query
 from agents.tool.storage.checkpoint import get_checkpointer
+from agents.tool.storage.query_route_rules import evaluate_query_route_rules
 from agents.config.settings import settings
 from agents.tool.trace.tracing import callbacks_from_config, child_trace_config, traced_tool_call
 
@@ -245,6 +247,24 @@ def _response_text(response) -> str:
     if content is None:
         return ""
     return str(content).strip()
+
+
+def _parse_json_object(text: str) -> dict:
+    clean = (text or "").strip()
+    if not clean:
+        return {}
+    try:
+        payload = json.loads(clean)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        match = re.search(r"\{.*\}", clean, flags=re.S)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
 
 def _split_terms(value: str) -> list[str]:
@@ -703,6 +723,202 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
     return {"selected_tables": selected, "table_relationships": relationships}
 
 
+async def infer_route_signal(state: SQLReactState, config=None) -> dict:
+    """Infer semantic route signal only after selected schema is broad."""
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    selected_tables = state.get("selected_tables", [])
+    if len(dict.fromkeys(selected_tables)) <= 8:
+        return {"route_signal": "", "route_signal_source": "not_needed"}
+
+    rule_decision = await evaluate_query_route_rules(query)
+    if rule_decision and rule_decision.confidence >= 0.8:
+        return {
+            "route_signal": rule_decision.route_signal,
+            "route_signal_source": "rules",
+            "complexity_report": {"route_rule": rule_decision.to_dict()},
+        }
+
+    model = get_chat_model(settings.chat_model_type)
+    try:
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=(
+                    "你是复杂 NL2SQL 路由仲裁器。根据用户问题判断它更像哪类请求：\n"
+                    "- analysis/report/comparison：可以拆成多个聚合 SQL 后合并分析\n"
+                    "- detail/export：用户要明细、清单、导出，不适合自动拆很多 SQL\n"
+                    "- sensitive：涉及个人敏感信息、权限明细、账号等需要澄清或权限确认\n"
+                    "- ambiguous：无法确定能稳定拆分或没有公共合并维度\n"
+                    "只返回 JSON：{\"route_signal\":\"analysis|report|comparison|detail|export|sensitive|ambiguous\","
+                    "\"reason\":\"一句话原因\"}"
+                )),
+                HumanMessage(content=query),
+            ],
+            config=child_trace_config(config, "sql.complex_route.llm", tags=["llm", "sql_react"]),
+        )
+        payload = _parse_json_object(_response_text(response))
+    except Exception as e:
+        logger.warning("complex route LLM arbitration failed: %s", e)
+        payload = {}
+
+    signal = str(payload.get("route_signal") or "ambiguous").strip().lower()
+    if signal not in {"analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"}:
+        signal = "ambiguous"
+    return {
+        "route_signal": signal,
+        "route_signal_source": "llm",
+        "complexity_report": {"route_signal_reason": payload.get("reason", "")},
+    }
+
+
+async def route_complexity(state: SQLReactState) -> dict:
+    """Route selected schema to single SQL, complex plan, or clarification."""
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    decision = classify_query_complexity(
+        query=query,
+        selected_tables=state.get("selected_tables", []),
+        relationships=state.get("table_relationships", []),
+        route_signal=state.get("route_signal") or None,
+    )
+    report = {
+        **(state.get("complexity_report") or {}),
+        "selected_tables_count": decision.selected_tables_count,
+        "relationship_count": decision.relationship_count,
+        "estimated_join_count": decision.estimated_join_count,
+        "query_intent_complexity": decision.query_intent_complexity,
+    }
+    answer = ""
+    if decision.route_mode == "clarify":
+        answer = (
+            "这个问题涉及的表和业务范围较大。请缩小查询范围，例如指定时间、部门、指标，"
+            "或说明你希望查看汇总分析还是明细列表。"
+        )
+    return {
+        "route_mode": decision.route_mode,
+        "route_reason": decision.reason,
+        "complexity_report": report,
+        "answer": answer,
+        "is_sql": False if decision.route_mode == "clarify" else state.get("is_sql", False),
+    }
+
+
+def _format_complex_plan_preview(plan: dict) -> str:
+    steps = plan.get("steps") or []
+    lines = ["检测到复杂多表分析问题，已生成执行计划，请确认是否按计划执行："]
+    for item in steps:
+        step_no = item.get("step")
+        step_type = item.get("type", "")
+        goal = item.get("goal", "")
+        tables = item.get("tables") or []
+        suffix = f"（{step_type}"
+        if tables:
+            suffix += f": {', '.join(tables)}"
+        suffix += "）"
+        lines.append(f"{step_no}. {goal}{suffix}")
+    return "\n".join(lines)
+
+
+async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
+    """Generate and validate a complex query plan without executing it."""
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    selected_tables = state.get("selected_tables", [])
+    relationships = state.get("table_relationships", [])
+    evidence = state.get("evidence", [])
+
+    model = get_chat_model(settings.chat_model_type)
+    response = await model.ainvoke(
+        [
+            SystemMessage(content=(
+                "你是复杂 NL2SQL 计划生成器。请把用户问题拆成可审计的执行计划，不要生成 SQL。\n"
+                "要求：\n"
+                "1. 只使用候选表中的表名\n"
+                "2. 每个 SQL 步骤建议不超过 5 张表\n"
+                "3. 多步骤合并必须给出 merge_keys\n"
+                "4. 如果无法稳定合并，返回 mode=clarify 且 steps 为空\n"
+                "5. 只返回 JSON，不要 Markdown\n"
+                "JSON 格式：{\"mode\":\"complex_plan|clarify\",\"reason\":\"...\",\"steps\":["
+                "{\"step\":1,\"type\":\"sql|python_merge|report\",\"goal\":\"...\","
+                "\"tables\":[\"...\"],\"depends_on\":[],\"merge_keys\":[\"...\"]}],"
+                "\"requires_user_confirmation\":true}"
+            )),
+            HumanMessage(content=(
+                f"用户问题:\n{query}\n\n"
+                f"候选表:\n{', '.join(selected_tables)}\n\n"
+                f"表关系:\n{json.dumps(relationships, ensure_ascii=False)}\n\n"
+                f"业务证据:\n{chr(10).join(evidence)}"
+            )),
+        ],
+        config=child_trace_config(config, "sql.complex_plan.llm", tags=["llm", "sql_react"]),
+    )
+    plan = _parse_json_object(_response_text(response))
+    if plan.get("mode") == "clarify":
+        return {
+            "complex_plan": plan,
+            "plan_validation_error": "",
+            "answer": plan.get("reason") or "这个问题需要进一步明确查询范围后再执行。",
+            "is_sql": False,
+        }
+
+    ok, error = validate_complex_plan(plan, allowed_tables=set(selected_tables))
+    if not ok:
+        return {
+            "complex_plan": plan,
+            "plan_validation_error": error,
+            "answer": f"复杂查询计划校验失败：{error}。请缩小查询范围或明确需要分析的指标和维度。",
+            "is_sql": False,
+        }
+
+    return {
+        "complex_plan": plan,
+        "plan_validation_error": "",
+        "answer": _format_complex_plan_preview(plan),
+        "is_sql": False,
+    }
+
+
+def route_after_complex_plan_generate(state: SQLReactState):
+    """Only executable complex plans should enter approval."""
+    plan = state.get("complex_plan") or {}
+    if state.get("plan_validation_error"):
+        return END
+    if plan.get("mode") == "clarify":
+        return END
+    steps = plan.get("steps") or []
+    if not steps:
+        return END
+    return "approve_complex_plan"
+
+
+async def approve_complex_plan(state: SQLReactState) -> dict:
+    """Ask the user to approve a generated complex plan before execution."""
+    plan = state.get("complex_plan") or {}
+    message = state.get("answer") or _format_complex_plan_preview(plan)
+    approved = interrupt({
+        "complex_plan": plan,
+        "message": message,
+        "approval_type": "complex_plan",
+    })
+    if approved.get("approved"):
+        return {
+            "plan_approved": True,
+            "answer": "复杂查询计划已确认，准备进入分步执行。",
+            "is_sql": False,
+        }
+    return {
+        "plan_approved": False,
+        "answer": "已取消复杂查询计划执行。",
+        "is_sql": False,
+    }
+
+
+async def execute_complex_plan_step(state: SQLReactState) -> dict:
+    """Skeleton for future multi-step execution."""
+    return {
+        "answer": "复杂计划已确认。当前版本已完成计划生成与审批，分步执行将在下一迭代启用。",
+        "is_sql": False,
+        "plan_execution_results": state.get("plan_execution_results", {}),
+    }
+
+
 async def recall_evidence(state: SQLReactState, config=None) -> dict:
     """并行检索业务知识 + 智能体知识库，注入 SQL 生成上下文。"""
     query = state.get("rewritten_query") or state.get("query", "")
@@ -1072,6 +1288,7 @@ def approve(state: SQLReactState) -> dict:
         "sql": state["sql"],
         "message": message,
         "reflection": is_reflected_sql,
+        "approval_type": "sql",
     })
 
     if result.get("approved"):
@@ -1331,9 +1548,14 @@ def build_sql_react_graph():
     graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("query_enhance", query_enhance)
     graph.add_node("select_tables", select_tables)
+    graph.add_node("infer_route_signal", infer_route_signal)
+    graph.add_node("route_complexity", route_complexity)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
     graph.add_node("sql_generate", sql_generate)
+    graph.add_node("complex_plan_generate", complex_plan_generate)
+    graph.add_node("approve_complex_plan", approve_complex_plan)
+    graph.add_node("execute_complex_plan_step", execute_complex_plan_step)
     graph.add_node("safety_check", safety_check)
     graph.add_node("approve", approve)
     graph.add_node("execute_sql", execute_sql)
@@ -1344,7 +1566,26 @@ def build_sql_react_graph():
     graph.add_edge("contextualize_query", "recall_evidence")
     graph.add_edge("recall_evidence", "query_enhance")
     graph.add_edge("query_enhance", "select_tables")
-    graph.add_edge("select_tables", "sql_retrieve")
+    graph.add_edge("select_tables", "infer_route_signal")
+    graph.add_edge("infer_route_signal", "route_complexity")
+
+    def route_after_complexity(state: SQLReactState) -> str:
+        if state.get("route_mode") == "clarify":
+            return END
+        if state.get("route_mode") == "complex_plan":
+            return "complex_plan_generate"
+        return "sql_retrieve"
+
+    graph.add_conditional_edges("route_complexity", route_after_complexity)
+    graph.add_conditional_edges("complex_plan_generate", route_after_complex_plan_generate)
+
+    def route_after_complex_plan_approve(state: SQLReactState) -> str:
+        if state.get("plan_approved"):
+            return "execute_complex_plan_step"
+        return END
+
+    graph.add_conditional_edges("approve_complex_plan", route_after_complex_plan_approve)
+    graph.add_edge("execute_complex_plan_step", END)
     graph.add_edge("sql_retrieve", "check_docs")
 
     def route_after_check(state: SQLReactState) -> str:

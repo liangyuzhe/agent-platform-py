@@ -601,6 +601,113 @@ class TestSelectTables:
         }
 
 
+class TestComplexRoute:
+    """Test broad schema route decisions."""
+
+    @pytest.mark.asyncio
+    async def test_route_complexity_single_sql(self):
+        from agents.flow.sql_react import route_complexity
+
+        state = {
+            "query": "去年亏损",
+            "selected_tables": ["a", "b", "c"],
+            "table_relationships": [],
+        }
+
+        result = await route_complexity(state)
+
+        assert result["route_mode"] == "single_sql"
+
+    @pytest.mark.asyncio
+    async def test_route_complexity_clarify_for_broad_detail(self):
+        from agents.flow.sql_react import route_complexity
+
+        state = {
+            "query": "员工工资和部门角色权限",
+            "selected_tables": [f"t_{i}" for i in range(9)],
+            "table_relationships": [],
+            "route_signal": "detail",
+        }
+
+        result = await route_complexity(state)
+
+        assert result["route_mode"] == "clarify"
+        assert "缩小查询范围" in result["answer"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_complex_plan_generate_returns_validated_plan_preview(self, mock_get_model):
+        from agents.flow.sql_react import complex_plan_generate
+
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content=(
+            '{"mode":"complex_plan","steps":['
+            '{"step":1,"type":"sql","goal":"查收入","tables":["a","b"],"depends_on":[],"merge_keys":["period"]},'
+            '{"step":2,"type":"python_merge","goal":"汇总分析","tables":[],"depends_on":[1],"merge_keys":["period"]}'
+            '],"requires_user_confirmation":true}'
+        )))
+        mock_get_model.return_value = mock_model
+
+        result = await complex_plan_generate({
+            "query": "分析收入和预算关系",
+            "selected_tables": ["a", "b"],
+            "table_relationships": [],
+            "evidence": [],
+        })
+
+        assert result["is_sql"] is False
+        assert result["plan_validation_error"] == ""
+        assert result["complex_plan"]["mode"] == "complex_plan"
+        assert "已生成执行计划" in result["answer"]
+
+    def test_route_after_complex_plan_generate_skips_approval_for_clarify_or_invalid(self):
+        from langgraph.graph import END
+        from agents.flow.sql_react import route_after_complex_plan_generate
+
+        assert route_after_complex_plan_generate({
+            "complex_plan": {"mode": "clarify", "steps": []},
+            "plan_validation_error": "",
+        }) == END
+
+        assert route_after_complex_plan_generate({
+            "complex_plan": {"mode": "complex_plan", "steps": [{"step": 1}]},
+            "plan_validation_error": "missing merge_keys",
+        }) == END
+
+        assert route_after_complex_plan_generate({
+            "complex_plan": {"mode": "complex_plan", "steps": [{"step": 1}]},
+            "plan_validation_error": "",
+        }) == "approve_complex_plan"
+
+    @pytest.mark.asyncio
+    async def test_approve_complex_plan_rejected_returns_false(self):
+        from agents.flow.sql_react import approve_complex_plan
+
+        with patch("agents.flow.sql_react.interrupt", return_value={
+            "approved": False,
+            "feedback": "计划太宽泛",
+        }):
+            result = await approve_complex_plan({
+                "complex_plan": {"mode": "complex_plan", "steps": [{"step": 1, "goal": "x"}]},
+                "answer": "计划预览",
+            })
+
+        assert result["plan_approved"] is False
+        assert "取消" in result["answer"]
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_returns_non_executing_skeleton_message(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        result = await execute_complex_plan_step({
+            "complex_plan": {"mode": "complex_plan", "steps": []},
+            "plan_approved": True,
+        })
+
+        assert result["is_sql"] is False
+        assert "分步执行将在下一迭代启用" in result["answer"]
+
+
 # ---------------------------------------------------------------------------
 # safety_check node
 # ---------------------------------------------------------------------------
@@ -1199,6 +1306,11 @@ class TestBuildSqlReactGraph:
         assert "result_reflection" in node_names
         assert "query_enhance" in node_names
         assert "recall_evidence" in node_names
+        assert "infer_route_signal" in node_names
+        assert "route_complexity" in node_names
+        assert "complex_plan_generate" in node_names
+        assert "approve_complex_plan" in node_names
+        assert "execute_complex_plan_step" in node_names
 
     @patch("agents.flow.sql_react.get_checkpointer")
     def test_graph_compiles(self, mock_cp):

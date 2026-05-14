@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,27 +7,62 @@ const baseUrl = process.env.DEMO_BASE_URL || "http://localhost:8080/#/";
 const outDir = path.resolve("docs/assets/demos");
 const rawDir = path.join(outDir, "raw");
 const gifTrimStart = Number(process.env.DEMO_GIF_TRIM_START || "3.2");
+const browserChannel = process.env.DEMO_BROWSER_CHANNEL || "chrome";
+const require = createRequire(import.meta.url);
 
 const demos = [
   {
     slug: "chat-maotai-q1-profit",
-    title: "Chat / Knowledge: 茅台第一季度盈利",
-    questions: ["茅台第一季度盈利"],
+    title: "Chat / Knowledge: 贵州茅台第一季度盈利",
+    questions: ["贵州茅台第一季度盈利"],
     approvals: 0,
+    finalText: "茅台",
   },
   {
-    slug: "sql-last-year-profit-approved",
-    title: "SQL Query: 公司盈利",
-    questions: ["公司盈利"],
+    slug: "sql-last-year-loss-approved",
+    title: "SQL Query: 去年亏损",
+    questions: ["去年亏损"],
+    approvals: 3,
+    finalText: "查询已执行完成",
+  },
+  {
+    slug: "sql-loss-followup-amount-approved",
+    title: "Multi-turn SQL: 亏损多少",
+    questions: ["去年亏损", "亏损多少"],
+    approvals: 3,
+    finalText: "亏损",
+  },
+  {
+    slug: "sql-q1-salary-approved",
+    title: "SQL Query: 第一季度员工工资",
+    questions: ["第一季度员工工资"],
     approvals: 2,
-    waitForReflection: false,
+    finalText: "查询已执行完成",
   },
   {
-    slug: "sql-loss-followup-repair-approved",
-    title: "SQL Repair: 执行失败 -> 反思修正 -> 结果",
-    questions: ["2024年每月亏损金额"],
-    approvals: 5,
-    waitForReflection: true,
+    slug: "sql-management-user-role-approved",
+    title: "SQL Query: 用户真实姓名与角色",
+    questions: ["查询所有用户的真实姓名以及他们被分配的角色名称"],
+    approvals: 2,
+    finalText: "查询已执行完成",
+  },
+  {
+    slug: "sql-complex-route-guardrail",
+    title: "Complex Routing: 复杂跨域问题友好拦截",
+    questions: [
+      "跨域复杂分析测试：分析今年收入、成本、预算、费用报销、发票、应收应付、固定资产、资金划转、用户、角色、部门、成本中心、项目之间的关系",
+    ],
+    approvals: 0,
+    setupRouteRule: {
+      name: "README 复杂分析测试",
+      signal: "analysis",
+      matchType: "contains",
+      pattern: "跨域复杂分析测试",
+      priority: "100",
+      confidence: "0.95",
+      description: "README demo: broad analysis should enter complex planner when selected schema exceeds the table budget",
+    },
+    finalText: "需要补充项目相关表信息",
   },
 ];
 
@@ -41,6 +76,18 @@ function ensureDirs() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadChromium() {
+  try {
+    const mod = await import("playwright");
+    return mod.chromium;
+  } catch (error) {
+    if (process.env.PLAYWRIGHT_MODULE) {
+      return require(process.env.PLAYWRIGHT_MODULE).chromium;
+    }
+    throw error;
+  }
 }
 
 async function addDemoOverlay(page, title) {
@@ -113,11 +160,21 @@ async function waitForApproveSettled(page, previousAssistantCount) {
     const hasFinalResult = Boolean(last.querySelector(".intent-tag.result"))
       || text.includes("查询已执行完成")
       || text.includes("共返回")
-      || text.includes("SQL 执行完成");
+      || text.includes("SQL 执行完成")
+      || text.includes("复杂计划已确认")
+      || text.includes("分步执行将在下一迭代启用");
     const hasNextApproval = Boolean(last.querySelector(".btn-approve:not([disabled])"));
     const hasTerminalError = text.includes("系统错误") || text.includes("SQL 执行失败");
     return hasFinalResult || hasNextApproval || hasTerminalError;
   }, previousAssistantCount, { timeout: 180_000 });
+}
+
+async function waitForFinalText(page, expectedText) {
+  if (!expectedText) return;
+  await page.waitForFunction((needle) => {
+    const text = document.querySelector("#sqlMessages")?.innerText || "";
+    return text.includes(needle);
+  }, expectedText, { timeout: 180_000 });
 }
 
 async function waitForFinalSqlResult(page) {
@@ -167,9 +224,15 @@ async function recordDemo(browser, demo) {
   });
   const page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "networkidle" });
-  await page.locator("button", { hasText: "SQL Agent" }).click();
   await addDemoOverlay(page, demo.title);
   await sleep(900);
+
+  if (demo.setupRouteRule) {
+    await setupQueryRouteRule(page, demo.setupRouteRule);
+  }
+
+  await page.locator("button", { hasText: "SQL Agent" }).click();
+  await sleep(700);
 
   for (const question of demo.questions) {
     await submitQuestion(page, question);
@@ -177,9 +240,10 @@ async function recordDemo(browser, demo) {
     await sleep(900);
   }
 
-  if (demo.approvals > 0) {
+  if (demo.approvals > 0 && !demo.finalText?.includes("已生成执行计划")) {
     await waitForFinalSqlResult(page);
   }
+  await waitForFinalText(page, demo.finalText);
   if (demo.waitForReflection) {
     await waitForReflectionFlowVisible(page);
   }
@@ -194,13 +258,43 @@ async function recordDemo(browser, demo) {
   console.log(`Wrote ${gifPath}`);
 }
 
+async function setupQueryRouteRule(page, rule) {
+  await page.evaluate(() => switchTab("admin"));
+  await page.waitForFunction(() => document.querySelector("#tab-admin.active") !== null, undefined, { timeout: 30_000 });
+  await page.waitForSelector("#queryRouteRuleName", { state: "visible", timeout: 30_000 });
+  await page.locator("#queryRouteRuleName").fill(rule.name);
+  await page.locator("#queryRouteRuleSignal").selectOption(rule.signal);
+  await page.locator("#queryRouteRuleMatchType").selectOption(rule.matchType);
+  await page.locator("#queryRouteRulePattern").fill(rule.pattern);
+  await page.locator("#queryRouteRulePriority").fill(rule.priority);
+  await page.locator("#queryRouteRuleConfidence").fill(rule.confidence);
+  await page.locator("#queryRouteRuleDescription").fill(rule.description);
+  const enabled = page.locator("#queryRouteRuleEnabled");
+  if (!(await enabled.isChecked())) {
+    await enabled.check();
+  }
+  await sleep(500);
+  await page.locator("button", { hasText: "保存规则" }).last().click();
+  await page.waitForFunction(() => {
+    const text = document.querySelector("#queryRouteRuleStatus")?.innerText || "";
+    return text.includes("已加载") || text.includes("保存失败");
+  }, undefined, { timeout: 30_000 });
+  await sleep(900);
+  await page.evaluate(() => switchTab("agent"));
+  await page.waitForFunction(() => document.querySelector("#tab-agent.active") !== null, undefined, { timeout: 30_000 });
+}
+
 async function main() {
   ensureDirs();
-  const browser = await chromium.launch({
-    channel: "chrome",
+  const chromium = await loadChromium();
+  const launchOptions = {
     headless: true,
     args: ["--window-size=1280,720"],
-  });
+  };
+  if (browserChannel) {
+    launchOptions.channel = browserChannel;
+  }
+  const browser = await chromium.launch(launchOptions);
   try {
     for (const demo of selected) {
       await recordDemo(browser, demo);

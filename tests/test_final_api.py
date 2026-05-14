@@ -170,7 +170,7 @@ class TestQueryInvoke:
         from agents.api.routers.query import query_invoke, QueryRequest
 
         interrupt_obj = MagicMock()
-        interrupt_obj.value = {"sql": "SELECT * FROM users", "message": "请确认?"}
+        interrupt_obj.value = {"sql": "SELECT * FROM users", "message": "请确认?", "approval_type": "sql"}
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke = AsyncMock(return_value={
@@ -184,7 +184,37 @@ class TestQueryInvoke:
         assert result.pending_approval is True
         assert result.status == "pending_approval"
         assert result.sql == "SELECT * FROM users"
+        assert result.approval_type == "sql"
         assert "确认" in result.answer
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_returns_pending_complex_plan_approval(self, mock_build_graph, mock_callbacks):
+        """Complex plan interrupts should be exposed even without SQL text."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        interrupt_obj = MagicMock()
+        interrupt_obj.value = {
+            "complex_plan": {"mode": "complex_plan", "steps": [{"step": 1, "goal": "分析收入"}]},
+            "message": "检测到复杂多表分析问题，已生成执行计划，请确认是否按计划执行：",
+            "approval_type": "complex_plan",
+        }
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={
+            "__interrupt__": [interrupt_obj],
+        })
+        mock_build_graph.return_value = mock_graph
+
+        req = QueryRequest(query="复杂分析", session_id="s1")
+        result = await query_invoke(req)
+
+        assert result.pending_approval is True
+        assert result.status == "pending_approval"
+        assert result.sql == ""
+        assert result.approval_type == "complex_plan"
+        assert "执行计划" in result.answer
 
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
@@ -357,6 +387,7 @@ class TestQueryApprove:
             "sql": "SELECT COALESCE(SUM(x), 0) FROM t;",
             "message": "上次执行结果疑似异常，系统已反思并生成修正后的 SQL。请确认是否执行修正后的 SQL？",
             "reflection": True,
+            "approval_type": "sql",
         }
 
         mock_graph = AsyncMock()
@@ -374,6 +405,34 @@ class TestQueryApprove:
         assert result_events
         assert "pending_approval" in result_events[0]["data"]
         assert "COALESCE" in result_events[0]["data"]
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_approve_stream_returns_complex_plan_progress(self, mock_build_graph, mock_callbacks):
+        """Complex plan approval should emit plan-oriented progress text."""
+        from agents.api.routers.query import approve_sql_stream, ApproveRequest
+
+        interrupt_obj = MagicMock()
+        interrupt_obj.value = {
+            "message": "检测到复杂多表分析问题，已生成执行计划，请确认是否按计划执行：",
+            "approval_type": "complex_plan",
+        }
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"__interrupt__": [interrupt_obj]})
+        mock_build_graph.return_value = mock_graph
+
+        req = ApproveRequest(session_id="s1", approved=True)
+        response = await approve_sql_stream(req, MagicMock())
+        events = []
+        async for event in response.body_iterator:
+            events.append(event)
+
+        assert any(e.get("event") == "status" and "复杂查询计划已生成" in e.get("data", "") for e in events)
+        result_events = [e for e in events if e.get("event") == "result"]
+        assert result_events
+        assert "complex_plan" in result_events[0]["data"]
 
 
 # ---------------------------------------------------------------------------

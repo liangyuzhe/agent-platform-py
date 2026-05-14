@@ -36,6 +36,7 @@ class QueryResponse(BaseModel):
     session_id: str
     pending_approval: bool = False
     sql: str = ""
+    approval_type: str = ""
 
 
 class ClassifyResponse(BaseModel):
@@ -198,6 +199,7 @@ async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
             session_id=req.session_id,
             pending_approval=True,
             sql=interrupt_val.get("sql", ""),
+            approval_type=interrupt_val.get("approval_type", "sql"),
         )
 
     answer = result.get("answer", "")
@@ -271,6 +273,7 @@ async def query_invoke(req: QueryRequest):
             session_id=req.session_id,
             pending_approval=True,
             sql=interrupt_val.get("sql", ""),
+            approval_type=interrupt_val.get("approval_type", "sql"),
         )
 
     answer = result.get("answer", "")
@@ -313,16 +316,21 @@ async def approve_sql_stream(req: ApproveRequest, request: Request):
             if not req.approved:
                 yield {"event": "status", "data": "正在提交拒绝意见..."}
             else:
-                yield {"event": "status", "data": "已确认，正在执行 SQL..."}
-                yield {"event": "status", "data": "如果 SQL 执行失败或结果异常，系统会自动分析并生成修正 SQL..."}
+                yield {"event": "status", "data": "已确认，正在继续处理审批请求..."}
 
             result = await _approve_sql_result(req)
 
             if result.pending_approval:
-                yield {"event": "status", "data": "检测到执行失败或结果异常，已完成反思/分析并生成修正 SQL。"}
-                yield {"event": "status", "data": "请确认是否执行修正后的 SQL。"}
+                if result.approval_type == "complex_plan":
+                    yield {"event": "status", "data": "复杂查询计划已生成，请确认是否进入分步执行。"}
+                else:
+                    yield {"event": "status", "data": "检测到执行失败或结果异常，已完成反思/分析并生成修正 SQL。"}
+                    yield {"event": "status", "data": "请确认是否执行修正后的 SQL。"}
             else:
-                yield {"event": "status", "data": "SQL 执行完成。"}
+                if "复杂查询计划已确认" in result.answer or "分步执行将在下一迭代启用" in result.answer:
+                    yield {"event": "status", "data": "复杂查询计划已确认。"}
+                else:
+                    yield {"event": "status", "data": "SQL 执行完成。"}
 
             yield {"event": "result", "data": result.model_dump_json()}
         except Exception as e:

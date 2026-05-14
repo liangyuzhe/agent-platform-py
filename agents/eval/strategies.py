@@ -70,3 +70,30 @@ async def run_agent_knowledge_recall(query: str, top_k: int = 10) -> StrategyRun
     docs = await asyncio.to_thread(recall_agent_knowledge, query, top_k)
     latency_ms = (time.monotonic() - t0) * 1000
     return StrategyRunResult(retrieved_doc_ids=_docs_to_ids(docs), latency_ms=latency_ms)
+
+
+def route_accuracy(results: list[tuple[str, str]]) -> float:
+    """Compute exact route-mode accuracy for complex query routing."""
+    if not results:
+        return 0.0
+    return sum(1 for actual, expected in results if actual == expected) / len(results)
+
+
+def run_complex_route_eval_case(case: dict) -> dict:
+    """Evaluate one complex-query routing case without calling external LLMs."""
+    from agents.flow.complex_query import classify_query_complexity
+
+    decision = classify_query_complexity(
+        query=case.get("query", ""),
+        selected_tables=case.get("tables", []),
+        relationships=case.get("relationships", []),
+        route_signal=case.get("route_signal"),
+    )
+    expected = case.get("expected_route", "")
+    return {
+        "query": case.get("query", ""),
+        "actual_route": decision.route_mode,
+        "expected_route": expected,
+        "passed": decision.route_mode == expected,
+        "reason": decision.reason,
+    }
