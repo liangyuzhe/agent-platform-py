@@ -17,7 +17,9 @@
 - **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
 
-## 功能演示
+## 功能演示（6 个端到端案例）
+
+以下 GIF 均为本地 Web UI 录制，覆盖 Chat/Knowledge 路由、SQL 审批执行、多轮追问、管理表查询和多表聚合查询 6 条典型 case。
 
 ### Chat / Knowledge：外部公开知识路由
 
