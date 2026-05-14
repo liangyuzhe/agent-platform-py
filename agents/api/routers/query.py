@@ -327,7 +327,9 @@ async def approve_sql_stream(req: ApproveRequest, request: Request):
                     yield {"event": "status", "data": "检测到执行失败或结果异常，已完成反思/分析并生成修正 SQL。"}
                     yield {"event": "status", "data": "请确认是否执行修正后的 SQL。"}
             else:
-                if "复杂查询计划已确认" in result.answer or "分步执行将在下一迭代启用" in result.answer:
+                if "复杂查询计划执行完成" in result.answer:
+                    yield {"event": "status", "data": "复杂查询计划已执行完成。"}
+                elif "复杂查询计划已确认" in result.answer:
                     yield {"event": "status", "data": "复杂查询计划已确认。"}
                 else:
                     yield {"event": "status", "data": "SQL 执行完成。"}

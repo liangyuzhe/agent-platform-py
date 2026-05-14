@@ -794,7 +794,7 @@
                     html += '<details class="sql-detail" open><summary>SQL 语句</summary>';
                     html += '<pre>' + escHtml(data.sql) + '</pre></details>';
                 } else if (approvalType === 'complex_plan') {
-                    html += '<div class="result-card"><div class="answer-text">该复杂查询已进入计划审批模式，确认后将进入分步执行。</div></div>';
+                    html += '<div class="result-card"><div class="answer-text">该复杂查询已进入计划审批模式，确认后将串行执行 SQL 步骤并汇总结果。</div></div>';
                 }
                 html += '<div class="approval-actions">';
                 html += `<button class="btn-approve" onclick="approveSql(this, true)">${isSqlApproval ? '执行' : '确认计划'}</button>`;

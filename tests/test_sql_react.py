@@ -909,16 +909,96 @@ class TestComplexRoute:
         assert "取消" in result["answer"]
 
     @pytest.mark.asyncio
-    async def test_execute_complex_plan_step_returns_non_executing_skeleton_message(self):
+    async def test_execute_complex_plan_step_executes_sql_steps_and_merges_results(self):
         from agents.flow.sql_react import execute_complex_plan_step
 
-        result = await execute_complex_plan_step({
-            "complex_plan": {"mode": "complex_plan", "steps": []},
-            "plan_approved": True,
-        })
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a\nperiod varchar(7)")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            if "当前步骤目标: 查询收入" in step_state["query"]:
+                return {"sql": "SELECT period, revenue FROM a", "answer": "SELECT period, revenue FROM a", "is_sql": True}
+            return {"sql": "SELECT period, budget FROM b", "answer": "SELECT period, budget FROM b", "is_sql": True}
+
+        async def fake_execute_sql(step_state):
+            if "revenue" in step_state["sql"]:
+                return {
+                    "result": '[{"period":"2025-01","revenue":100}]',
+                    "answer": "查询已执行完成。\nperiod：2025-01\nrevenue：100",
+                    "error": None,
+                    "execution_history": [{"sql": step_state["sql"], "result": '[{"period":"2025-01","revenue":100}]', "error": None}],
+                }
+            return {
+                "result": '[{"period":"2025-01","budget":80}]',
+                "answer": "查询已执行完成。\nperiod：2025-01\nbudget：80",
+                "error": None,
+                "execution_history": [{"sql": step_state["sql"], "result": '[{"period":"2025-01","budget":80}]', "error": None}],
+            }
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql):
+            result = await execute_complex_plan_step({
+                "query": "分析收入预算关系",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "查询收入", "tables": ["a"], "depends_on": [], "merge_keys": ["period"]},
+                        {"step": 2, "type": "sql", "goal": "查询预算", "tables": ["b"], "depends_on": [], "merge_keys": ["period"]},
+                        {"step": 3, "type": "python_merge", "goal": "按期间合并收入和预算", "tables": [], "depends_on": [1, 2], "merge_keys": ["period"]},
+                    ],
+                },
+                "plan_approved": True,
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
 
         assert result["is_sql"] is False
-        assert "分步执行将在下一迭代启用" in result["answer"]
+        assert result["error"] is None
+        assert "复杂查询计划执行完成" in result["answer"]
+        assert result["plan_current_step"] == 3
+        assert result["plan_execution_results"]["1"]["sql"] == "SELECT period, revenue FROM a"
+        assert result["plan_execution_results"]["2"]["sql"] == "SELECT period, budget FROM b"
+        assert result["plan_execution_results"]["3"]["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_blocks_unsafe_generated_sql(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"sql": "DROP TABLE a", "answer": "DROP TABLE a", "is_sql": True}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", new_callable=AsyncMock) as mock_execute:
+            result = await execute_complex_plan_step({
+                "query": "危险测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "生成危险 SQL", "tables": ["a"], "depends_on": [], "merge_keys": ["id"]},
+                    ],
+                },
+                "plan_approved": True,
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert mock_execute.await_count == 0
+        assert result["error"] == "complex_plan_step_failed"
+        assert "安全检查未通过" in result["answer"]
+        assert result["plan_execution_results"]["1"]["error"]
 
 
 # ---------------------------------------------------------------------------

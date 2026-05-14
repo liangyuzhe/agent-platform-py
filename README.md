@@ -17,7 +17,7 @@
 - **查询增强**：基于业务知识翻译术语和同义表达（如“亏损多少” -> 亏损金额计算口径），提高后续检索、选表和 SQL 生成命中率。
 - **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成；审批恢复使用 LangGraph `interrupt/Command(resume=...)`，SSE 展示执行、异常反思和二次确认过程。
 - **执行后反思修复**：SQL 执行成功但返回空集、`NULL`、全字段空值或零值可疑结果时，进入 `result_reflection` 直接生成修正 SQL，不再回到 `sql_generate` 重新发散。
-- **复杂查询模式切换**：5 张内走单 SQL，6-8 张走严格单 SQL，超过 8 张根据规则/LLM 语义信号进入复杂计划或澄清，避免超大 JOIN 幻觉和 token 膨胀。
+- **复杂查询模式切换**：5 张内走单 SQL，6-8 张走严格单 SQL，超过 8 张根据规则/LLM 语义信号进入复杂计划或澄清；复杂计划经用户确认后串行执行 SQL step，逐步安全检查、执行并把本地 merge/report step 写入可审计结果，避免超大 JOIN 幻觉和 token 膨胀。
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）按 `session_id` 隔离；SQL 场景单独保存上一轮 SQL 口径，支持“亏损多少”这类多轮追问。
 - **链路追踪与评测闭环**：LangSmith/CozeLoop 记录 LLM、Milvus、ES、MySQL fallback、SQL 执行和审批节点；Evaluation 页面展示 Accuracy@K、Precision@K、Recall@K、MRR、NDCG、P50/P95、首字延迟和 per-query 明细。
 - **安全、熔断与 Fallback**：只允许安全 `SELECT/WITH`；支持 SQLState 错误分类、可配置重试、超时控制、Redis -> MySQL fallback、检索失败降级为空 evidence。
@@ -90,8 +90,8 @@ flowchart TD
     PlanGen --> PlanCheck{validate_complex_plan}
     PlanCheck -->|invalid / clarify| Clarify
     PlanCheck -->|valid| PlanApprove[approve_complex_plan<br/>用户确认计划]
-    PlanApprove --> PlanExec[execute_complex_plan_step<br/>当前版本计划确认占位]
-    PlanExec --> PlanEnd([返回计划状态])
+    PlanApprove --> PlanExec[execute_complex_plan_step<br/>串行执行 SQL step + 本地 merge/report]
+    PlanExec --> PlanEnd([返回分步执行结果])
 
     Complexity -->|single_sql / strict| Retrieve[sql_retrieve<br/>按已选表加载完整语义模型]
     Retrieve --> CheckDocs{check_docs}
@@ -375,6 +375,135 @@ python -m scripts.cleanup_schema_indexes
 ```
 
 `scripts.seed_financial` 会额外写入一组 `LOSS-YYYY-*` 凭证，用于稳定验证“去年亏损”“亏损多少”等 NL2SQL 场景。脚本每次执行都会先清理同年度旧的 `LOSS-YYYY-*` 凭证，再重新插入上一年度 12 个月的已过账收入、成本、费用分录，避免重复累加。该数据只用于测试库造数，不参与运行时 SQL 生成逻辑。
+
+### Admin 配置治理教程
+
+服务启动后打开 `http://localhost:8080/`，进入 `Admin` Tab。这里维护的是运行时可调整的语义资产和规则信号，目标是把业务口径、路由规则和 SQL 示例放到 MySQL/Admin 中治理，而不是写死在 Python 代码里。
+
+#### 1. 语义模型：让字段能被业务语言命中
+
+语义模型对应 MySQL `t_semantic_model`，用于把物理 schema 变成 NL2SQL 可理解的字段画像。技术 schema（字段类型、注释、PK/FK）由 `scripts.seed_semantic_model` 从 `information_schema` 同步；业务字段可以在 Admin 页面补充。
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `table_name` / `column_name` | 定位物理字段 | `t_budget.cost_center_id` |
+| `business_name` | 字段业务名称，参与选表画像和 SQL 生成理解 | `成本中心ID` |
+| `synonyms` | 用户可能使用的说法，逗号分隔 | `部门,责任中心` |
+| `business_description` | 枚举、计算逻辑、关联说明 | `关联 t_cost_center.id，表示预算归属成本中心` |
+
+案例：用户问“查询各部门年度预算总金额”时，`t_budget.cost_center_id` 的同义词包含“部门”，`t_cost_center.department_id` 又通过逻辑外键指向 `t_department.id`。运行时 `select_tables` 会先用这些字段提示帮助 LLM 选表，再用 `ref_table/ref_column` 构建 Schema Graph，补齐 `t_budget -> t_cost_center -> t_department`。
+
+注意：Admin 页面主要维护业务名、同义词和描述；逻辑外键 `is_fk/ref_table/ref_column` 通常通过 `scripts.seed_semantic_model` 或 schema sync 维护，避免手工漏配 JOIN 关系。
+
+#### 2. 业务知识：让指标口径稳定
+
+业务知识对应 `t_business_knowledge`，用于解释“亏损”“毛利率”“费用总额”等业务术语。它会被写入 MySQL，并可重新索引到 Milvus/ES，运行时由 `recall_evidence` 召回后进入 `recall_context`、`query_enhance` 和 `sql_generate`。
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `term` | 标准业务术语 | `亏损金额` |
+| `formula` | 口径或计算公式 | `净利润 < 0 时为 ABS(净利润)，否则为 0` |
+| `synonyms` | 用户说法 | `亏损多少,亏了多少,亏损额` |
+| `related_tables` | 该口径常涉及的表，逗号分隔 | `t_journal_entry,t_journal_item,t_account` |
+
+案例：用户问“去年亏损多少”，业务知识会把“亏损多少”映射为“亏损金额”口径，避免 LLM 只返回净利润字段，或把 `0` 错误归入亏损。`related_tables` 也会作为选表重排信号，帮助相关表进入 TopK。
+
+更新业务知识后，如果需要让向量/BM25 检索立即使用新内容，点击 Admin 的 reindex，或调用：
+
+```bash
+curl -X POST http://localhost:8080/api/admin/business-knowledge/reindex
+```
+
+#### 3. 智能体知识：沉淀高质量 SQL few-shot
+
+智能体知识对应 `t_agent_knowledge`，用于保存“自然语言问题 -> 参考 SQL”的 few-shot 示例。它适合沉淀已经验证过的高质量 SQL，不适合保存偶然生成但未验证的 SQL。
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `question` | 相似问题 | `查询各部门年度预算和实际发生额对比` |
+| `sql_text` | 已验证 SQL | `SELECT d.name, SUM(b.budget_amount) ...` |
+| `description` | 适用场景说明 | `预算按部门聚合，需经过成本中心关联部门` |
+| `category` | 分类 | `budget_analysis` |
+
+案例：当用户问“2025 年按部门对比预算金额、实际发生额和已审批报销金额”时，few-shot 可以提供类似的 `FROM/JOIN/GROUP BY` 写法。系统会解析示例 SQL 中的 `FROM/JOIN` 表，把这些表写入 `recall_context.few_shot_related_tables`，用于选表重排和 SQL 生成参考。
+
+更新 SQL few-shot 后，重新索引：
+
+```bash
+curl -X POST http://localhost:8080/api/admin/agent-knowledge/reindex
+```
+
+#### 4. 意图规则：把高确定性入口路由沉淀为配置
+
+意图规则对应 `t_intent_rule`，用于在 LLM 意图识别之外提供确定性规则信号。规则与 LLM 并行执行，仲裁后决定进入 `sql_query`、`chat`、`knowledge`、`report` 等链路。
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `target_intent` | 命中后建议的目标意图 | `sql_query` |
+| `match_type` | 匹配方式：`contains` / `exact` / `regex` | `contains` |
+| `pattern` | 关键词、完整问题或正则 | `查询` |
+| `rewrite_template` | 可选重写模板，`{query}` 表示原问题 | `公司{query}` |
+| `priority` | 规则排序，值越大越先匹配 | `100` |
+| `confidence` | 人工配置的规则可靠度，不是模型计算分 | `0.95` |
+
+案例：用户问“第一季度毛利率”，问题缺少主体，LLM 可能理解成公开公司知识问答。可以配置：
+
+```text
+target_intent: sql_query
+match_type: regex
+pattern: .*毛利率.*
+rewrite_template: 公司{query}
+priority: 120
+confidence: 0.95
+```
+
+命中后系统会更稳定地进入 SQL 链路，并把问题补齐为“公司第一季度毛利率”。低置信规则可以保留但降低 `confidence`，让 LLM 仲裁有机会覆盖它。
+
+#### 5. 复杂查询路由规则：决定计划模式还是澄清
+
+复杂查询路由规则对应 `t_query_route_rule`，只在选表结果超过单 SQL 表数预算时使用。它不决定最终 SQL，而是给 `route_complexity` 一个语义信号，帮助系统判断应该生成多步计划，还是先让用户缩小范围。
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `route_signal` | `analysis` / `report` / `comparison` 会倾向 `complex_plan`；`detail` / `export` / `sensitive` / `ambiguous` 会倾向 `clarify` | `analysis` |
+| `match_type` | 匹配方式：`contains` / `exact` / `regex` | `regex` |
+| `pattern` | 命中的查询表达式 | `.*收入.*成本.*预算.*关系.*` |
+| `priority` | 多条规则命中时的排序，值越大越先匹配 | `150` |
+| `confidence` | 人工配置的规则可靠度；当前代码中 `>= 0.8` 才直接采用规则，否则回退 LLM 仲裁 | `0.95` |
+
+案例 A：复杂分析问题进入计划模式。
+
+```text
+name: 收入成本预算关系分析
+route_signal: analysis
+match_type: regex
+pattern: .*收入.*成本.*预算.*关系.*
+priority: 150
+confidence: 0.95
+enabled: true
+```
+
+当用户问“分析今年收入、成本、预算、费用报销之间的关系”，如果补表后超过 8 张表，系统会先命中规则，得到 `route_signal=analysis`，然后进入 `complex_plan_generate`。Planner 会输出 `sql / python_merge / report` 结构化步骤，并校验表白名单、步骤依赖、`merge_keys` 和步骤上限，最后交给用户确认。
+
+案例 B：明细导出问题先澄清。
+
+```text
+name: 大范围明细导出
+route_signal: export
+match_type: contains
+pattern: 导出
+priority: 120
+confidence: 0.9
+enabled: true
+```
+
+当用户问“导出所有部门、角色、用户、报销、预算、发票明细”时，系统不会为了满足请求直接生成超大 JOIN，而是进入 `clarify`，提示用户指定时间、部门、指标或缩小范围。
+
+`confidence` 当前不是在线计算出来的分数，而是规则治理字段。建议配置原则：
+
+- `0.9~1.0`：表达非常明确、误伤低的规则，可以直接采用。
+- `0.8~0.89`：较可靠，但仍建议结合评测观察。
+- `<0.8`：保留为弱信号，不直接接管路由，运行时回退给 LLM 仲裁。
 
 ### 评测数据与报告
 

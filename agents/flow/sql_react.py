@@ -1186,12 +1186,376 @@ async def approve_complex_plan(state: SQLReactState) -> dict:
     }
 
 
-async def execute_complex_plan_step(state: SQLReactState) -> dict:
-    """Skeleton for future multi-step execution."""
+def _filter_relationships_for_tables(relationships: list[dict], tables: set[str]) -> list[dict]:
+    """Keep only relationships fully inside the current step table set."""
+    if not tables:
+        return []
+    result = []
+    for rel in relationships or []:
+        from_table = rel.get("from_table")
+        to_table = rel.get("to_table")
+        if from_table in tables and to_table in tables:
+            result.append(rel)
+    return result
+
+
+def _short_text(value, limit: int = 500) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _build_complex_step_query(state: SQLReactState, step: dict, dependency_results: dict[str, dict]) -> str:
+    """Build a focused query for a single SQL step."""
+    original_query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    step_no = step.get("step")
+    goal = step.get("goal", "")
+    tables = ", ".join(step.get("tables") or [])
+    merge_keys = ", ".join(step.get("merge_keys") or [])
+    depends_on = step.get("depends_on") or []
+    dependency_text = ""
+    if depends_on:
+        snippets = []
+        for dep in depends_on:
+            dep_entry = dependency_results.get(str(dep)) or {}
+            if dep_entry:
+                snippets.append(f"步骤 {dep}: {_short_text(dep_entry.get('answer') or dep_entry.get('result'), 300)}")
+        if snippets:
+            dependency_text = "\n已完成依赖步骤摘要:\n" + "\n".join(snippets)
+
+    return (
+        f"整体问题: {original_query}\n"
+        f"当前复杂计划 SQL 步骤: {step_no}\n"
+        f"当前步骤目标: {goal}\n"
+        f"当前步骤可用表: {tables}\n"
+        f"后续合并键: {merge_keys or '无'}\n"
+        "请只生成完成当前步骤目标所需的 SELECT SQL，不要处理其他计划步骤。"
+        f"{dependency_text}"
+    )
+
+
+def _parse_rows_from_sql_result(result) -> list[dict] | None:
+    """Parse common MCP SQL result shapes into a list of row dictionaries."""
+    value = result
+    if isinstance(value, str):
+        text = _strip_execution_time(value)
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except Exception:
+            return None
+
+    if isinstance(value, dict):
+        for key in ("rows", "data", "result", "items"):
+            rows = value.get(key)
+            if isinstance(rows, list):
+                value = rows
+                break
+        else:
+            value = [value]
+
+    if not isinstance(value, list):
+        return None
+    rows = [row for row in value if isinstance(row, dict)]
+    return rows if len(rows) == len(value) else None
+
+
+def _merge_dependency_rows(
+    step: dict,
+    execution_results: dict[str, dict],
+) -> tuple[list[dict] | None, str]:
+    """Merge dependency SQL rows by merge_keys with a conservative outer merge."""
+    merge_keys = step.get("merge_keys") or []
+    depends_on = step.get("depends_on") or []
+    if not merge_keys:
+        return None, "missing merge_keys"
+    if not depends_on:
+        return None, "missing depends_on"
+
+    merged: dict[tuple, dict] = {}
+    for dep in depends_on:
+        dep_key = str(dep)
+        dep_entry = execution_results.get(dep_key) or {}
+        if dep_entry.get("error"):
+            return None, f"dependency step {dep} failed"
+        rows = _parse_rows_from_sql_result(dep_entry.get("result"))
+        if rows is None:
+            return None, f"dependency step {dep} result is not structured rows"
+        for row in rows:
+            key = tuple(row.get(k) for k in merge_keys)
+            if any(v is None for v in key):
+                return None, f"dependency step {dep} row missing merge key"
+            bucket = merged.setdefault(key, {k: row.get(k) for k in merge_keys})
+            for col, value in row.items():
+                if col in merge_keys:
+                    continue
+                out_col = col
+                if out_col in bucket and bucket[out_col] != value:
+                    out_col = f"step{dep}_{col}"
+                bucket[out_col] = value
+
+    return list(merged.values()), ""
+
+
+def _dependency_summary(step: dict, execution_results: dict[str, dict]) -> str:
+    depends_on = step.get("depends_on") or []
+    if not depends_on:
+        return "该步骤没有依赖结果可汇总。"
+    lines = []
+    for dep in depends_on:
+        entry = execution_results.get(str(dep)) or {}
+        if not entry:
+            lines.append(f"步骤 {dep}: 未执行")
+            continue
+        if entry.get("error"):
+            lines.append(f"步骤 {dep}: 失败 - {entry['error']}")
+            continue
+        lines.append(f"步骤 {dep}: {_short_text(entry.get('answer') or entry.get('result'), 300)}")
+    return "\n".join(lines)
+
+
+def _run_local_complex_step(step: dict, execution_results: dict[str, dict]) -> dict:
+    """Run python_merge/report steps without another LLM call."""
+    step_no = step.get("step")
+    step_type = step.get("type")
+    missing = [
+        dep for dep in step.get("depends_on", [])
+        if str(dep) not in execution_results or execution_results.get(str(dep), {}).get("error")
+    ]
+    if missing:
+        return {
+            "step": step_no,
+            "type": step_type,
+            "goal": step.get("goal", ""),
+            "depends_on": step.get("depends_on", []),
+            "merge_keys": step.get("merge_keys", []),
+            "result": None,
+            "answer": f"依赖步骤未完成，无法执行本地步骤: {missing}",
+            "error": f"missing dependency steps: {missing}",
+        }
+
+    if step_type == "python_merge":
+        rows, reason = _merge_dependency_rows(step, execution_results)
+        if rows is not None:
+            return {
+                "step": step_no,
+                "type": step_type,
+                "goal": step.get("goal", ""),
+                "depends_on": step.get("depends_on", []),
+                "merge_keys": step.get("merge_keys", []),
+                "result": rows,
+                "answer": f"本地合并完成，共 {len(rows)} 行。",
+                "error": None,
+            }
+        return {
+            "step": step_no,
+            "type": step_type,
+            "goal": step.get("goal", ""),
+            "depends_on": step.get("depends_on", []),
+            "merge_keys": step.get("merge_keys", []),
+            "result": _dependency_summary(step, execution_results),
+            "answer": f"未能进行结构化行合并（{reason}），已保留依赖步骤摘要。",
+            "error": None,
+        }
+
     return {
-        "answer": "复杂计划已确认。当前版本已完成计划生成与审批，分步执行将在下一迭代启用。",
+        "step": step_no,
+        "type": step_type,
+        "goal": step.get("goal", ""),
+        "depends_on": step.get("depends_on", []),
+        "merge_keys": step.get("merge_keys", []),
+        "result": _dependency_summary(step, execution_results),
+        "answer": "报告步骤已基于依赖步骤结果生成摘要。",
+        "error": None,
+    }
+
+
+def _format_complex_execution_answer(plan: dict, execution_results: dict[str, dict], failed: bool = False) -> str:
+    steps = plan.get("steps") or []
+    title = "复杂查询计划执行失败。" if failed else "复杂查询计划执行完成。"
+    lines = [f"{title}共处理 {len(execution_results)}/{len(steps)} 个步骤："]
+    for step in steps:
+        step_no = step.get("step")
+        entry = execution_results.get(str(step_no))
+        if not entry:
+            lines.append(f"{step_no}. {step.get('goal', '')}：未执行")
+            continue
+        status = "失败" if entry.get("error") else "完成"
+        lines.append(f"{step_no}. {entry.get('goal') or step.get('goal', '')}：{status}")
+        if entry.get("sql"):
+            lines.append(f"   SQL: {_short_text(entry['sql'], 260)}")
+        if entry.get("error"):
+            lines.append(f"   错误: {_short_text(entry['error'], 300)}")
+        else:
+            lines.append(f"   结果: {_short_text(entry.get('answer') or entry.get('result'), 360)}")
+    return "\n".join(lines)
+
+
+def _joined_plan_sql(execution_results: dict[str, dict]) -> str:
+    blocks = []
+    for key in sorted(execution_results, key=lambda x: int(x) if str(x).isdigit() else 10**9):
+        entry = execution_results[key]
+        sql = entry.get("sql")
+        if sql:
+            blocks.append(f"-- Step {key}: {entry.get('goal', '')}\n{sql}")
+    return "\n\n".join(blocks)
+
+
+async def _execute_complex_sql_step(
+    state: SQLReactState,
+    step: dict,
+    execution_results: dict[str, dict],
+    config=None,
+) -> dict:
+    step_no = step.get("step")
+    tables = step.get("tables") or []
+    table_set = set(tables)
+    step_query = _build_complex_step_query(state, step, execution_results)
+    step_state = {
+        **state,
+        "query": step_query,
+        "rewritten_query": step_query,
+        "enhanced_query": step_query,
+        "selected_tables": tables,
+        "table_relationships": _filter_relationships_for_tables(state.get("table_relationships", []), table_set),
+        "docs": [],
+        "semantic_model": {},
+        "sql": "",
         "is_sql": False,
-        "plan_execution_results": state.get("plan_execution_results", {}),
+        "answer": "",
+        "error": None,
+        "execution_history": [],
+        "reflection_notice": "",
+    }
+
+    try:
+        retrieve_update = await sql_retrieve(step_state, config=config)
+        step_state.update(retrieve_update)
+        docs_check = await check_docs(step_state)
+        if docs_check.get("is_sql") is False:
+            return {
+                "step": step_no,
+                "type": "sql",
+                "goal": step.get("goal", ""),
+                "tables": tables,
+                "sql": "",
+                "result": None,
+                "answer": docs_check.get("answer", ""),
+                "error": docs_check.get("answer", "missing schema docs"),
+            }
+
+        generation = await sql_generate(step_state, config=config)
+        step_state.update(generation)
+        if not step_state.get("is_sql"):
+            return {
+                "step": step_no,
+                "type": "sql",
+                "goal": step.get("goal", ""),
+                "tables": tables,
+                "sql": step_state.get("sql", ""),
+                "result": None,
+                "answer": step_state.get("answer", "未生成 SQL"),
+                "error": step_state.get("error") or step_state.get("answer", "not sql"),
+            }
+
+        safety = await safety_check(step_state)
+        if safety.get("is_sql") is False:
+            return {
+                "step": step_no,
+                "type": "sql",
+                "goal": step.get("goal", ""),
+                "tables": tables,
+                "sql": step_state.get("sql", ""),
+                "result": None,
+                "answer": safety.get("answer", "SQL 安全检查未通过"),
+                "error": safety.get("answer", "SQL 安全检查未通过"),
+                "safety_report": safety.get("safety_report"),
+            }
+        step_state.update(safety)
+
+        executed = await execute_sql(step_state)
+        return {
+            "step": step_no,
+            "type": "sql",
+            "goal": step.get("goal", ""),
+            "tables": tables,
+            "sql": step_state.get("sql", ""),
+            "result": executed.get("result"),
+            "answer": executed.get("answer", ""),
+            "error": executed.get("error"),
+            "execution_history": executed.get("execution_history", []),
+        }
+    except Exception as e:
+        logger.warning("complex plan step %s failed: %s", step_no, e, exc_info=True)
+        return {
+            "step": step_no,
+            "type": "sql",
+            "goal": step.get("goal", ""),
+            "tables": tables,
+            "sql": step_state.get("sql", ""),
+            "result": None,
+            "answer": f"复杂计划步骤 {step_no} 执行失败: {e}",
+            "error": str(e),
+        }
+
+
+async def execute_complex_plan_step(state: SQLReactState, config=None) -> dict:
+    """Execute an approved complex plan sequentially with per-step safety checks."""
+    plan = state.get("complex_plan") or {}
+    steps = plan.get("steps") or []
+    execution_results = {
+        str(key): value for key, value in (state.get("plan_execution_results") or {}).items()
+    }
+    if not state.get("plan_approved"):
+        return {
+            "answer": "复杂查询计划尚未确认，无法执行。",
+            "is_sql": False,
+            "error": "complex_plan_not_approved",
+            "plan_execution_results": execution_results,
+        }
+    if not steps:
+        return {
+            "answer": "复杂查询计划为空，无法执行。",
+            "is_sql": False,
+            "error": "empty_complex_plan",
+            "plan_execution_results": execution_results,
+        }
+
+    current_step = state.get("plan_current_step", 0) or 0
+    for step in steps:
+        step_no = step.get("step")
+        step_key = str(step_no)
+        if step_key in execution_results and not execution_results[step_key].get("error"):
+            current_step = step_no
+            continue
+
+        if step.get("type") == "sql":
+            entry = await _execute_complex_sql_step(state, step, execution_results, config=config)
+        else:
+            entry = _run_local_complex_step(step, execution_results)
+        execution_results[step_key] = entry
+        current_step = step_no
+
+        if entry.get("error"):
+            return {
+                "answer": _format_complex_execution_answer(plan, execution_results, failed=True),
+                "is_sql": False,
+                "sql": _joined_plan_sql(execution_results),
+                "result": json.dumps(execution_results, ensure_ascii=False),
+                "error": "complex_plan_step_failed",
+                "plan_current_step": current_step,
+                "plan_execution_results": execution_results,
+            }
+
+    return {
+        "answer": _format_complex_execution_answer(plan, execution_results, failed=False),
+        "is_sql": False,
+        "sql": _joined_plan_sql(execution_results),
+        "result": json.dumps(execution_results, ensure_ascii=False),
+        "error": None,
+        "plan_current_step": current_step,
+        "plan_execution_results": execution_results,
     }
 
 

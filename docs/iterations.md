@@ -2641,9 +2641,18 @@ selected_tables > 8: 进入复杂查询路由仲裁
 执行策略：
 
 - 无依赖 SQL 步骤可以并行，但初期建议先串行，降低状态复杂度。
-- 每个 SQL 仍必须 safety_check 和 approve。
+- 每个 SQL step 都必须经过 `safety_check`，继续只允许安全 `SELECT/WITH`；计划已经在 `approve_complex_plan` 统一确认，当前实现不再对每个 step 二次 interrupt，避免复杂计划审批与普通 SQL 审批状态互相污染。
 - 每步结果写入 `plan_execution_results[step_id]`。
 - `python_merge` 或本地聚合节点只消费已完成步骤结果。
+
+本次实现：
+
+- `execute_complex_plan_step` 从“计划确认占位”推进为串行执行器。
+- 对每个 `sql` step 构造独立临时 state，只暴露该 step 的目标、表集合和表内关系，复用 `sql_retrieve -> check_docs -> sql_generate -> safety_check -> execute_sql`。
+- 执行结果按 step id 写入 `plan_execution_results`，并在最终 answer 中展示每步目标、SQL、结果摘要或错误。
+- `python_merge` step 先实现保守本地合并：当依赖 SQL 返回 JSON 行数组且包含 `merge_keys` 时按 key 做外连接合并；无法结构化合并时不让 LLM 硬编结论，而是保留依赖步骤摘要。
+- `report` step 当前生成依赖步骤摘要，后续可扩展为 LLM 报告生成节点。
+- 任一步生成危险 SQL 或执行失败时立即停止后续步骤，返回 `complex_plan_step_failed` 和已完成步骤明细。
 
 #### Task 5：评测与回归
 
