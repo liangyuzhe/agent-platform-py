@@ -622,7 +622,7 @@
         const messagesDiv = document.getElementById('messages');
         const queryInput = document.getElementById('query');
         const btn = document.getElementById('btn');
-        const sessionId = 'web_' + Date.now();
+        const sessionId = window.__DEMO_SESSION_ID || ('web_' + Date.now());
 
         function addMessage(container, role, content) {
             const div = document.createElement('div');

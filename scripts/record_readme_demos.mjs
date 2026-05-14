@@ -35,7 +35,7 @@ const demos = [
   {
     slug: "sql-q1-salary-approved",
     title: "SQL Query: 第一季度员工工资",
-    questions: ["第一季度员工工资"],
+    questions: ["2026年第一季度按月统计应付职工薪酬借方和贷方金额"],
     approvals: 2,
     finalText: "查询已执行完成",
   },
@@ -47,22 +47,13 @@ const demos = [
     finalText: "查询已执行完成",
   },
   {
-    slug: "sql-complex-route-guardrail",
-    title: "Complex Routing: 复杂跨域问题友好拦截",
+    slug: "sql-complex-budget-expense-approved",
+    title: "Complex SQL: 部门预算与报销对比",
     questions: [
-      "跨域复杂分析测试：分析今年收入、成本、预算、费用报销、发票、应收应付、固定资产、资金划转、用户、角色、部门、成本中心、项目之间的关系",
+      "2025年按部门对比预算金额、实际发生额和已审批报销金额",
     ],
-    approvals: 0,
-    setupRouteRule: {
-      name: "README 复杂分析测试",
-      signal: "analysis",
-      matchType: "contains",
-      pattern: "跨域复杂分析测试",
-      priority: "100",
-      confidence: "0.95",
-      description: "README demo: broad analysis should enter complex planner when selected schema exceeds the table budget",
-    },
-    finalText: "需要补充项目相关表信息",
+    approvals: 2,
+    finalText: "查询已执行完成",
   },
 ];
 
@@ -197,6 +188,29 @@ async function waitForReflectionFlowVisible(page) {
   }, undefined, { timeout: 240_000 });
 }
 
+async function focusFinalResult(page) {
+  await page.evaluate(() => {
+    const container = document.querySelector("#sqlMessages");
+    if (!container) return;
+
+    const assistantBubbles = Array.from(container.querySelectorAll(".sql-message.assistant .bubble"));
+    const finalBubble = assistantBubbles.at(-1);
+    if (!finalBubble) return;
+
+    // Collapse earlier SQL detail blocks so the final result is actually visible in-frame.
+    const openDetails = Array.from(container.querySelectorAll("details[open]"));
+    for (const detail of openDetails) {
+      if (!finalBubble.contains(detail)) {
+        detail.removeAttribute("open");
+      }
+    }
+
+    container.scrollTop = container.scrollHeight;
+    finalBubble.scrollIntoView({ block: "center", inline: "nearest" });
+  });
+  await sleep(1200);
+}
+
 function convertToGif(webmPath, gifPath) {
   const palette = path.join(rawDir, `${path.basename(gifPath, ".gif")}-palette.png`);
   execFileSync("ffmpeg", [
@@ -218,10 +232,14 @@ function convertToGif(webmPath, gifPath) {
 
 async function recordDemo(browser, demo) {
   console.log(`Recording ${demo.slug}: ${demo.title}`);
+  const demoSessionId = `readme_demo_${demo.slug}_${Date.now()}`;
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     recordVideo: { dir: rawDir, size: { width: 1280, height: 720 } },
   });
+  await context.addInitScript((sessionId) => {
+    window.__DEMO_SESSION_ID = sessionId;
+  }, demoSessionId);
   const page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await addDemoOverlay(page, demo.title);
@@ -240,14 +258,15 @@ async function recordDemo(browser, demo) {
     await sleep(900);
   }
 
-  if (demo.approvals > 0 && !demo.finalText?.includes("已生成执行计划")) {
+  if (demo.approvals > 0 && demo.finalText?.includes("查询已执行完成")) {
     await waitForFinalSqlResult(page);
   }
   await waitForFinalText(page, demo.finalText);
   if (demo.waitForReflection) {
     await waitForReflectionFlowVisible(page);
   }
-  await sleep(5_000);
+  await focusFinalResult(page);
+  await sleep(6_000);
   const video = page.video();
   await context.close();
   const recorded = await video.path();

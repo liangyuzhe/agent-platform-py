@@ -39,7 +39,7 @@
 
 ### SQL Query：第一季度员工工资
 
-提问“第一季度员工工资”，系统完成意图识别、生成 SQL、审批执行，并返回按期间聚合的工资相关结果。
+提问“2026年第一季度按月统计应付职工薪酬借方和贷方金额”，系统完成意图识别、生成 SQL、审批执行，并返回按期间聚合的工资相关结果。
 
 ![SQL Query: 第一季度员工工资](docs/assets/demos/sql-q1-salary-approved.gif)
 
@@ -49,11 +49,11 @@
 
 ![SQL Query: 用户与角色](docs/assets/demos/sql-management-user-role-approved.gif)
 
-### Complex Routing：复杂跨域问题友好拦截
+### Complex SQL：部门预算与报销对比
 
-提问超出当前 schema 关系覆盖范围的复杂跨域问题时，系统不会硬拼 SQL，而是返回清晰的缺表/缺关系说明，引导用户补充范围或元数据。
+提问“2025年按部门对比预算金额、实际发生额和已审批报销金额”，系统会召回预算、成本中心、费用报销等多表语义，生成可审批 SQL 并返回按部门聚合结果。
 
-![Complex Routing: 复杂跨域问题友好拦截](docs/assets/demos/sql-complex-route-guardrail.gif)
+![Complex SQL: 部门预算与报销对比](docs/assets/demos/sql-complex-budget-expense-approved.gif)
 
 ## 架构概览
 
