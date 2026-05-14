@@ -4,18 +4,25 @@
 
 ## 核心特性
 
-- **自然语言查数据**：自然语言 → SQL → 人工审批 → 执行，含 SQL 安全分析 + 自动纠错重试 + 自动补表
-- **多场景意图路由**：意图分类 + 查询重写合并为一次 LLM 调用，自动路由到 SQL/RAG/闲聊
-- **可配置意图规则**：常见路由规则存储在 MySQL，通过 Admin 页面维护；规则引擎与 LLM 并行运行，最终仲裁意图
-- **统一语义模型**：`t_semantic_model` 表存储字段级业务映射（业务名/同义词/描述）+ 技术 schema（类型/注释/PK/FK），binlog 增量自动同步
-- **表关系自动发现**：从 `information_schema.key_column_usage` + 逻辑外键自动提取 JOIN 关系
-- **混合检索 RAG**：向量（Milvus）+ BM25（ES）+ RRF 融合 + Cross-Encoder 重排序
-- **业务知识 + 智能体知识**：公式/术语定义 + SQL few-shot 示例，并行检索注入 prompt
-- **查询增强**：用业务知识翻译术语（如 GMV → 已支付订单总额），提高检索命中率
-- **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成
-- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）
-- **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路
-- **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini
+- **自然语言查数据**：自然语言 -> 意图识别 -> 证据召回 -> 选表 -> SQL 生成 -> 人工审批 -> MySQL 执行，包含 SQL 安全分析、执行错误修复、异常结果反思、自动补表和用户友好结果展示。
+- **多场景意图路由**：意图分类 + 查询重写合并为一次 LLM 调用，自动路由到 SQL/RAG/闲聊/报告/审计等链路，减少重复调用和历史上下文漂移。
+- **可配置意图规则**：常见路由规则存储在 MySQL，通过 Admin 页面维护；规则引擎与 LLM 并行运行，最终仲裁意图，避免把业务关键词硬编码在代码中。
+- **统一语义模型**：`t_semantic_model` 存储字段级业务映射（业务名/同义词/描述）+ 技术 schema（类型/注释/PK/FK/逻辑外键），Schema 权威源收敛到 MySQL/Redis。
+- **表级可见语义**：为财务表、管理表、组织表维护表说明、业务域、别名和高价值字段提示，解决“用户/角色/部门”等管理表语义弱、排不进 TopK 的问题。
+- **轻量选表画像**：`select_tables` 只给 LLM 表说明和当前 query 命中的少量字段提示，完整 schema 只在 `sql_retrieve -> sql_generate` 阶段按已选表加载，避免提前把全库字段塞进上下文。
+- **表关系自动发现**：从 `information_schema.key_column_usage` + 语义模型逻辑外键提取 JOIN 关系，支持链式补齐桥接表、维表和端点表，例如 `t_budget -> t_cost_center -> t_department`。
+- **单次召回上下文复用**：`recall_evidence` 每轮只召回一次，把当前 query 命中的业务知识、SQL few-shot、相关表、匹配术语和示例问题结构化为 `recall_context`，后续查询增强、选表和 SQL 生成复用同一份状态，减少重复召回和状态污染。
+- **混合检索 RAG**：向量（Milvus）+ BM25（Elasticsearch）+ RRF 融合 + Cross-Encoder 重排序，用于业务术语、SQL few-shot 和用户文档检索。
+- **业务知识 + 智能体知识**：公式/术语定义 + SQL few-shot 示例并行检索注入 prompt；业务知识支持 MySQL `term/synonyms` 兜底命中，提升财务口径稳定性。
+- **查询增强**：基于业务知识翻译术语和同义表达（如“亏损多少” -> 亏损金额计算口径），提高后续检索、选表和 SQL 生成命中率。
+- **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成；审批恢复使用 LangGraph `interrupt/Command(resume=...)`，SSE 展示执行、异常反思和二次确认过程。
+- **执行后反思修复**：SQL 执行成功但返回空集、`NULL`、全字段空值或零值可疑结果时，进入 `result_reflection` 直接生成修正 SQL，不再回到 `sql_generate` 重新发散。
+- **复杂查询模式切换**：5 张内走单 SQL，6-8 张走严格单 SQL，超过 8 张根据规则/LLM 语义信号进入复杂计划或澄清，避免超大 JOIN 幻觉和 token 膨胀。
+- **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）按 `session_id` 隔离；SQL 场景单独保存上一轮 SQL 口径，支持“亏损多少”这类多轮追问。
+- **链路追踪与评测闭环**：LangSmith/CozeLoop 记录 LLM、Milvus、ES、MySQL fallback、SQL 执行和审批节点；Evaluation 页面展示 Accuracy@K、Precision@K、Recall@K、MRR、NDCG、P50/P95、首字延迟和 per-query 明细。
+- **安全、熔断与 Fallback**：只允许安全 `SELECT/WITH`；支持 SQLState 错误分类、可配置重试、超时控制、Redis -> MySQL fallback、检索失败降级为空 evidence。
+- **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路，避免在样本不足时把错误 SQL 和错误口径固化进模型。
+- **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini。
 
 ## 功能演示（6 个端到端案例）
 
@@ -56,6 +63,65 @@
 提问“2025年按部门对比预算金额、实际发生额和已审批报销金额”，系统会召回预算、成本中心、费用报销等多表语义，生成待审批 SQL，并在确认后返回按部门聚合的对比结果。
 
 ![Complex SQL: 部门预算与报销对比](docs/assets/demos/sql-complex-budget-expense-approved.gif)
+
+## 最新节点调用流程图
+
+当前主链路由 `Final Graph` 做意图分类与路由，SQL 查询进入 `SQL React` 子图。`recall_evidence` 每轮只召回一次，并把业务知识/few-shot 整理成 `recall_context`，后续查询增强、选表和 SQL 生成复用同一份状态。
+
+```mermaid
+flowchart TD
+    Start([用户请求]) --> API[FastAPI /api/query/invoke]
+    API --> Classify[classify_intent<br/>意图分类 + 查询重写]
+    Classify --> Route{route_intent}
+
+    Route -->|chat / knowledge / report 等| RagChat[RAG Chat / chat_direct]
+    RagChat --> ChatEnd([返回自然语言回答])
+
+    Route -->|sql_query| Recall[recall_evidence<br/>业务知识 + SQL few-shot]
+    Recall --> RecallCtx[build recall_context<br/>相关表 / 匹配术语 / few-shot 问题 / query_key]
+    RecallCtx --> Enhance[query_enhance<br/>基于 evidence 增强业务术语]
+    Enhance --> Select[select_tables<br/>轻量 table routing profile + LLM 选表]
+    Select --> Rerank[本地语义重排 + 逻辑外键链式补表]
+    Rerank --> Signal[infer_route_signal<br/>规则或 LLM 复杂查询语义信号]
+    Signal --> Complexity[route_complexity<br/>single_sql / strict / complex_plan / clarify]
+
+    Complexity -->|clarify| Clarify([返回澄清问题])
+    Complexity -->|complex_plan| PlanGen[complex_plan_generate<br/>结构化计划]
+    PlanGen --> PlanCheck{validate_complex_plan}
+    PlanCheck -->|invalid / clarify| Clarify
+    PlanCheck -->|valid| PlanApprove[approve_complex_plan<br/>用户确认计划]
+    PlanApprove --> PlanExec[execute_complex_plan_step<br/>当前版本计划确认占位]
+    PlanExec --> PlanEnd([返回计划状态])
+
+    Complexity -->|single_sql / strict| Retrieve[sql_retrieve<br/>按已选表加载完整语义模型]
+    Retrieve --> CheckDocs{check_docs}
+    CheckDocs -->|无 schema| NoSchema([友好错误返回])
+    CheckDocs -->|有 schema| Generate[sql_generate<br/>SQL 生成 + 最多 3 轮补表]
+    Generate --> Safety[safety_check<br/>只允许安全 SELECT/WITH]
+    Safety -->|unsafe| Unsafe([安全拦截返回])
+    Safety -->|safe| Approve[approve<br/>Human-in-the-Loop SQL 审批]
+    Approve -->|拒绝| Rejected([返回拒绝/反馈])
+    Approve -->|通过| Execute[execute_sql<br/>MCP MySQL 执行]
+
+    Execute --> ExecRoute{执行结果}
+    ExecRoute -->|正常| Done([用户友好结果展示])
+    ExecRoute -->|可修复执行错误| ErrorAnalysis[error_analysis<br/>错误分类 + 修复反馈]
+    ErrorAnalysis --> Generate
+    ExecRoute -->|空集 / NULL / 可疑结果| Reflection[result_reflection<br/>直接生成修正 SQL]
+    Reflection --> Safety
+    ExecRoute -->|不可修复错误 / 超过重试| Failed([友好失败返回])
+```
+
+节点职责简表：
+
+| 节点 | 作用 |
+|------|------|
+| `classify_intent` | 一次 LLM 调用完成意图分类和查询重写；规则引擎与 LLM 并行后仲裁 |
+| `recall_evidence` | 唯一的业务知识/few-shot 召回节点，调用 Milvus/ES/MySQL fallback |
+| `recall_context` | 运行态结构化证据，不是新检索；用于防止重复召回和跨节点语义漂移 |
+| `select_tables` | 只给 LLM 表说明和少量命中字段提示，不提前注入完整 schema |
+| `route_complexity` | 5 张内单 SQL，6-8 张严格单 SQL，超过 8 张按语义信号进入计划或澄清 |
+| `result_reflection` | 处理“执行成功但结果异常”，直接生成修正 SQL，再重新安全检查和审批 |
 
 ## 架构概览
 
@@ -351,7 +417,7 @@ python -m agents.eval.cli run-online-nl2sql --dataset data/eval/online_nl2sql_ca
 - `business_knowledge_recall`：业务知识召回，只有数据集带 `relevant_business_doc_ids` 时计算。
 - `agent_knowledge_recall`：SQL few-shot 召回，只有数据集带 `relevant_agent_doc_ids` 时计算。
 
-线上选表前置链路 `preselect_pipeline` 会执行 `recall_evidence -> query_enhance -> select_tables`，可能调用外部 LLM。需要评测真实线上链路时显式开启：
+线上选表前置链路 `preselect_pipeline` 会执行 `recall_evidence -> recall_context -> query_enhance -> select_tables`，其中 `recall_evidence` 每轮只召回一次，后续节点复用 state 中的结构化证据；该链路可能调用外部 LLM。需要评测真实线上链路时显式开启：
 
 ```bash
 python -m agents.eval.cli run \
@@ -578,20 +644,25 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 ### 5. SQL React 图流程
 
 ```
-contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → sql_generate
-     (代词消解)         (业务知识+few-shot)  (术语翻译)      (LLM选表)    (MySQL语义模型)              (SQL生成+补表)
+recall_evidence → query_enhance → select_tables → infer_route_signal → route_complexity
+(业务知识+few-shot)  (术语翻译)      (LLM选表)       (规则/LLM语义信号)       (单SQL/计划模式)
+     → sql_retrieve → check_docs → sql_generate
+       (MySQL语义模型)              (SQL生成+补表)
      → safety_check → approve → execute_sql
           (安全检查)     (人工审批)     (MCP执行)
 ```
 
 **核心流程**：
-1. **代词消解**：结合对话历史将"他"→"zhangsan01"
+1. **意图与查询重写**：在外层 `classify_intent` 一次完成，SQL React 子图不再做二次 rewrite。
 2. **证据检索**：并行检索业务知识（公式/术语）+ 智能体知识（SQL 示例），RRF 融合
-3. **查询增强**：基于召回到的业务知识 evidence 翻译术语/同义词；业务知识召回支持 MySQL `term/synonyms` 兜底
-4. **表选择**：从 MySQL `t_semantic_model` 加载表名+描述，LLM 精选
-5. **Schema 加载**：从 `t_semantic_model` 构建含业务映射的 schema 文档
-6. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示；生成结果经 `normalize_sql_answer()` 清洗/校验
-7. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
+3. **召回上下文**：把本轮 evidence/few-shot 解析成 `recall_context`，只把命中当前 query 的业务知识和 few-shot 表证据写入相关表，避免召回噪声污染选表
+4. **查询增强**：基于同一份 `recall_context.evidence` 翻译术语/同义词；业务知识召回支持 MySQL `term/synonyms` 兜底
+5. **表选择**：从 MySQL/Redis 加载表名+描述，并基于 `t_semantic_model` 生成轻量 table routing profile；LLM 只看表说明和当前 query 命中的少量字段提示
+6. **本地重排与补表**：复用 `recall_context.business_related_tables/few_shot_related_tables` 加权，结合逻辑外键做链式补表，例如 `t_budget -> t_cost_center -> t_department`
+7. **复杂度路由**：表数超过单 SQL 预算时，进入 `complex_plan` 或 `clarify`，不把超大 schema 直接塞进 SQL 生成 prompt
+8. **Schema 加载**：从 `t_semantic_model` 按已选表构建完整业务 schema 文档
+9. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示；生成结果经 `normalize_sql_answer()` 清洗/校验
+10. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
 
 ### 6. 检索数据源分工
 
@@ -599,11 +670,11 @@ contextualize_query → recall_evidence → query_enhance → select_tables → 
 
 | 数据 | 存储位置 | 检索方式 | 使用节点 | 为什么这样查 |
 |------|----------|----------|----------|--------------|
-| 表名、表注释 | Redis `schema:table_metadata`；miss 后查 MySQL `information_schema.tables` | 精确读取全量候选表，再由 LLM 精选 | `select_tables` | 表名是结构化元数据，要求完整、实时、可解释，不适合靠向量相似度召回 |
-| 字段类型、字段注释、PK/FK、业务名、同义词、业务描述 | Redis `schema:semantic_model:<table>`；miss 后查 MySQL `t_semantic_model` | 按已选表精确加载 | `sql_retrieve`、自动补表 | SQL 生成必须拿到准确字段和关系，Redis 降低延迟，MySQL 作为权威来源 |
+| 表名、表注释 | Redis `schema:table_metadata`；miss 后查 MySQL `information_schema.tables` | 精确读取候选表，再由 LLM 精选 | `select_tables` | 表名是结构化元数据，要求完整、实时、可解释，不适合靠向量相似度召回 |
+| 字段类型、字段注释、PK/FK、业务名、同义词、业务描述 | Redis `schema:semantic_model:<table>`；miss 后查 MySQL `t_semantic_model` | 选表阶段只取少量命中字段做 routing profile；SQL 生成阶段按已选表完整加载 | `select_tables`、`sql_retrieve`、自动补表 | 选表需要轻量提示，SQL 生成才需要完整 schema，避免提前消耗大量 token |
 | 表关系、JOIN 关系 | MySQL `t_semantic_model` 的逻辑外键 + `information_schema.key_column_usage` | 按表名精确查询 | `select_tables`、`sql_generate` | JOIN 条件必须确定，不能依赖向量相似度推断 |
-| 业务术语、公式、同义词 | MySQL `t_business_knowledge` + Milvus `source=business_knowledge` + ES `metadata.source=business_knowledge` | Milvus 向量召回 + ES BM25 + RRF；不足时 MySQL term/synonyms 字符匹配兜底 | `recall_evidence`、`query_enhance`、`sql_generate` | 用户表达可能口语化，向量适合语义近似，BM25 适合关键词命中，MySQL 兜底保证配置过的同义词能命中 |
-| SQL few-shot 示例 | MySQL `t_agent_knowledge` + Milvus `source=agent_knowledge` + ES `metadata.source=agent_knowledge` | Milvus 向量召回 + ES BM25 + RRF；过滤不含 SQL 的结果 | `recall_evidence`、`sql_generate` | 示例 SQL 是非结构化知识，向量找相似问题，BM25 命中表名/字段名/指标词 |
+| 业务术语、公式、同义词 | MySQL `t_business_knowledge` + Milvus `source=business_knowledge` + ES `metadata.source=business_knowledge` | 每轮 query 只在 `recall_evidence` 召回一次：Milvus 向量 + ES BM25 + RRF；不足时 MySQL term/synonyms 兜底；结果写入 `recall_context` | `recall_evidence`、`query_enhance`、`select_tables`、`sql_generate` | 用户表达可能口语化，向量适合语义近似，BM25 适合关键词命中；结构化 `recall_context` 避免后续节点重复召回 |
+| SQL few-shot 示例 | MySQL `t_agent_knowledge` + Milvus `source=agent_knowledge` + ES `metadata.source=agent_knowledge` | 每轮 query 只在 `recall_evidence` 召回一次，解析 SQL 中的 FROM/JOIN 表和示例问题写入 `recall_context` | `recall_evidence`、`select_tables`、`sql_generate` | 示例 SQL 是非结构化知识，向量找相似问题，BM25 命中表名/字段名/指标词；选表阶段复用示例表证据 |
 | 用户上传文档 | Milvus/ES 文档索引 | RAG 检索、重排 | RAG Chat 流程 | 文档内容天然非结构化，适合向量语义召回 + 关键词召回 |
 | 会话状态、checkpoint、schema 缓存、领域摘要缓存 | Redis | key-value 精确读取 | API、LangGraph、schema sync | 高频状态数据需要低延迟读写，Redis 作为缓存和会话存储 |
 | 实际业务数据 | MySQL 业务表 | LLM 生成 SELECT，经审批后由 MCP MySQL 执行 | `execute_sql` | MySQL 是业务数据权威来源，SQL 执行前必须经过安全检查和人工确认 |
@@ -621,7 +692,7 @@ python -m scripts.cleanup_schema_indexes
 - 执行成功但结果异常（空集、`NULL`、包装结构中的 `rows: []` 等）进入 `result_reflection`
 - `result_reflection` 直接生成修正后的 SQL，然后走 `safety_check → approve → execute_sql`，不再重复进入 `sql_generate`
 - 审批恢复使用 SSE 展示“执行中 → 异常检测 → 反思生成修正 SQL → 等待确认”的过程，避免用户误以为重复审批同一条 SQL
-- `query` 是稳定输入字段，父图和 SQL 子图都使用 `keep_existing_query` reducer，避免 approve/resume 后重复写入触发 LangGraph 并发更新错误
+- `query` 和 `rewritten_query` 使用 `latest_non_empty` reducer，允许新一轮非空 query 覆盖旧 checkpoint，approve/resume 没有新值时保留当前值，避免 LangGraph 并发更新错误
 
 **时序调用图**：
 
@@ -640,10 +711,10 @@ sequenceDiagram
 
     U->>API: /api/query/invoke
     API->>G: sql_query
-    G->>S: contextualize_query
-    S->>S: recall_evidence
-    S->>S: query_enhance
-    S->>S: select_tables + sql_retrieve
+    S->>S: recall_evidence -> recall_context
+    S->>S: query_enhance(reuse recall_context)
+    S->>S: select_tables(reuse recall_context) + route_complexity
+    S->>S: sql_retrieve
     S->>LLM: sql_generate
     LLM-->>S: SQL
     S->>S: normalize_sql_answer + safety_check

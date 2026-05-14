@@ -168,7 +168,7 @@ def main():
     p_run.add_argument(
         "--include-online-pipeline",
         action="store_true",
-        help="Also evaluate recall_evidence -> query_enhance -> select_tables; may call external LLM",
+        help="Also evaluate recall_evidence -> recall_context -> query_enhance -> select_tables; may call external LLM",
     )
 
     # detail

@@ -101,46 +101,6 @@ class TestStateReducers:
 # check_docs node
 # ---------------------------------------------------------------------------
 
-class TestContextualizeQuery:
-    """Test contextualize_query node."""
-
-    @pytest.mark.asyncio
-    async def test_existing_rewritten_query_skips(self):
-        """When rewritten_query already exists, should skip LLM call."""
-        from agents.flow.sql_react import contextualize_query
-
-        state = {"query": "它多少钱", "rewritten_query": "iPhone 15 价格"}
-        result = await contextualize_query(state)
-        assert result["rewritten_query"] == "iPhone 15 价格"
-
-    @pytest.mark.asyncio
-    async def test_no_history_returns_original(self):
-        """Without chat history, should return original query."""
-        from agents.flow.sql_react import contextualize_query
-
-        state = {"query": "查询订单", "chat_history": []}
-        result = await contextualize_query(state)
-        assert result["rewritten_query"] == "查询订单"
-
-    @pytest.mark.asyncio
-    @patch("agents.flow.sql_react.rewrite_query")
-    async def test_with_history_rewrites(self, mock_rewrite):
-        """With chat history, should call rewrite_query."""
-        from agents.flow.sql_react import contextualize_query
-
-        mock_rewrite.return_value = "张三的订单金额"
-        state = {
-            "query": "他的订单金额",
-            "chat_history": [
-                {"role": "user", "content": "查询张三的信息"},
-                {"role": "assistant", "content": "张三，男，28岁"},
-            ],
-        }
-        result = await contextualize_query(state)
-        assert result["rewritten_query"] == "张三的订单金额"
-        mock_rewrite.assert_called_once()
-
-
 class TestCheckDocs:
     """Test check_docs node."""
 
@@ -310,14 +270,14 @@ class TestSelectTables:
     @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
     @patch("agents.flow.sql_react.load_full_table_metadata")
     @patch("agents.flow.sql_react.get_chat_model")
-    async def test_merges_business_evidence_related_tables(
+    async def test_merges_recall_context_related_tables(
         self,
         mock_get_model,
         mock_load_metadata,
         _mock_relationships,
         _mock_semantic,
     ):
-        """Related tables from business knowledge should survive an LLM under-selection."""
+        """Related tables from recall_context should survive an LLM under-selection."""
         from agents.flow.sql_react import select_tables
 
         mock_load_metadata.return_value = [
@@ -332,12 +292,14 @@ class TestSelectTables:
 
         result = await select_tables({
             "query": "公司盈利",
+            "rewritten_query": "公司盈利",
             "enhanced_query": "公司净利润 > 0",
-            "evidence": [
-                "术语: 净利润\n"
-                "公式: 收入 - 成本 - 费用\n"
-                "关联表: t_journal_item,t_account,t_expense_claim"
-            ],
+            "recall_context": {
+                "query_key": "公司盈利",
+                "business_related_tables": ["t_journal_item", "t_account", "t_expense_claim"],
+                "few_shot_related_tables": [],
+                "matched_terms": ["净利润"],
+            },
         })
 
         assert result["selected_tables"][:3] == [
@@ -394,6 +356,257 @@ class TestSelectTables:
         })
 
         assert result["selected_tables"] == ["t_user"]
+
+    def test_expands_semantic_relationship_chain_independent_of_dict_order(self):
+        """FK expansion should close multi-hop table chains, not depend on row order."""
+        from agents.flow.sql_react import _expand_selected_tables_by_semantic_relationships
+
+        semantic_model = {
+            "t_cost_center": {
+                "department_id": {
+                    "is_fk": 1,
+                    "ref_table": "t_department",
+                    "ref_column": "id",
+                },
+            },
+            "t_budget": {
+                "cost_center_id": {
+                    "is_fk": 1,
+                    "ref_table": "t_cost_center",
+                    "ref_column": "id",
+                },
+            },
+            "t_department": {},
+        }
+
+        expanded = _expand_selected_tables_by_semantic_relationships(
+            selected=["t_budget"],
+            candidate_tables=["t_budget", "t_cost_center", "t_department"],
+            semantic_model=semantic_model,
+        )
+
+        assert expanded == ["t_budget", "t_cost_center", "t_department"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_select_tables_uses_lightweight_routing_profile_and_repairs_underselection(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """Prompt should expose only matched field hints and repair budget/department under-selection."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_budget", "table_comment": "预算管理表"},
+            {"table_name": "t_cost_center", "table_comment": "成本中心表"},
+            {"table_name": "t_department", "table_comment": "组织部门信息表，包含部门名称"},
+            {"table_name": "t_invoice", "table_comment": "发票管理表"},
+        ]
+        mock_semantic.return_value = {
+            "t_cost_center": {
+                "center_name": {
+                    "column_name": "center_name",
+                    "business_name": "成本中心名称",
+                    "synonyms": "部门名称",
+                    "business_description": "如：研发部、市场部、财务部",
+                },
+                "annual_budget": {
+                    "column_name": "annual_budget",
+                    "business_name": "年度预算",
+                    "synonyms": "全年预算",
+                    "business_description": "该成本中心的年度预算金额",
+                },
+                "department_id": {
+                    "column_name": "department_id",
+                    "is_fk": 1,
+                    "ref_table": "t_department",
+                    "ref_column": "id",
+                },
+                "created_at": {
+                    "column_name": "created_at",
+                    "business_name": "创建时间",
+                    "synonyms": "记录时间",
+                },
+            },
+            "t_budget": {
+                "budget_year": {
+                    "column_name": "budget_year",
+                    "business_name": "预算年度",
+                },
+                "cost_center_id": {
+                    "column_name": "cost_center_id",
+                    "business_name": "成本中心ID",
+                    "synonyms": "部门",
+                    "is_fk": 1,
+                    "ref_table": "t_cost_center",
+                    "ref_column": "id",
+                },
+                "budget_amount": {
+                    "column_name": "budget_amount",
+                    "business_name": "预算金额",
+                    "synonyms": "预算额度",
+                },
+            },
+            "t_department": {
+                "name": {
+                    "column_name": "name",
+                    "business_name": "部门名称",
+                    "synonyms": "组织名称, 部门",
+                },
+            },
+            "t_invoice": {
+                "invoice_no": {
+                    "column_name": "invoice_no",
+                    "business_name": "发票号码",
+                    "synonyms": "发票号",
+                },
+            },
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_budget"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询各个部门的年度预算总金额",
+            "enhanced_query": "查询各个部门的年度预算总金额",
+            "evidence": [],
+        })
+
+        prompt = mock_model.ainvoke.call_args.args[0][0].content
+        assert "匹配字段" in prompt
+        assert "annual_budget(年度预算" in prompt
+        assert "cost_center_id(成本中心ID" in prompt
+        assert "created_at" not in prompt
+        assert set(result["selected_tables"][:3]) == {"t_budget", "t_cost_center", "t_department"}
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables", return_value={})
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_select_tables_reuses_recall_context_related_tables(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        _mock_semantic,
+    ):
+        """select_tables should reuse recall_context and not perform another recall."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_budget", "table_comment": "预算管理表"},
+            {"table_name": "t_cost_center", "table_comment": "成本中心表"},
+            {"table_name": "t_department", "table_comment": "组织部门信息表"},
+            {"table_name": "t_invoice", "table_comment": "发票管理表"},
+        ]
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_department"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询各个部门的年度预算总金额",
+            "rewritten_query": "查询各个部门的年度预算总金额",
+            "evidence": [],
+            "recall_context": {
+                "query_key": "查询各个部门的年度预算总金额",
+                "business_related_tables": ["t_cost_center"],
+                "few_shot_related_tables": ["t_budget", "t_cost_center"],
+                "matched_terms": ["年度预算", "部门"],
+            },
+        })
+
+        assert set(result["selected_tables"][:3]) == {"t_budget", "t_cost_center", "t_department"}
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables", return_value={})
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_select_tables_ignores_stale_recall_context(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        _mock_semantic,
+    ):
+        """recall_context from another query should not pollute table selection."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_user", "table_comment": "用户表"},
+            {"table_name": "t_budget", "table_comment": "预算管理表"},
+            {"table_name": "t_cost_center", "table_comment": "成本中心表"},
+            {"table_name": "t_invoice", "table_comment": "发票管理表"},
+        ]
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_user"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询所有用户",
+            "rewritten_query": "查询所有用户",
+            "evidence": [],
+            "recall_context": {
+                "query_key": "查询各个部门的年度预算总金额",
+                "business_related_tables": ["t_cost_center"],
+                "few_shot_related_tables": ["t_budget"],
+                "matched_terms": ["年度预算"],
+            },
+        })
+
+        assert result["selected_tables"] == ["t_user"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables", return_value={})
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_select_tables_does_not_expand_filtered_recall_context_tables(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        mock_relationships,
+        _mock_semantic,
+    ):
+        """A clean recall_context should not expand selected tables before relationship lookup."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_journal_item", "table_comment": "凭证分录明细表"},
+            {"table_name": "t_account", "table_comment": "会计科目表"},
+            {"table_name": "t_expense_claim", "table_comment": "费用报销表"},
+            {"table_name": "t_budget", "table_comment": "预算管理表"},
+            {"table_name": "t_fund_transfer", "table_comment": "资金划转记录表"},
+            {"table_name": "t_receivable_payable", "table_comment": "应收应付表"},
+            {"table_name": "t_cost_center", "table_comment": "成本中心表"},
+            {"table_name": "t_fixed_asset", "table_comment": "固定资产表"},
+            {"table_name": "t_department", "table_comment": "组织部门信息表"},
+        ]
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_journal_item,t_account,t_expense_claim"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "查询当前公司去年的亏损金额",
+            "rewritten_query": "查询当前公司去年的亏损金额",
+            "evidence": [],
+            "recall_context": {
+                "query_key": "查询当前公司去年的亏损金额",
+                "business_related_tables": ["t_journal_item", "t_account", "t_expense_claim"],
+                "few_shot_related_tables": [],
+                "matched_terms": ["净利润"],
+            },
+        })
+
+        assert result["selected_tables"] == ["t_journal_item", "t_account", "t_expense_claim"]
+        mock_relationships.assert_called_once_with(["t_journal_item", "t_account", "t_expense_claim"])
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.get_semantic_model_by_tables")
@@ -1311,6 +1524,20 @@ class TestBuildSqlReactGraph:
         assert "complex_plan_generate" in node_names
         assert "approve_complex_plan" in node_names
         assert "execute_complex_plan_step" in node_names
+        assert "contextualize_query" not in node_names
+
+    @patch("agents.flow.sql_react.get_checkpointer")
+    def test_graph_starts_at_recall_evidence(self, mock_cp):
+        """SQL React must rely on dispatcher rewritten_query and start with evidence recall."""
+        from langgraph.checkpoint.memory import MemorySaver
+        from agents.flow.sql_react import build_sql_react_graph
+
+        mock_cp.return_value = MemorySaver()
+        graph = build_sql_react_graph()
+        edges = graph.get_graph().edges
+
+        assert any(edge.source == "__start__" and edge.target == "recall_evidence" for edge in edges)
+        assert not any(edge.source == "__start__" and edge.target == "contextualize_query" for edge in edges)
 
     @patch("agents.flow.sql_react.get_checkpointer")
     def test_graph_compiles(self, mock_cp):
@@ -1479,6 +1706,93 @@ class TestRecallEvidence:
         assert result["few_shot_examples"] == ["SELECT 1;"]
         assert mock_business.call_args.kwargs["callbacks"] == ["trace-handler"]
         assert mock_agent.call_args.kwargs["callbacks"] == ["trace-handler"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.recall_agent_knowledge")
+    @patch("agents.flow.sql_react.recall_business_knowledge")
+    async def test_recall_evidence_builds_structured_context(self, mock_business, mock_agent):
+        """Recall should run once and store structured evidence for later nodes."""
+        from agents.flow.sql_react import recall_evidence
+
+        mock_business.return_value = [
+            Document(
+                page_content=(
+                    "术语: 年度预算\n"
+                    "公式: SUM(budget_amount) GROUP BY cost_center_id\n"
+                    "同义词: 年度预算总金额, 全年预算\n"
+                    "关联表: t_budget,t_cost_center"
+                ),
+                metadata={"score": 0.9},
+            )
+        ]
+        mock_agent.return_value = [
+            Document(
+                page_content=(
+                    "问题: 查询各部门年度预算总额\n"
+                    "SQL: SELECT cc.center_name, SUM(b.budget_amount) "
+                    "FROM t_budget b JOIN t_cost_center cc ON b.cost_center_id = cc.id\n"
+                    "说明: 年度预算执行率排名"
+                ),
+                metadata={"score": 0.9},
+            )
+        ]
+
+        result = await recall_evidence(
+            {"query": "查询各个部门的年度预算总金额", "rewritten_query": "查询各个部门的年度预算总金额"},
+        )
+
+        context = result["recall_context"]
+        assert context["query_key"] == "查询各个部门的年度预算总金额"
+        assert context["business_related_tables"] == ["t_budget", "t_cost_center"]
+        assert context["few_shot_related_tables"] == ["t_budget", "t_cost_center"]
+        assert "年度预算" in context["matched_terms"]
+        assert context["few_shot_questions"] == ["查询各部门年度预算总额"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.recall_agent_knowledge")
+    @patch("agents.flow.sql_react.recall_business_knowledge")
+    async def test_recall_evidence_filters_unmatched_business_related_tables(self, mock_business, mock_agent):
+        """Unmatched business knowledge should not pollute recall_context related tables."""
+        from agents.flow.sql_react import recall_evidence
+
+        mock_business.return_value = [
+            Document(
+                page_content=(
+                    "术语: 净利润\n"
+                    "公式: 收入 - 成本 - 费用\n"
+                    "同义词: 亏损, 亏损金额\n"
+                    "关联表: t_journal_item,t_account,t_expense_claim"
+                ),
+                metadata={"score": 0.9},
+            ),
+            Document(
+                page_content=(
+                    "术语: 年度预算\n"
+                    "公式: SUM(budget_amount)\n"
+                    "同义词: 预算总额, 全年预算\n"
+                    "关联表: t_budget,t_cost_center,t_department"
+                ),
+                metadata={"score": 0.8},
+            ),
+            Document(
+                page_content=(
+                    "术语: 固定资产净值\n"
+                    "公式: original_value - accumulated_depreciation\n"
+                    "同义词: 资产净额\n"
+                    "关联表: t_fixed_asset"
+                ),
+                metadata={"score": 0.7},
+            ),
+        ]
+        mock_agent.return_value = []
+
+        result = await recall_evidence(
+            {"query": "查询当前公司去年的亏损金额", "rewritten_query": "查询当前公司去年的亏损金额"},
+        )
+
+        context = result["recall_context"]
+        assert context["business_related_tables"] == ["t_journal_item", "t_account", "t_expense_claim"]
+        assert context["matched_terms"] == ["净利润"]
 
 
 # ---------------------------------------------------------------------------

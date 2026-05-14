@@ -16,7 +16,7 @@
 
 | 能力 | 当前实现 |
 |------|----------|
-| NL2SQL | `Final Graph -> SQL React`，支持业务知识增强、语义模型选表、SQL 生成、安全审查、人工审批、执行与反思 |
+| NL2SQL | `Final Graph -> SQL React`，支持单次 evidence 召回复用、轻量表路由画像、复杂查询路由、SQL 生成、安全审查、人工审批、执行与反思 |
 | RAG 问答 | Milvus 向量 + ES BM25 + RRF + Cross-Encoder rerank |
 | 业务知识 | `t_business_knowledge` 存储术语、公式、同义词，支持 MySQL lexical fallback |
 | 语义模型 | `t_semantic_model` 统一存储物理字段、业务名、同义词、描述、主外键信息 |
@@ -105,10 +105,11 @@ Command(resume={
 
 ```python
 class FinalGraphState(TypedDict):
-    query: Annotated[str, keep_existing_query]
+    query: Annotated[str, latest_non_empty]
     session_id: str
     chat_history: list[dict]
     intent: str
+    rewritten_query: Annotated[str, latest_non_empty]
     sql: str
     result: str
     answer: str
@@ -121,13 +122,17 @@ class FinalGraphState(TypedDict):
 
 ```python
 class SQLReactState(TypedDict):
-    query: Annotated[str, keep_existing_query]
-    rewritten_query: str
+    query: Annotated[str, latest_non_empty]
+    rewritten_query: Annotated[str, latest_non_empty]
     enhanced_query: str
     evidence: list[str]
     few_shot_examples: list[str]
+    recall_context: dict
     selected_tables: list[str]
     table_relationships: list[dict]
+    route_mode: str
+    route_signal: str
+    complex_plan: dict
     docs: list[Document]
     semantic_model: dict
     sql: str
@@ -141,18 +146,16 @@ class SQLReactState(TypedDict):
     reflection_notice: str
 ```
 
-### 4.3 query reducer
+### 4.3 query / rewritten_query reducer
 
-`query` 是稳定输入字段，父图和子图都可能携带。为了避免 approve/resume 后同一步重复写入报错，`query` 使用 reducer：
+`query` 和 `rewritten_query` 是跨父图、SQL 子图、approve/resume 都会携带的稳定输入字段。为了同时支持“新一轮请求覆盖旧 checkpoint”和“approve/resume 不带新值时保留当前值”，二者使用同一个 reducer：
 
 ```python
-def keep_existing_query(current: str | None, incoming: str | None) -> str:
-    if current:
-        return current
-    return incoming or ""
+def latest_non_empty(current: str | None, incoming: str | None) -> str:
+    return incoming or current or ""
 ```
 
-该 reducer 只用于保持原始用户问题稳定，不承担查询增强职责。查询增强仍由 `rewritten_query` 和 `enhanced_query` 表达。
+该 reducer 不承担查询增强职责。查询增强仍由 `enhanced_query` 表达，证据复用由 `recall_context.query_key` 做当前 query 校验。
 
 ## 5. Final Graph 设计
 
@@ -184,10 +187,11 @@ START
 ### 6.1 主流程
 
 ```text
-contextualize_query
-  -> recall_evidence
+recall_evidence
   -> query_enhance
   -> select_tables
+  -> infer_route_signal
+  -> route_complexity
   -> sql_retrieve
   -> check_docs
   -> sql_generate
@@ -202,16 +206,19 @@ contextualize_query
 ```text
 execute_sql -- retryable error --> error_analysis -> sql_generate
 execute_sql -- suspicious result --> result_reflection -> safety_check -> approve -> execute_sql
+route_complexity -- complex_plan --> complex_plan_generate -> approve_complex_plan -> execute_complex_plan_step
+route_complexity -- clarify --> END
 ```
 
 ### 6.2 节点职责
 
 | 节点 | 说明 |
 |------|------|
-| `contextualize_query` | 若外层已有 `rewritten_query` 则复用，否则结合历史做指代消解 |
-| `recall_evidence` | 并行召回业务知识和 SQL few-shot 示例 |
-| `query_enhance` | 基于召回 evidence 翻译业务术语，LLM 空响应时使用 evidence 驱动 fallback |
-| `select_tables` | 从 `t_semantic_model` 加载表名和描述，让 LLM 精选相关表 |
+| `recall_evidence` | 并行召回业务知识和 SQL few-shot 示例，并构建 `recall_context` |
+| `query_enhance` | 基于 `recall_context.evidence` 翻译业务术语，LLM 空响应时使用 evidence 驱动 fallback |
+| `select_tables` | 从 MySQL/Redis 加载表信息，构建轻量 table routing profile，让 LLM 精选相关表，并用 `recall_context` 和逻辑外键做本地重排/补表 |
+| `infer_route_signal` | 从数据库规则或 LLM 获取复杂查询语义信号，例如 analysis/report/detail/export/sensitive |
+| `route_complexity` | 根据表数、关系数和 route signal 决定 `single_sql`、`single_sql_with_strict_checks`、`complex_plan` 或 `clarify` |
 | `sql_retrieve` | 根据表名加载完整语义模型并构建 schema docs |
 | `check_docs` | 无 schema 时直接返回用户友好错误 |
 | `sql_generate` | 用 LLM tool 生成 SQL，支持最多 3 轮自动补表 |
@@ -220,8 +227,37 @@ execute_sql -- suspicious result --> result_reflection -> safety_check -> approv
 | `execute_sql` | 通过 MCP MySQL 执行 SQL |
 | `error_analysis` | 对可重试执行错误生成修正反馈，再回到 `sql_generate` |
 | `result_reflection` | 对空集、NULL 等异常成功结果直接生成修正 SQL |
+| `complex_plan_generate` | 对超过单 SQL 预算且可拆分析的问题生成结构化计划 |
+| `approve_complex_plan` | 在执行复杂计划前让用户确认步骤、依赖和合并键 |
 
-### 6.3 query_enhance 设计
+### 6.3 recall_context 设计
+
+`recall_evidence` 是 SQL 链路唯一的业务知识和 few-shot 检索节点。它返回原始 evidence 的同时，会把可复用信息整理为结构化上下文：
+
+```python
+{
+    "query_key": "查询各个部门的年度预算总金额",
+    "business_evidence": [...],
+    "few_shot_examples": [...],
+    "business_related_tables": ["t_cost_center"],
+    "few_shot_related_tables": ["t_budget", "t_cost_center"],
+    "matched_terms": ["年度预算", "部门"],
+    "few_shot_questions": ["查询各部门年度预算总额"],
+}
+```
+
+设计约束：
+
+- 每轮 query 只调用一次 `recall_evidence`，后续节点只读 state，不再重复召回。
+- `recall_context.query_key` 必须等于当前 `rewritten_query/query`，否则视为旧 checkpoint 污染并忽略。
+- `business_related_tables` 只来自当前 query 命中 `term/synonyms` 的业务知识；召回到但未命中的业务知识只保留在原始 evidence 中，不参与选表合并。
+- `few_shot_related_tables` 只来自与当前 query 有足够词面重叠的 few-shot 示例，避免相似度召回噪声把无关表带入关系查询。
+- `select_tables` 使用 `business_related_tables`、`few_shot_related_tables`、`matched_terms` 和 `few_shot_questions` 做表合并、表重排和字段提示打分。
+- `sql_generate` 仍使用原始 evidence/few-shot，保证 prompt 可读；`recall_context` 主要服务于链路可解释和选表稳定性。
+
+这解决了原来 `_ranking_terms()` 只靠中文 n-gram 的问题：字面匹配仍作为 fallback，但优先使用业务知识和 few-shot 召回出来的语义证据。
+
+### 6.4 query_enhance 设计
 
 `query_enhance` 不做 query-specific 硬编码。它只使用召回到的业务知识：
 
@@ -239,7 +275,38 @@ execute_sql -- suspicious result --> result_reflection -> safety_check -> approv
 
 业务词新增方式是维护 `t_business_knowledge.term/synonyms/formula`，不是改代码。
 
-### 6.4 SQL 输出格式化
+### 6.5 select_tables 设计
+
+`select_tables` 不把完整 schema 提前交给 LLM。它先读取表说明和当前 query 命中的少量字段提示，构建轻量 table routing profile：
+
+```text
+- t_budget: 预算管理表 | 匹配字段: budget_amount(预算金额/预算额度)；cost_center_id(成本中心ID/部门/-> t_cost_center.id)
+- t_cost_center: 成本中心表 | 匹配字段: annual_budget(年度预算/全年预算)；department_id(关联部门ID/-> t_department.id)
+```
+
+随后执行三步治理：
+
+1. 用 LLM 在候选表画像中精选表。
+2. 合并 `recall_context` 中业务知识和 few-shot 指向的相关表。
+3. 基于 `t_semantic_model.is_fk/ref_table/ref_column` 做链式逻辑外键补表和本地语义重排。
+
+完整字段类型、完整字段列表和 JOIN 关系只在 `sql_retrieve -> sql_generate` 阶段按已选表加载，避免把 SQL 生成的 token 压力前移到选表阶段。
+
+### 6.6 复杂查询路由
+
+复杂度路由不在 Python 里硬编码业务关键词，只使用结构信号和外部语义信号：
+
+```text
+<= 5 张表：single_sql
+6-8 张表：single_sql_with_strict_checks
+> 8 张表：根据 route_signal 进入 complex_plan 或 clarify
+```
+
+`route_signal` 来自数据库规则或 LLM 仲裁。`analysis/report/comparison` 可进入 `complex_plan`，`detail/export/sensitive/ambiguous` 走 `clarify`。复杂计划必须通过 `validate_complex_plan()`，校验步骤数、表白名单、依赖关系、SQL 子任务表数和 `merge_keys`，再进入用户确认。
+
+当前复杂计划链路已完成路由、计划生成、计划校验和审批占位。多 SQL 分步执行会复用现有 SQL 生成、安全检查和审批能力继续迭代。
+
+### 6.7 SQL 输出格式化
 
 LLM 通过 `sql_format_response` tool 返回：
 
@@ -264,7 +331,7 @@ LLM 通过 `sql_format_response` tool 返回：
 
 `sql_generate` 和 `result_reflection` 都必须经过该格式化器，不能只依赖 LLM tool schema。
 
-### 6.5 执行结果反思
+### 6.8 执行结果反思
 
 SQL 执行成功不等于结果可信。`_result_anomaly_reason()` 会识别：
 
@@ -374,8 +441,8 @@ preprocess -> rewrite -> retrieve -> construct_messages -> chat -> END
 |------|------|
 | 表名、表描述 | `select_tables` 候选表选择 |
 | 字段名、类型、注释 | SQL 物理字段生成 |
-| 业务名、同义词、描述 | 业务含义理解 |
-| PK/FK、逻辑外键 | JOIN 关系提示 |
+| 业务名、同义词、描述 | 选表轻量字段提示 + SQL 生成业务含义理解 |
+| PK/FK、逻辑外键 | 链式补表、桥接表发现、JOIN 关系提示 |
 
 `sql_retrieve` 从该表构建 schema docs，不再依赖 Milvus schema 索引。
 
@@ -389,7 +456,8 @@ preprocess -> rewrite -> retrieve -> construct_messages -> chat -> END
 | SQL 执行失败 | `is_retryable()` 决定是否 `error_analysis -> sql_generate` |
 | SQL 执行成功但结果异常 | `_result_anomaly_reason()` 触发 `result_reflection` |
 | approve 后 query 丢失 | Session `_pending_query` 用于最终 Q&A 保存 |
-| approve 后并发写 query | `query: Annotated[..., keep_existing_query]` |
+| approve 后并发写 query | `query/rewritten_query: Annotated[..., latest_non_empty]` |
+| checkpoint 中召回上下文污染 | `recall_context.query_key` 与当前 `rewritten_query/query` 不一致时忽略；部署结构变更后清理旧 checkpoint |
 | 检索/LLM 慢或失败 | resilience 配置的 timeout 和 retry |
 
 ## 11. 时序图
@@ -410,9 +478,10 @@ sequenceDiagram
     U->>API: POST /api/query/invoke
     API->>G: initial_state
     G->>S: SQL React subgraph
-    S->>S: contextualize_query
-    S->>S: recall_evidence + query_enhance
-    S->>S: select_tables + sql_retrieve
+    S->>S: recall_evidence -> recall_context
+    S->>S: query_enhance(reuse recall_context)
+    S->>S: select_tables(reuse recall_context) + route_complexity
+    S->>S: sql_retrieve
     S->>LLM: sql_generate
     LLM-->>S: tool call SQL
     S->>S: normalize_sql_answer + safety_check
@@ -444,7 +513,7 @@ sequenceDiagram
 
 | 文件 | 覆盖 |
 |------|------|
-| `tests/test_sql_react.py` | query_enhance、SQL 格式化、结果异常检测、result_reflection、图节点、query reducer |
+| `tests/test_sql_react.py` | query_enhance、recall_context、轻量选表画像、链式补表、SQL 格式化、结果异常检测、result_reflection、图节点、query reducer |
 | `tests/test_final_api.py` | query invoke、approve resume、approve SSE |
 | `tests/test_rag_e2e.py` | RAG 端到端流程 |
 | `tests/test_api.py` | API 基础行为 |

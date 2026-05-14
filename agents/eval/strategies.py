@@ -29,10 +29,11 @@ def _docs_to_ids(docs: list[Document]) -> list[str]:
 
 
 async def run_preselect_pipeline(query: str) -> StrategyRunResult:
-    """Run recall_evidence -> query_enhance -> select_tables.
+    """Run recall_evidence -> recall_context -> query_enhance -> select_tables.
 
     This evaluates the table-selection path as it is used before SQL
-    generation, including business knowledge driven query enhancement.
+    generation, including single-call evidence recall, structured recall
+    context reuse, and business knowledge driven query enhancement.
     """
     from agents.model.chat_model import init_chat_models
     from agents.flow.sql_react import recall_evidence, query_enhance, select_tables

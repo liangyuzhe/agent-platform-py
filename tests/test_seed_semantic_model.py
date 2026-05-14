@@ -9,6 +9,9 @@ from scripts.seed_semantic_model import (
 def test_management_tables_have_visible_table_semantics():
     comments = table_visible_semantics()
 
+    assert "预算金额" in comments["t_budget"]
+    assert "成本中心" in comments["t_budget"]
+    assert "年度预算" in comments["t_cost_center"]
     assert "真实姓名" in comments["t_user"]
     assert "联系电话" in comments["t_user"]
     assert "角色名称" in comments["t_role"]

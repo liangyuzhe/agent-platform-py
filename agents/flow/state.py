@@ -50,6 +50,7 @@ class SQLReactState(TypedDict):
     plan_execution_results: dict                 # step_id -> result/error/sql
     evidence: list[str]                          # 业务知识检索结果
     few_shot_examples: list[str]                 # SQL Q&A few-shot 参考
+    recall_context: dict                         # 单次召回后的结构化上下文，供后续节点复用
     docs: list[Document]                         # 检索到的表结构（从 t_semantic_model 构建）
     semantic_model: dict                         # {table_name: {column_name: row_dict}}
     sql: str                                     # 生成的 SQL

@@ -156,7 +156,7 @@ class _AsyncStrategyRetriever:
 
 
 class _PreselectPipelineRetriever:
-    """Sync wrapper for recall_evidence -> query_enhance -> select_tables."""
+    """Sync wrapper for recall_evidence -> recall_context -> query_enhance -> select_tables."""
 
     def retrieve_ids(self, query: str) -> tuple[list[str], float]:
         from agents.eval.strategies import run_preselect_pipeline
@@ -365,7 +365,7 @@ def run_evaluation(
                 2,
                 StrategyConfig(
                     name="preselect_pipeline",
-                    description="Online pre-selection path: recall_evidence -> query_enhance -> select_tables",
+                    description="Online pre-selection path: recall_evidence -> recall_context -> query_enhance -> select_tables",
                     retrieve_k=20,
                     reranker_top_k=10,
                     mode="preselect_pipeline",

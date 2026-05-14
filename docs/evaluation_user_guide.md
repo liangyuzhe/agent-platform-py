@@ -7,7 +7,7 @@
 | 类型 | 命令 | 是否调用 Agent | 是否执行 SQL | 主要用途 |
 |------|------|----------------|--------------|----------|
 | Retrieval 评测 | `generate` + `run` | 默认否 | 否 | 衡量 schema、业务知识、few-shot 召回质量 |
-| 线上预选链路评测 | `run --include-online-pipeline` | 是 | 否 | 衡量 `recall_evidence -> query_enhance -> select_tables` 是否选对表 |
+| 线上预选链路评测 | `run --include-online-pipeline` | 是 | 否 | 衡量 `recall_evidence -> recall_context -> query_enhance -> select_tables` 是否选对表 |
 | 离线 NL2SQL 评测 | `run-nl2sql` | 否 | 否 | 评测已记录 SQL/结果样本 |
 | 在线 NL2SQL 评测 | `run-online-nl2sql` | 是 | 可选 | 真实回放 NL2SQL Agent，记录 SQL、结果和延迟 |
 
@@ -52,7 +52,7 @@ python -m agents.eval.cli run \
   --include-online-pipeline
 ```
 
-注意：`--include-online-pipeline` 会调用 `query_enhance` 和 `select_tables` 的 LLM。
+注意：`--include-online-pipeline` 会调用真实线上预选链路。`recall_evidence` 每条 query 只执行一次，并把业务知识、few-shot、相关表和匹配术语整理进 `recall_context`；`query_enhance` 和 `select_tables` 复用这份 state。该链路仍会调用 `query_enhance` 和 `select_tables` 的 LLM。
 
 最近一次全量线上预选链路评测结果（45 条，2026-05-13）：
 
@@ -62,6 +62,8 @@ python -m agents.eval.cli run \
 | `preselect_pipeline` | 96.67% | 88.89% | 94.07% | 7426.8 / 10541.4 ms |
 
 管理表专项线上评测（12 条）中，`preselect_pipeline Recall@5 = 100%`、`MRR = 100%`。专项数据只用于验证用户/角色/部门等管理表问题，不代表全量业务指标。
+
+第 12 条“查询各个部门的年度预算总金额”是最近一次重点回归样本。修复后 `recall_context` 能从业务知识/few-shot 中拿到 `t_cost_center`、`t_budget` 等表证据，`select_tables` 再通过轻量字段画像和逻辑外键补齐 `t_department`。该样本本地切片复测 Top3/Top5 均完整命中标准相关表。
 
 ## 2. 离线 NL2SQL 评测
 

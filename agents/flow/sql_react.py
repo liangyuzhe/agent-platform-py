@@ -18,7 +18,6 @@ from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
-from agents.rag.query_rewrite import rewrite_query
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.tool.storage.query_route_rules import evaluate_query_route_rules
 from agents.config.settings import settings
@@ -309,25 +308,102 @@ def _parse_business_evidence(evidence: list[str]) -> list[dict[str, str | list[s
     return entries
 
 
-def _business_evidence_matches_query(entry: dict[str, str | list[str]], query: str) -> bool:
+_SQL_TABLE_RE = re.compile(r"\b(?:FROM|JOIN)\s+`?([a-zA-Z_][\w]*)`?", re.IGNORECASE)
+
+
+def _unique_ordered(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _tables_from_few_shot_examples(few_shot_examples: list[str]) -> list[str]:
+    tables = []
+    for item in few_shot_examples:
+        for table in _SQL_TABLE_RE.findall(item or ""):
+            tables.append(table)
+    return _unique_ordered(tables)
+
+
+def _business_entry_matches_query(entry: dict[str, str | list[str]], query: str) -> bool:
     aliases = [str(entry.get("term") or ""), *entry.get("synonyms", [])]  # type: ignore[list-item]
     return any(alias and alias in query for alias in aliases)
 
 
-def _related_tables_from_business_evidence(
-    evidence: list[str],
-    candidate_tables: list[str],
-    query: str = "",
-) -> list[str]:
-    candidate_set = set(candidate_tables)
-    related = []
-    for entry in _parse_business_evidence(evidence):
-        if query and not _business_evidence_matches_query(entry, query):
+def _few_shot_matches_query(example: str, query: str) -> bool:
+    question = ""
+    for line in (example or "").splitlines():
+        question = _label_value(line.strip(), ("问题", "Query"))
+        if question:
+            break
+    if not question:
+        return False
+    query_terms = {term for term in _ranking_terms(query) if len(term) >= 2}
+    question_terms = {term for term in _ranking_terms(question) if len(term) >= 2}
+    overlap = query_terms & question_terms
+    return sum(len(term) for term in overlap) >= 4
+
+
+def _tables_from_matched_few_shot_examples(few_shot_examples: list[str], query: str) -> list[str]:
+    tables = []
+    for item in few_shot_examples:
+        if not _few_shot_matches_query(item, query):
             continue
+        for table in _SQL_TABLE_RE.findall(item or ""):
+            tables.append(table)
+    return _unique_ordered(tables)
+
+
+def _questions_from_few_shot_examples(few_shot_examples: list[str]) -> list[str]:
+    questions = []
+    for item in few_shot_examples:
+        for line in (item or "").splitlines():
+            value = _label_value(line.strip(), ("问题", "Query"))
+            if value:
+                questions.append(value)
+                break
+    return _unique_ordered(questions)
+
+
+def _build_recall_context(query: str, evidence: list[str], few_shot_examples: list[str]) -> dict:
+    business_entries = _parse_business_evidence(evidence)
+    matched_terms = []
+    business_related_tables = []
+    for entry in business_entries:
+        if not _business_entry_matches_query(entry, query):
+            continue
+        term = str(entry.get("term") or "")
+        if term:
+            matched_terms.append(term)
         for table in entry.get("related_tables", []):  # type: ignore[union-attr]
-            if table in candidate_set and table not in related:
-                related.append(table)
-    return related
+            business_related_tables.append(str(table))
+
+    return {
+        "query_key": query,
+        "business_evidence": evidence,
+        "few_shot_examples": few_shot_examples,
+        "business_related_tables": _unique_ordered(business_related_tables),
+        "few_shot_related_tables": _tables_from_matched_few_shot_examples(few_shot_examples, query),
+        "matched_terms": _unique_ordered(matched_terms),
+        "few_shot_questions": _questions_from_few_shot_examples(few_shot_examples),
+    }
+
+
+def _recall_context_for_query(state: SQLReactState, query: str) -> dict:
+    context = state.get("recall_context") or {}
+    if not isinstance(context, dict):
+        return {}
+    context_query = state.get("rewritten_query") or state.get("query", "")
+    if context.get("query_key") != context_query:
+        return {}
+    return context
+
+
+def _filter_candidate_tables(tables: list[str], candidate_tables: list[str]) -> list[str]:
+    candidate_set = set(candidate_tables)
+    return [table for table in _unique_ordered(tables) if table in candidate_set]
 
 
 def _merge_selected_tables(selected: list[str], evidence_tables: list[str]) -> list[str]:
@@ -362,35 +438,59 @@ def _expand_selected_tables_by_semantic_relationships(
     selected: list[str],
     candidate_tables: list[str],
     semantic_model: dict,
+    query: str = "",
+    table_metadata: dict[str, str] | None = None,
+    recall_context: dict | None = None,
 ) -> list[str]:
     """Add join tables and endpoint tables using FK metadata from t_semantic_model."""
     selected_set = set(selected)
     candidate_set = set(candidate_tables)
     expanded = list(selected)
     edges = _semantic_fk_edges(semantic_model)
+    table_metadata = table_metadata or {}
+    recall_context = recall_context or {}
 
     def append(table: str) -> None:
         if table in candidate_set and table not in expanded:
             expanded.append(table)
             selected_set.add(table)
 
-    # If a selected relation table references another candidate table, keep the
-    # endpoint so SQL generation has enough schema to build the join.
-    for edge in edges:
-        if edge["from_table"] in selected_set:
-            append(edge["to_table"])
-
-    # If two selected tables are connected through an unselected bridge table,
-    # keep that bridge table. This is driven by semantic FK metadata, not by
-    # business keyword rules.
     refs_by_from: dict[str, set[str]] = {}
     for edge in edges:
         refs_by_from.setdefault(edge["from_table"], set()).add(edge["to_table"])
-    for bridge, refs in refs_by_from.items():
-        if bridge in selected_set or bridge not in candidate_set:
-            continue
-        if len(refs & selected_set) >= 2:
-            append(bridge)
+
+    changed = True
+    while changed:
+        changed = False
+
+        # If a selected relation table references another candidate table, keep
+        # the endpoint when that edge is relevant to the user query. Running this
+        # as a closure avoids order-dependent one-hop expansion.
+        for edge in edges:
+            before = len(expanded)
+            if edge["from_table"] in selected_set and _edge_relevant_to_query(edge, query, table_metadata, semantic_model):
+                append(edge["to_table"])
+            changed = changed or len(expanded) > before
+
+        # If two selected tables are connected through an unselected bridge
+        # table, keep that bridge table. This is driven by semantic FK metadata,
+        # not by business keyword rules.
+        for bridge, refs in refs_by_from.items():
+            before = len(expanded)
+            if (
+                bridge not in selected_set
+                and bridge in candidate_set
+                and len(refs & selected_set) >= 2
+                and (
+                    _table_recall_context_score(bridge, recall_context) > 0
+                    or (
+                        _is_relation_table(bridge, semantic_model)
+                        and _table_relevant_to_query_or_context(bridge, query, table_metadata, semantic_model, recall_context)
+                    )
+                )
+            ):
+                append(bridge)
+            changed = changed or len(expanded) > before
 
     return expanded
 
@@ -447,17 +547,207 @@ def _table_semantic_score(table: str, query: str, table_metadata: dict[str, str]
     return float(score)
 
 
+def _table_recall_context_score(table: str, recall_context: dict) -> float:
+    score = 0.0
+    if table in recall_context.get("business_related_tables", []):
+        score += 18
+    if table in recall_context.get("few_shot_related_tables", []):
+        score += 14
+    return score
+
+
+_ROUTING_PROFILE_MAX_FIELDS_PER_TABLE = 3
+_ROUTING_PROFILE_MIN_FIELD_SCORE = 4.0
+
+
+def _column_semantic_phrases(meta: dict) -> list[str]:
+    phrases = [
+        str(meta.get("business_name") or ""),
+        str(meta.get("column_comment") or ""),
+        *_split_terms(str(meta.get("synonyms") or "")),
+    ]
+    return [phrase for phrase in phrases if phrase]
+
+
+def _column_semantic_text(column_name: str, meta: dict) -> str:
+    parts = [
+        column_name,
+        str(meta.get("column_comment") or ""),
+        str(meta.get("business_name") or ""),
+        str(meta.get("synonyms") or ""),
+        str(meta.get("business_description") or ""),
+    ]
+    ref_table = str(meta.get("ref_table") or "")
+    ref_column = str(meta.get("ref_column") or "")
+    if ref_table:
+        parts.append(f"{ref_table}.{ref_column}" if ref_column else ref_table)
+    return "\n".join(part for part in parts if part)
+
+
+def _column_semantic_score(column_name: str, meta: dict, query: str) -> float:
+    query_terms = _ranking_terms(query)
+    if not query_terms:
+        return 0.0
+
+    column_terms = _ranking_terms(_column_semantic_text(column_name, meta))
+    overlap = query_terms & column_terms
+    score = sum(max(1, len(term)) for term in overlap)
+
+    query_chunks = {term for term in query_terms if len(term) >= 2}
+    for phrase in _column_semantic_phrases(meta):
+        if phrase in query:
+            score += 8 + min(len(phrase), 8)
+        else:
+            score += sum(4 + len(term) for term in query_chunks if term in phrase)
+    return float(score)
+
+
+def _column_recall_context_score(column_name: str, meta: dict, recall_context: dict) -> float:
+    terms = [
+        *[str(term) for term in recall_context.get("matched_terms", [])],
+        *[str(question) for question in recall_context.get("few_shot_questions", [])],
+    ]
+    if not terms:
+        return 0.0
+    text = _column_semantic_text(column_name, meta)
+    score = 0.0
+    for term in terms:
+        if not term:
+            continue
+        if term in text:
+            score += 16 + min(len(term), 8)
+            continue
+        term_parts = _ranking_terms(term)
+        field_terms = _ranking_terms(text)
+        overlap = {part for part in term_parts & field_terms if len(part) >= 2}
+        score += sum(3 + len(part) for part in overlap)
+    return score
+
+
+def _format_routing_field_hint(column_name: str, meta: dict) -> str:
+    labels = []
+    business_name = str(meta.get("business_name") or "").strip()
+    column_comment = str(meta.get("column_comment") or "").strip()
+    synonyms = _split_terms(str(meta.get("synonyms") or ""))
+    ref_table = str(meta.get("ref_table") or "").strip()
+    ref_column = str(meta.get("ref_column") or "").strip()
+
+    if business_name:
+        labels.append(business_name)
+    elif column_comment:
+        labels.append(column_comment)
+    labels.extend(synonyms[:2])
+    if ref_table:
+        labels.append(f"-> {ref_table}.{ref_column}" if ref_column else f"-> {ref_table}")
+
+    unique_labels = list(dict.fromkeys(labels))
+    return f"{column_name}({'/'.join(unique_labels)})" if unique_labels else column_name
+
+
+def _matched_routing_field_hints(
+    table: str,
+    query: str,
+    semantic_model: dict,
+    recall_context: dict | None = None,
+    limit: int = _ROUTING_PROFILE_MAX_FIELDS_PER_TABLE,
+) -> list[str]:
+    recall_context = recall_context or {}
+    scored = []
+    for index, (column_name, meta) in enumerate((semantic_model.get(table) or {}).items()):
+        score = _column_semantic_score(str(column_name), meta or {}, query)
+        score += _column_recall_context_score(str(column_name), meta or {}, recall_context)
+        if score < _ROUTING_PROFILE_MIN_FIELD_SCORE:
+            continue
+        if (meta or {}).get("ref_table") and str((meta or {}).get("ref_table")) != table:
+            score += 8
+        scored.append((score, -index, _format_routing_field_hint(str(column_name), meta or {})))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [hint for _, _, hint in scored[:limit]]
+
+
+def _build_table_routing_profiles(
+    candidate_tables: list[str],
+    table_metadata: dict[str, str],
+    semantic_model: dict,
+    query: str,
+    recall_context: dict | None = None,
+) -> str:
+    """Render compact table-selection hints without sending full field schema."""
+    lines = []
+    for table in candidate_tables:
+        desc = table_metadata.get(table, "")
+        line = f"- {table}: {desc}" if desc else f"- {table}"
+        field_hints = _matched_routing_field_hints(table, query, semantic_model, recall_context=recall_context)
+        if field_hints:
+            line += " | 匹配字段: " + "；".join(field_hints)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _edge_relevant_to_query(edge: dict[str, str], query: str, table_metadata: dict[str, str], semantic_model: dict) -> bool:
+    if not query:
+        return True
+
+    from_table = edge["from_table"]
+    from_column = edge["from_column"]
+    to_table = edge["to_table"]
+    meta = (semantic_model.get(from_table) or {}).get(from_column) or {}
+
+    if _column_semantic_score(from_column, meta, query) >= _ROUTING_PROFILE_MIN_FIELD_SCORE:
+        return True
+    if _table_semantic_score(to_table, query, table_metadata, semantic_model) >= _ROUTING_PROFILE_MIN_FIELD_SCORE:
+        return True
+    return False
+
+
+def _table_relevant_to_query_or_context(
+    table: str,
+    query: str,
+    table_metadata: dict[str, str],
+    semantic_model: dict,
+    recall_context: dict | None = None,
+) -> bool:
+    recall_context = recall_context or {}
+    if _table_recall_context_score(table, recall_context) > 0:
+        return True
+    return _table_semantic_score(table, query, table_metadata, semantic_model) >= _ROUTING_PROFILE_MIN_FIELD_SCORE
+
+
+def _is_relation_table(table: str, semantic_model: dict) -> bool:
+    columns = semantic_model.get(table) or {}
+    if not columns:
+        return False
+    non_system_columns = [
+        str(column)
+        for column in columns
+        if str(column) not in {"id", "created_at", "updated_at"}
+    ]
+    if not non_system_columns:
+        return False
+    fk_columns = [
+        str(column)
+        for column, meta in columns.items()
+        if str((meta or {}).get("is_fk")).lower() in {"1", "true", "yes", "y", "是"}
+        and str(column) in non_system_columns
+    ]
+    return len(fk_columns) >= 2 and len(non_system_columns) <= len(fk_columns) + 2
+
+
 def _rerank_selected_tables(
     selected: list[str],
     query: str,
     table_metadata: dict[str, str],
     semantic_model: dict,
     evidence_tables: list[str],
+    recall_context: dict | None = None,
 ) -> list[str]:
+    recall_context = recall_context or {}
     evidence_set = set(evidence_tables)
     indexed = []
     for index, table in enumerate(selected):
         score = _table_semantic_score(table, query, table_metadata, semantic_model)
+        score += _table_recall_context_score(table, recall_context)
         if table in evidence_set:
             score += 10
         indexed.append((score, -index, table))
@@ -486,51 +776,6 @@ def _heuristic_enhance_query(query: str, evidence: list[str]) -> str:
         enhanced = f"{enhanced}（业务口径: {'; '.join(additions)}）"
 
     return enhanced or query
-
-
-async def contextualize_query(state: SQLReactState, config=None) -> dict:
-    """利用对话历史将代词化查询重写为独立查询。
-
-    如果 rewritten_query 已由外层 classify 提供，直接复用，跳过 LLM 调用。
-    """
-    # 外层已重写，跳过
-    existing = state.get("rewritten_query", "")
-    if existing:
-        return {"rewritten_query": existing}
-
-    query = state.get("query", "")
-    chat_history = state.get("chat_history", [])
-
-    if not chat_history:
-        return {"rewritten_query": query}
-
-    # 提取最近对话摘要和历史
-    summary = ""
-    history_dicts = []
-    for h in chat_history:
-        if h.get("role") == "system" and h.get("content", "").startswith("[对话摘要]"):
-            summary = h["content"].replace("[对话摘要] ", "")
-        else:
-            history_dicts.append(h)
-
-    if not history_dicts:
-        return {"rewritten_query": query}
-
-    try:
-        rewritten = await asyncio.wait_for(
-            rewrite_query(
-                summary=summary,
-                history=history_dicts[-6:],  # 最近 3 轮
-                query=query,
-                config=config,
-            ),
-            timeout=settings.resilience.llm_rewrite_timeout,
-        )
-        logger.info("contextualize_query: '%s' -> '%s'", query, rewritten)
-        return {"rewritten_query": rewritten}
-    except Exception as e:
-        logger.warning("Query contextualization failed, using original: %s", e)
-        return {"rewritten_query": query}
 
 
 async def query_enhance(state: SQLReactState, config=None) -> dict:
@@ -617,10 +862,13 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
 
     candidate_tables = [m["table_name"] for m in metadata_list]
     table_metadata = {m["table_name"]: m.get("table_comment", "") for m in metadata_list}
-    evidence_tables = _related_tables_from_business_evidence(
-        state.get("evidence", []),
+    recall_context = _recall_context_for_query(state, query)
+    evidence_tables = _filter_candidate_tables(
+        [
+            *recall_context.get("business_related_tables", []),
+            *recall_context.get("few_shot_related_tables", []),
+        ],
         candidate_tables,
-        query,
     )
     semantic_model = {}
     try:
@@ -641,8 +889,22 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
     # Stage 2: 候选少于等于 3 个，直接使用（省一次 LLM 调用）
     if len(candidate_tables) <= 3:
         selected = _merge_selected_tables(candidate_tables, evidence_tables)
-        selected = _expand_selected_tables_by_semantic_relationships(selected, candidate_tables, semantic_model)
-        selected = _rerank_selected_tables(selected, query, table_metadata, semantic_model, evidence_tables)
+        selected = _expand_selected_tables_by_semantic_relationships(
+            selected,
+            candidate_tables,
+            semantic_model,
+            query=query,
+            table_metadata=table_metadata,
+            recall_context=recall_context,
+        )
+        selected = _rerank_selected_tables(
+            selected,
+            query,
+            table_metadata,
+            semantic_model,
+            evidence_tables,
+            recall_context=recall_context,
+        )
         relationships = []
         try:
             relationships = await asyncio.wait_for(
@@ -665,27 +927,27 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
 
-    names_with_desc = []
-    for t in candidate_tables:
-        desc = table_metadata.get(t, "")
-        if desc:
-            names_with_desc.append(f"- {t}: {desc}")
-        else:
-            names_with_desc.append(f"- {t}")
-    names_text = "\n".join(names_with_desc)
+    names_text = _build_table_routing_profiles(
+        candidate_tables,
+        table_metadata,
+        semantic_model,
+        query,
+        recall_context=recall_context,
+    )
 
     response = await model.ainvoke(
         [
             SystemMessage(content=f"""你是一个数据库专家。根据用户的问题，从候选表名中选出需要用到的表。
 
-候选表名:
+候选表路由画像（只包含表说明和与当前问题匹配的少量字段提示，不是完整 schema）:
 {names_text}
 
 要求：
 1. 只返回需要用到的表名，用逗号分隔
 2. 如果需要多表关联，选出所有涉及的表
 3. 如果问题与数据库无关（如闲聊），返回空
-4. 只返回表名，不要其他内容"""),
+4. 字段提示只用于判断表是否相关，生成 SQL 前会按已选表加载完整 schema
+5. 只返回表名，不要其他内容"""),
             HumanMessage(content=query),
         ],
         config=child_trace_config(config, "sql.select_tables.llm", tags=["llm", "sql_react"]),
@@ -699,8 +961,22 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
         if not selected:
             selected = candidate_tables
     selected = _merge_selected_tables(selected, evidence_tables)
-    selected = _expand_selected_tables_by_semantic_relationships(selected, candidate_tables, semantic_model)
-    selected = _rerank_selected_tables(selected, query, table_metadata, semantic_model, evidence_tables)
+    selected = _expand_selected_tables_by_semantic_relationships(
+        selected,
+        candidate_tables,
+        semantic_model,
+        query=query,
+        table_metadata=table_metadata,
+        recall_context=recall_context,
+    )
+    selected = _rerank_selected_tables(
+        selected,
+        query,
+        table_metadata,
+        semantic_model,
+        evidence_tables,
+        recall_context=recall_context,
+    )
 
     relationships = []
     try:
@@ -956,7 +1232,11 @@ async def recall_evidence(state: SQLReactState, config=None) -> dict:
     # 并行检索，耗时 = max(单个) 而非 sum
     evidence, few_shot = await asyncio.gather(_recall_business(), _recall_agent())
 
-    return {"evidence": evidence, "few_shot_examples": few_shot}
+    return {
+        "evidence": evidence,
+        "few_shot_examples": few_shot,
+        "recall_context": _build_recall_context(query, evidence, few_shot),
+    }
 
 
 
@@ -1540,11 +1820,10 @@ async def result_reflection(state: SQLReactState, config=None) -> dict:
 def build_sql_react_graph():
     """构建 SQL React 图，支持自动纠错重试。
 
-    流程: contextualize_query → recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → generate → ...
+    流程: recall_evidence → query_enhance → select_tables → sql_retrieve → check_docs → generate → ...
     """
     graph = StateGraph(SQLReactState)
 
-    graph.add_node("contextualize_query", contextualize_query)
     graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("query_enhance", query_enhance)
     graph.add_node("select_tables", select_tables)
@@ -1562,8 +1841,7 @@ def build_sql_react_graph():
     graph.add_node("error_analysis", error_analysis)
     graph.add_node("result_reflection", result_reflection)
 
-    graph.add_edge(START, "contextualize_query")
-    graph.add_edge("contextualize_query", "recall_evidence")
+    graph.add_edge(START, "recall_evidence")
     graph.add_edge("recall_evidence", "query_enhance")
     graph.add_edge("query_enhance", "select_tables")
     graph.add_edge("select_tables", "infer_route_signal")

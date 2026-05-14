@@ -28,6 +28,16 @@ def get_conn():
 
 
 _TABLE_VISIBLE_SEMANTICS = {
+    "t_account": "会计科目表，包含科目编码、科目名称、科目类型、余额方向和启用状态",
+    "t_cost_center": "成本中心/部门预算责任中心表，包含成本中心名称、部门映射、负责人和年度预算",
+    "t_journal_entry": "记账凭证主表，包含凭证号、凭证日期、会计期间、凭证状态、制单人和审核人",
+    "t_journal_item": "凭证分录明细表，包含科目、摘要、借方金额、贷方金额、成本中心和项目编码",
+    "t_budget": "预算管理表，包含预算年度、预算月份、成本中心、会计科目、预算金额、实际金额和审批状态",
+    "t_invoice": "发票管理表，包含发票号码、发票方向、开票日期、购销方、税额、价税合计、认证状态和关联凭证",
+    "t_receivable_payable": "应收应付表，包含往来单位、原始金额、已结金额、状态、到期日、关联发票和核销凭证",
+    "t_expense_claim": "费用报销表，包含报销人、部门、成本中心、费用类型、报销总额、审批金额和报销状态",
+    "t_fixed_asset": "固定资产表，包含资产名称、资产类别、购入日期、原值、折旧、存放地点和成本中心",
+    "t_fund_transfer": "资金划转记录表，包含划转单号、划转日期、转出账户、转入账户、金额、申请人和审批状态",
     "t_user": "用户/员工账号信息表，包含真实姓名、联系电话、邮箱、注册时间、账号状态",
     "t_role": "系统角色信息表，包含角色名称、角色编码、角色状态和创建时间",
     "t_user_role": "用户角色绑定关系表，关联用户与系统角色，用于查询用户拥有哪些角色",
@@ -312,7 +322,7 @@ def seed_data(conn):
 
 
 def clear_table_metadata_cache():
-    """Clear table metadata cache so select_tables sees updated comments."""
+    """Clear schema caches so select_tables sees updated comments and FKs."""
     try:
         import redis as redis_mod
         addr = settings.redis.addr
@@ -325,8 +335,11 @@ def clear_table_metadata_cache():
             decode_responses=True,
             socket_timeout=2,
         )
-        client.delete("schema:table_metadata")
-        print("Cleared Redis schema:table_metadata cache")
+        deleted = client.delete("schema:table_metadata")
+        semantic_keys = list(client.scan_iter("schema:semantic_model:*"))
+        if semantic_keys:
+            deleted += client.delete(*semantic_keys)
+        print(f"Cleared {deleted} Redis schema cache keys")
     except Exception as e:
         print(f"Skipped Redis table metadata cache clear: {e}")
 

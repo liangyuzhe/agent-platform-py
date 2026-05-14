@@ -198,11 +198,11 @@ python -m agents.eval.cli run --dataset data/eval/eval_dataset.jsonl --output da
 | `schema_table_name` | 只基于表名做召回 | 对照组，用于判断字段业务描述是否带来收益 |
 | `business_knowledge_recall` | 单独评测业务知识召回 | 仅当数据集包含 `relevant_business_doc_ids` 时计算 |
 | `agent_knowledge_recall` | 单独评测 SQL few-shot 示例召回 | 仅当数据集包含 `relevant_agent_doc_ids` 时计算 |
-| `preselect_pipeline` | 执行线上选表前置链路：`recall_evidence -> query_enhance -> select_tables` | 显式开启后评测真实 NL2SQL 选表路径 |
+| `preselect_pipeline` | 执行线上选表前置链路：`recall_evidence -> recall_context -> query_enhance -> select_tables` | 显式开启后评测真实 NL2SQL 选表路径 |
 
 `business_knowledge_recall` 和 `agent_knowledge_recall` 发生在选表之前，它们不是直接选择 schema 表，而是给 `query_enhance` 和后续 SQL 生成提供业务定义、公式、few-shot 示例。因此这两个策略不会拿 `relevant_doc_ids` 强行计算 schema 召回率，只有数据集显式标注了 `relevant_business_doc_ids` 或 `relevant_agent_doc_ids` 时才参与指标计算；没有对应标注时报告里会显示该策略 `num_queries = 0`。
 
-`preselect_pipeline` 是更贴近线上流程的 schema 召回评测：先召回业务知识和 few-shot，再做 query 增强，最后调用 `select_tables` 产出表名，并转换成 `schema_<table_name>` 与 `relevant_doc_ids` 对比。它会走 LLM 选表节点，因此默认不启用，避免普通本地评测消耗 LLM token。需要评测线上预选链路时显式增加参数：
+`preselect_pipeline` 是更贴近线上流程的 schema 召回评测：先由 `recall_evidence` 召回业务知识和 few-shot，并整理为 `recall_context`；后续 `query_enhance` 与 `select_tables` 复用同一份状态，不在选表阶段重复召回；最后把 `select_tables` 产出的表名转换成 `schema_<table_name>` 与 `relevant_doc_ids` 对比。它会走 LLM 选表节点，因此默认不启用，避免普通本地评测消耗 LLM token。需要评测线上预选链路时显式增加参数：
 
 ```bash
 python -m agents.eval.cli run \
@@ -221,6 +221,19 @@ python -m agents.eval.cli run \
 | `preselect_pipeline` | 96.67% | 88.89% | 84.93% | 94.07% | 94.13% | 7545.6 ms | 7426.8 ms | 10541.4 ms |
 
 管理表专项评测（`management_eval_dataset.jsonl`，12 条）中，`preselect_pipeline` 的 `Recall@5 = 100%`、`MRR = 100%`。该结果只说明用户/角色/部门等管理表链路已被修复，不能替代全量业务集指标。
+
+Iteration 41 后，线上预选链路的证据流转方式发生了变化，但指标计算口径不变：
+
+```text
+query
+  -> recall_evidence: business knowledge + few-shot，只调用一次
+  -> recall_context: 相关表、匹配术语、few-shot 问题
+  -> query_enhance: 使用 recall_context.evidence
+  -> select_tables: 使用轻量 table routing profile + recall_context 加权 + 逻辑外键补表
+  -> retrieved_doc_ids: schema_<table_name>
+```
+
+因此 `Recall@5` 仍然表示 Top5 是否包含标准相关表；变化只在召回证据如何被线上选表链路复用。
 
 旧版通用文档检索策略（Milvus/ES/RRF）默认不再运行，因为 schema 评测集标注的是 `schema_<table>`，当前线上 schema 权威来源也是 MySQL/Redis。如果需要兼容测试旧链路，可显式开启：
 
