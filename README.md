@@ -1028,11 +1028,4 @@ docker-compose logs -f milvus
 
 ## License
 
-Non-Commercial Learning License. See [LICENSE](LICENSE).
-
-本项目开放用于学习、研究、个人评估和非商业交流。未经版权持有人书面授权，
-不得用于商业用途，包括但不限于付费 SaaS、商业产品集成、客户交付、转售、
-再授权，或企业内部用于产生收入、降低运营成本、支撑商业运营的场景。
-
-This is not the MIT License or Apache License 2.0, because those licenses allow
-commercial use. This project intentionally restricts commercial use.
+See [LICENSE](LICENSE).
