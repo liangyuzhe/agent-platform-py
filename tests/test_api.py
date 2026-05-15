@@ -136,6 +136,38 @@ class TestDocumentEndpoint:
         assert resp.status_code == 422
 
 
+class TestAdminKnowledgeReindexEndpoints:
+    """Test knowledge reindex endpoints do not depend on local scripts."""
+
+    @patch("agents.api.routers.admin.reindex_business_knowledge_documents")
+    def test_business_knowledge_reindex_uses_package_indexer(self, mock_reindex, client):
+        mock_reindex.return_value = 3
+
+        resp = client.post("/api/admin/business-knowledge/reindex")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "success": True,
+            "message": "Business knowledge re-indexed into Milvus/ES",
+            "count": 3,
+        }
+        mock_reindex.assert_called_once_with()
+
+    @patch("agents.api.routers.admin.reindex_agent_knowledge_documents")
+    def test_agent_knowledge_reindex_uses_package_indexer(self, mock_reindex, client):
+        mock_reindex.return_value = 5
+
+        resp = client.post("/api/admin/agent-knowledge/reindex")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "success": True,
+            "message": "Agent knowledge re-indexed into Milvus/ES",
+            "count": 5,
+        }
+        mock_reindex.assert_called_once_with()
+
+
 class TestAdminIntentRules:
     """Test configurable intent-rule admin endpoints."""
 

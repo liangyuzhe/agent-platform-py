@@ -1,8 +1,14 @@
 """Admin endpoints: semantic model & business knowledge CRUD."""
 
 import logging
+import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from agents.tool.knowledge_indexing import (
+    reindex_agent_knowledge_documents,
+    reindex_business_knowledge_documents,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -203,12 +209,14 @@ async def delete_business_knowledge(term: str):
 
 @router.post("/business-knowledge/reindex")
 async def reindex_business_knowledge():
-    """Re-index business knowledge into Milvus."""
+    """Re-index business knowledge into Milvus/ES."""
     try:
-        from scripts.seed_business_knowledge import index_to_milvus
-        import asyncio
-        await asyncio.to_thread(lambda: asyncio.run(index_to_milvus()))
-        return {"success": True, "message": "Business knowledge re-indexed into Milvus"}
+        count = await asyncio.to_thread(reindex_business_knowledge_documents)
+        return {
+            "success": True,
+            "message": "Business knowledge re-indexed into Milvus/ES",
+            "count": count,
+        }
     except Exception as e:
         logger.warning("Business knowledge reindex failed: %s", e)
         return {"success": False, "message": f"Reindex failed: {e}"}
@@ -300,12 +308,14 @@ async def delete_agent_knowledge(knowledge_id: int):
 
 @router.post("/agent-knowledge/reindex")
 async def reindex_agent_knowledge():
-    """Re-index agent knowledge into Milvus."""
+    """Re-index agent knowledge into Milvus/ES."""
     try:
-        from scripts.seed_agent_knowledge import index_to_milvus
-        import asyncio
-        await asyncio.to_thread(lambda: asyncio.run(index_to_milvus()))
-        return {"success": True, "message": "Agent knowledge re-indexed into Milvus"}
+        count = await asyncio.to_thread(reindex_agent_knowledge_documents)
+        return {
+            "success": True,
+            "message": "Agent knowledge re-indexed into Milvus/ES",
+            "count": count,
+        }
     except Exception as e:
         logger.warning("Agent knowledge reindex failed: %s", e)
         return {"success": False, "message": f"Reindex failed: {e}"}

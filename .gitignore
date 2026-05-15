@@ -35,8 +35,10 @@ htmlcov/
 .tox/
 .nox/
 data/eval/
+data/
 outputs/
 docs/assets/demos/raw/
+docs/superpowers/
 scripts/
 README.full.local.md
 
