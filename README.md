@@ -1,6 +1,6 @@
 # Financial Copilot Platform
 
-基于 **LangChain + LangGraph** 构建的财务 Copilot 平台，提供自然语言查数据、SQL 自动生成与执行、异常归因、资金核对、审计追踪等核心能力。
+基于 **LangChain + LangGraph** 构建的财务 Copilot 平台，当前聚焦企业 NL2SQL 主链路：自然语言查数据、业务语义选表、SQL 自动生成与审批执行、复杂查询计划、数据权限门禁、合规审计、RAG 知识问答和评测闭环。
 
 ## 核心特性
 
