@@ -390,8 +390,9 @@ def seed_logical_foreign_keys(conn):
         ("t_user_department", "user_id", "t_user", "id"),
         ("t_user_department", "department_id", "t_department", "id"),
 
-        # t_receivable_payable (如果有外键)
-        # t_invoice (如果有外键)
+        # t_receivable_payable / t_invoice
+        ("t_receivable_payable", "related_invoice_id", "t_invoice", "id"),
+        ("t_invoice", "related_entry_id", "t_journal_entry", "id"),
     ]
 
     with conn.cursor() as cur:

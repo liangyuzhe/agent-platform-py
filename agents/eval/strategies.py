@@ -88,7 +88,7 @@ def run_complex_route_eval_case(case: dict) -> dict:
         query=case.get("query", ""),
         selected_tables=case.get("tables", []),
         relationships=case.get("relationships", []),
-        route_signal=case.get("route_signal"),
+        route_signal=case.get("task_type") or case.get("route_signal"),
     )
     expected = case.get("expected_route", "")
     return {

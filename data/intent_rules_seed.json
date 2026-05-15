@@ -19,5 +19,16 @@
     "confidence": 0.92,
     "enabled": true,
     "description": "用户省略主体但询问本地财务指标时补齐公司口径，例如“第一季度毛利率”重写为“公司第一季度毛利率”。"
+  },
+  {
+    "name": "省略主体多指标关系分析",
+    "target_intent": "sql_query",
+    "match_type": "regex",
+    "pattern": "^(?!.*(茅台|贵州茅台|股票|股价|年报|季报)).*(收入.*成本.*预算.*回款.*费用.*(关系|分析|对比)|收入.*成本.*预算.*费用.*回款.*(关系|分析|对比)).*",
+    "rewrite_template": "分析当前公司{query}",
+    "priority": 95,
+    "confidence": 0.94,
+    "enabled": true,
+    "description": "用户省略主体但询问收入、成本、预算、回款、费用之间关系时，按当前公司本地经营数据进入 SQL 链路。"
   }
 ]

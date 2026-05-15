@@ -7,6 +7,7 @@ const baseUrl = process.env.DEMO_BASE_URL || "http://localhost:8080/#/";
 const outDir = path.resolve("docs/assets/demos");
 const rawDir = path.join(outDir, "raw");
 const gifTrimStart = Number(process.env.DEMO_GIF_TRIM_START || "3.2");
+const gifSpeed = Number(process.env.DEMO_GIF_SPEED || "3");
 const browserChannel = process.env.DEMO_BROWSER_CHANNEL || "chrome";
 const require = createRequire(import.meta.url);
 
@@ -47,13 +48,13 @@ const demos = [
     finalText: "查询已执行完成",
   },
   {
-    slug: "sql-complex-budget-expense-approved",
-    title: "Complex SQL: 部门预算与报销对比",
+    slug: "sql-complex-finance-relation-plan-approved",
+    title: "Complex Plan: 收入成本预算回款费用关系",
     questions: [
-      "2025年按部门对比预算金额、实际发生额和已审批报销金额",
+      "收入成本预算回款费用之间的关系",
     ],
-    approvals: 2,
-    finalText: "查询已执行完成",
+    approvals: 1,
+    finalText: "复杂查询计划执行完成",
   },
 ];
 
@@ -153,6 +154,7 @@ async function waitForApproveSettled(page, previousAssistantCount) {
       || text.includes("共返回")
       || text.includes("SQL 执行完成")
       || text.includes("复杂计划已确认")
+      || text.includes("复杂查询计划执行完成")
       || text.includes("分步执行将在下一迭代启用");
     const hasNextApproval = Boolean(last.querySelector(".btn-approve:not([disabled])"));
     const hasTerminalError = text.includes("系统错误") || text.includes("SQL 执行失败");
@@ -205,19 +207,26 @@ async function focusFinalResult(page) {
       }
     }
 
-    container.scrollTop = container.scrollHeight;
-    finalBubble.scrollIntoView({ block: "center", inline: "nearest" });
+    const finalText = finalBubble.innerText || "";
+    if (finalText.includes("复杂查询计划执行完成")) {
+      container.scrollTop = finalBubble.offsetTop + finalBubble.scrollHeight - container.clientHeight + 24;
+    } else {
+      container.scrollTop = container.scrollHeight;
+      finalBubble.scrollIntoView({ block: "center", inline: "nearest" });
+    }
   });
   await sleep(1200);
 }
 
 function convertToGif(webmPath, gifPath) {
   const palette = path.join(rawDir, `${path.basename(gifPath, ".gif")}-palette.png`);
+  const speedFactor = gifSpeed > 0 ? (1 / gifSpeed).toFixed(4) : "1";
+  const videoFilter = `setpts=${speedFactor}*PTS,fps=8,scale=960:-1:flags=lanczos`;
   execFileSync("ffmpeg", [
     "-y",
     "-ss", String(gifTrimStart),
     "-i", webmPath,
-    "-vf", "fps=8,scale=960:-1:flags=lanczos,palettegen",
+    "-vf", `${videoFilter},palettegen`,
     palette,
   ], { stdio: "inherit" });
   execFileSync("ffmpeg", [
@@ -225,7 +234,7 @@ function convertToGif(webmPath, gifPath) {
     "-ss", String(gifTrimStart),
     "-i", webmPath,
     "-i", palette,
-    "-filter_complex", "fps=8,scale=960:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5",
+    "-filter_complex", `${videoFilter}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5`,
     gifPath,
   ], { stdio: "inherit" });
 }

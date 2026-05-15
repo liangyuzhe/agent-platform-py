@@ -9,87 +9,228 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-SINGLE_SQL_TABLE_LIMIT = 8
-PRIMARY_SELECTED_TABLE_LIMIT = 5
 MAX_COMPLEX_PLAN_STEPS = 5
-MAX_TABLES_PER_SQL_STEP = 5
 
-RouteMode = Literal["single_sql", "single_sql_with_strict_checks", "complex_plan", "clarify"]
-RouteSignal = Literal["analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"]
+ExecutionMode = Literal["single_sql", "single_sql_with_strict_checks", "complex_plan", "clarify"]
+TaskType = Literal["analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"]
+JoinRisk = Literal["low", "medium", "high"]
 VALID_STEP_TYPES = {"sql", "python_merge", "report"}
+DECOMPOSABLE_TASK_TYPES = {"analysis", "report", "comparison"}
+CLARIFY_TASK_TYPES = {"detail", "export", "sensitive"}
 
 
 @dataclass(frozen=True)
-class ComplexityDecision:
-    route_mode: RouteMode
+class FeasibilityDecision:
+    execution_mode: ExecutionMode
     selected_tables_count: int
     relationship_count: int
     estimated_join_count: int
-    query_intent_complexity: str
+    task_type: TaskType
+    can_single_sql: bool
+    can_decompose: bool
+    needs_clarification: bool
+    join_risk: JoinRisk
+    decision_source: str
     reason: str
+
+    @property
+    def route_mode(self) -> ExecutionMode:
+        """Backward-compatible alias for older evaluation callers."""
+        return self.execution_mode
+
+    @property
+    def query_intent_complexity(self) -> TaskType:
+        """Backward-compatible alias for older reports."""
+        return self.task_type
+
+
+def assess_query_feasibility(
+    query: str,
+    selected_tables: list[str],
+    relationships: list[dict],
+    task_type: TaskType | str | None = None,
+    decision_source: str = "rules",
+) -> FeasibilityDecision:
+    """Assess the execution mode from rules and schema structure.
+
+    The query text is intentionally not parsed here. Runtime business semantics
+    should come from DB-backed route rules, recall context, and schema metadata.
+    """
+    del query
+
+    unique_tables = list(dict.fromkeys(selected_tables))
+    selected_count = len(unique_tables)
+    relationship_count = len(relationships or [])
+    estimated_join_count = max(0, selected_count - 1)
+    normalized_task_type = _normalize_task_type(task_type)
+    components = _schema_components(unique_tables, relationships or [])
+    schema_connected = len(components) <= 1
+    join_risk = _join_risk(unique_tables, relationships or [])
+
+    if not unique_tables:
+        return FeasibilityDecision(
+            execution_mode="clarify",
+            selected_tables_count=selected_count,
+            relationship_count=relationship_count,
+            estimated_join_count=estimated_join_count,
+            task_type=normalized_task_type,
+            can_single_sql=False,
+            can_decompose=False,
+            needs_clarification=True,
+            join_risk=join_risk,
+            decision_source=decision_source,
+            reason="no executable schema was selected",
+        )
+
+    if normalized_task_type in CLARIFY_TASK_TYPES:
+        return FeasibilityDecision(
+            execution_mode="clarify",
+            selected_tables_count=selected_count,
+            relationship_count=relationship_count,
+            estimated_join_count=estimated_join_count,
+            task_type=normalized_task_type,
+            can_single_sql=False,
+            can_decompose=False,
+            needs_clarification=True,
+            join_risk=join_risk,
+            decision_source=decision_source,
+            reason="configured task type should be clarified before execution",
+        )
+
+    if normalized_task_type in DECOMPOSABLE_TASK_TYPES:
+        return FeasibilityDecision(
+            execution_mode="complex_plan",
+            selected_tables_count=selected_count,
+            relationship_count=relationship_count,
+            estimated_join_count=estimated_join_count,
+            task_type=normalized_task_type,
+            can_single_sql=False,
+            can_decompose=True,
+            needs_clarification=False,
+            join_risk=join_risk,
+            decision_source=decision_source,
+            reason="configured task type is decomposable",
+        )
+
+    if not schema_connected:
+        return FeasibilityDecision(
+            execution_mode="clarify",
+            selected_tables_count=selected_count,
+            relationship_count=relationship_count,
+            estimated_join_count=estimated_join_count,
+            task_type=normalized_task_type,
+            can_single_sql=False,
+            can_decompose=False,
+            needs_clarification=True,
+            join_risk=join_risk,
+            decision_source=decision_source,
+            reason="selected schema has disconnected relationship components",
+        )
+
+    if join_risk == "medium":
+        return FeasibilityDecision(
+            execution_mode="single_sql_with_strict_checks",
+            selected_tables_count=selected_count,
+            relationship_count=relationship_count,
+            estimated_join_count=estimated_join_count,
+            task_type=normalized_task_type,
+            can_single_sql=True,
+            can_decompose=False,
+            needs_clarification=False,
+            join_risk=join_risk,
+            decision_source=decision_source,
+            reason="selected schema is connected but has multiple join paths",
+        )
+
+    return FeasibilityDecision(
+        execution_mode="single_sql",
+        selected_tables_count=selected_count,
+        relationship_count=relationship_count,
+        estimated_join_count=estimated_join_count,
+        task_type=normalized_task_type,
+        can_single_sql=True,
+        can_decompose=False,
+        needs_clarification=False,
+        join_risk=join_risk,
+        decision_source=decision_source,
+        reason="selected schema is connected and suitable for single SQL",
+    )
 
 
 def classify_query_complexity(
     query: str,
     selected_tables: list[str],
     relationships: list[dict],
-    route_signal: RouteSignal | str | None = None,
-) -> ComplexityDecision:
-    """Choose the SQL route from structure plus optional semantic signal."""
-    del query  # Query semantics are supplied by route_signal, not parsed here.
-
-    selected_count = len(dict.fromkeys(selected_tables))
-    relationship_count = len(relationships or [])
-    estimated_join_count = max(0, selected_count - 1)
-
-    if selected_count <= PRIMARY_SELECTED_TABLE_LIMIT:
-        return ComplexityDecision(
-            route_mode="single_sql",
-            selected_tables_count=selected_count,
-            relationship_count=relationship_count,
-            estimated_join_count=estimated_join_count,
-            query_intent_complexity="normal",
-            reason="selected table count is within primary budget",
-        )
-
-    if selected_count <= SINGLE_SQL_TABLE_LIMIT:
-        return ComplexityDecision(
-            route_mode="single_sql_with_strict_checks",
-            selected_tables_count=selected_count,
-            relationship_count=relationship_count,
-            estimated_join_count=estimated_join_count,
-            query_intent_complexity="medium",
-            reason="selected table count is within single SQL budget",
-        )
-
-    if route_signal in {"analysis", "report", "comparison"}:
-        return ComplexityDecision(
-            route_mode="complex_plan",
-            selected_tables_count=selected_count,
-            relationship_count=relationship_count,
-            estimated_join_count=estimated_join_count,
-            query_intent_complexity=str(route_signal),
-            reason="broad query has a configured/LLM analysis route signal",
-        )
-
-    if route_signal in {"detail", "export", "sensitive"}:
-        return ComplexityDecision(
-            route_mode="clarify",
-            selected_tables_count=selected_count,
-            relationship_count=relationship_count,
-            estimated_join_count=estimated_join_count,
-            query_intent_complexity=str(route_signal),
-            reason="broad query has a configured/LLM clarify route signal",
-        )
-
-    return ComplexityDecision(
-        route_mode="clarify",
-        selected_tables_count=selected_count,
-        relationship_count=relationship_count,
-        estimated_join_count=estimated_join_count,
-        query_intent_complexity="ambiguous",
-        reason="query exceeds single SQL table budget but lacks a clear analysis goal",
+    route_signal: TaskType | str | None = None,
+) -> FeasibilityDecision:
+    """Compatibility wrapper for older evaluation code."""
+    return assess_query_feasibility(
+        query=query,
+        selected_tables=selected_tables,
+        relationships=relationships,
+        task_type=route_signal,
     )
+
+
+def _normalize_task_type(value: str | None) -> TaskType:
+    task_type = (value or "ambiguous").strip().lower()
+    if task_type in {"analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"}:
+        return task_type  # type: ignore[return-value]
+    return "ambiguous"
+
+
+def _schema_components(selected_tables: list[str], relationships: list[dict]) -> list[set[str]]:
+    tables = set(selected_tables)
+    if not tables:
+        return []
+
+    parent = {table: table for table in tables}
+
+    def find(table: str) -> str:
+        while parent[table] != table:
+            parent[table] = parent[parent[table]]
+            table = parent[table]
+        return table
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for rel in relationships or []:
+        left = rel.get("from_table")
+        right = rel.get("to_table")
+        if left in tables and right in tables:
+            union(left, right)
+
+    components: dict[str, set[str]] = {}
+    for table in tables:
+        components.setdefault(find(table), set()).add(table)
+    return list(components.values())
+
+
+def _has_multiple_join_paths(selected_tables: list[str], relationships: list[dict]) -> bool:
+    tables = set(selected_tables)
+    edges = {
+        tuple(sorted((rel.get("from_table"), rel.get("to_table"))))
+        for rel in relationships or []
+        if rel.get("from_table") in tables and rel.get("to_table") in tables
+    }
+    if not tables or len(_schema_components(selected_tables, relationships)) != 1:
+        return False
+    # In an undirected connected graph, more edges than a tree means at least
+    # one alternate join path. That should run with stricter SQL checks.
+    return len(edges) > max(0, len(tables) - 1)
+
+
+def _join_risk(selected_tables: list[str], relationships: list[dict]) -> JoinRisk:
+    components = _schema_components(selected_tables, relationships)
+    if not selected_tables or len(components) > 1:
+        return "high"
+    if _has_multiple_join_paths(selected_tables, relationships):
+        return "medium"
+    return "low"
 
 
 def validate_complex_plan(plan: dict, allowed_tables: set[str]) -> tuple[bool, str]:
@@ -127,8 +268,6 @@ def validate_complex_plan(plan: dict, allowed_tables: set[str]) -> tuple[bool, s
             has_sql = True
             if not tables:
                 return False, f"sql step {step_no} missing tables"
-            if len(tables) > MAX_TABLES_PER_SQL_STEP:
-                return False, f"sql step {step_no} has too many tables"
             unknown = set(tables) - allowed_tables
             if unknown:
                 return False, f"step {step_no} uses unknown table(s): {sorted(unknown)}"

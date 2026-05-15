@@ -3,19 +3,19 @@
     "term": "净利润",
     "formula": "收入 - 成本 - 费用；净利润 > 0 表示盈利，净利润 < 0 表示亏损，净利润 = 0 表示不盈不亏；亏损金额 = CASE WHEN 净利润 < 0 THEN ABS(净利润) ELSE 0 END",
     "synonyms": "净收益, 盈利, 亏损, 净亏损, 赔钱, 赚钱, 亏损多少, 亏损金额, profit, loss",
-    "related_tables": "t_journal_item,t_account,t_expense_claim"
+    "related_tables": "t_journal_entry,t_journal_item,t_account,t_expense_claim"
   },
   {
     "term": "毛利率",
     "formula": "(SUM(credit_amount) - SUM(debit_amount)) / SUM(credit_amount) * 100 WHERE account_type='损益'",
     "synonyms": "gross margin, 毛利比率",
-    "related_tables": "t_journal_item,t_account"
+    "related_tables": "t_journal_entry,t_journal_item,t_account"
   },
   {
     "term": "净利率",
     "formula": "(收入 - 成本 - 费用) / 收入 * 100",
     "synonyms": "net margin, 净利润比率",
-    "related_tables": "t_journal_item,t_account,t_expense_claim"
+    "related_tables": "t_journal_entry,t_journal_item,t_account,t_expense_claim"
   },
   {
     "term": "预算执行率",
@@ -39,7 +39,7 @@
     "term": "应收账款周转率",
     "formula": "收入 / 平均应收账款",
     "synonyms": "应收周转, 回款效率",
-    "related_tables": "t_receivable_payable,t_journal_item"
+    "related_tables": "t_receivable_payable,t_journal_entry,t_journal_item,t_account"
   },
   {
     "term": "应收逾期率",
@@ -93,6 +93,6 @@
     "term": "科目余额",
     "formula": "SUM(debit_amount) - SUM(credit_amount) GROUP BY account_code",
     "synonyms": "账户余额, 科目结余",
-    "related_tables": "t_journal_item,t_account"
+    "related_tables": "t_journal_entry,t_journal_item,t_account"
   }
 ]

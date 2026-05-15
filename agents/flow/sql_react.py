@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 
 from agents.flow.state import SQLReactState
-from agents.flow.complex_query import classify_query_complexity, validate_complex_plan
+from agents.flow.complex_query import assess_query_feasibility, validate_complex_plan
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.tool.sql_tools.safety import SQLSafetyChecker
@@ -329,7 +329,17 @@ def _tables_from_few_shot_examples(few_shot_examples: list[str]) -> list[str]:
 
 def _business_entry_matches_query(entry: dict[str, str | list[str]], query: str) -> bool:
     aliases = [str(entry.get("term") or ""), *entry.get("synonyms", [])]  # type: ignore[list-item]
-    return any(alias and alias in query for alias in aliases)
+    if any(alias and alias in query for alias in aliases):
+        return True
+
+    profile = "\n".join([
+        str(entry.get("term") or ""),
+        str(entry.get("formula") or ""),
+        ",".join(str(item) for item in entry.get("synonyms", [])),  # type: ignore[union-attr]
+    ])
+    query_terms = {term for term in _ranking_terms(query) if len(term) >= 2}
+    profile_terms = {term for term in _ranking_terms(profile) if len(term) >= 2}
+    return bool(query_terms & profile_terms)
 
 
 def _few_shot_matches_query(example: str, query: str) -> bool:
@@ -434,6 +444,64 @@ def _semantic_fk_edges(semantic_model: dict) -> list[dict[str, str]]:
     return edges
 
 
+def _shortest_join_path(
+    start: str,
+    end: str,
+    edges: list[dict[str, str]],
+    candidate_tables: set[str],
+    max_edges: int = 3,
+) -> list[str]:
+    """Find a short undirected FK path between two tables."""
+    if start == end or start not in candidate_tables or end not in candidate_tables:
+        return []
+
+    adjacency: dict[str, list[str]] = {}
+    for edge in edges:
+        from_table = edge.get("from_table")
+        to_table = edge.get("to_table")
+        if from_table not in candidate_tables or to_table not in candidate_tables:
+            continue
+        adjacency.setdefault(from_table, []).append(to_table)
+        adjacency.setdefault(to_table, []).append(from_table)
+
+    queue: list[list[str]] = [[start]]
+    seen = {start}
+    while queue:
+        path = queue.pop(0)
+        if len(path) - 1 >= max_edges:
+            continue
+        for next_table in adjacency.get(path[-1], []):
+            if next_table in seen:
+                continue
+            next_path = [*path, next_table]
+            if next_table == end:
+                return next_path
+            seen.add(next_table)
+            queue.append(next_path)
+    return []
+
+
+def _expand_selected_tables_by_join_paths(
+    selected: list[str],
+    candidate_tables: list[str],
+    edges: list[dict[str, str]],
+    max_edges: int = 3,
+) -> list[str]:
+    """Add intermediate FK path tables between already-selected endpoints."""
+    expanded = list(selected)
+    candidate_set = set(candidate_tables)
+    anchors = [table for table in selected if table in candidate_set]
+
+    for left_index, left in enumerate(anchors):
+        for right in anchors[left_index + 1:]:
+            path = _shortest_join_path(left, right, edges, candidate_set, max_edges=max_edges)
+            for table in path[1:-1]:
+                if table not in expanded:
+                    expanded.append(table)
+
+    return expanded
+
+
 def _expand_selected_tables_by_semantic_relationships(
     selected: list[str],
     candidate_tables: list[str],
@@ -492,6 +560,7 @@ def _expand_selected_tables_by_semantic_relationships(
                 append(bridge)
             changed = changed or len(expanded) > before
 
+    expanded = _expand_selected_tables_by_join_paths(expanded, candidate_tables, edges)
     return expanded
 
 
@@ -999,81 +1068,53 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
     return {"selected_tables": selected, "table_relationships": relationships}
 
 
-async def infer_route_signal(state: SQLReactState, config=None) -> dict:
-    """Infer semantic route signal only after selected schema is broad."""
+async def assess_feasibility(state: SQLReactState, config=None) -> dict:
+    """Assess SQL execution mode from DB rules and selected schema structure."""
     query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
     selected_tables = state.get("selected_tables", [])
-    if len(dict.fromkeys(selected_tables)) <= 8:
-        return {"route_signal": "", "route_signal_source": "not_needed"}
-
     rule_decision = await evaluate_query_route_rules(query)
+    task_type = ""
+    decision_source = "default"
+    report = dict(state.get("complexity_report") or {})
     if rule_decision and rule_decision.confidence >= 0.8:
-        return {
-            "route_signal": rule_decision.route_signal,
-            "route_signal_source": "rules",
-            "complexity_report": {"route_rule": rule_decision.to_dict()},
-        }
+        task_type = rule_decision.route_signal
+        decision_source = "rules"
+        report["route_rule"] = rule_decision.to_dict()
 
-    model = get_chat_model(settings.chat_model_type)
-    try:
-        response = await model.ainvoke(
-            [
-                SystemMessage(content=(
-                    "你是复杂 NL2SQL 路由仲裁器。根据用户问题判断它更像哪类请求：\n"
-                    "- analysis/report/comparison：可以拆成多个聚合 SQL 后合并分析\n"
-                    "- detail/export：用户要明细、清单、导出，不适合自动拆很多 SQL\n"
-                    "- sensitive：涉及个人敏感信息、权限明细、账号等需要澄清或权限确认\n"
-                    "- ambiguous：无法确定能稳定拆分或没有公共合并维度\n"
-                    "只返回 JSON：{\"route_signal\":\"analysis|report|comparison|detail|export|sensitive|ambiguous\","
-                    "\"reason\":\"一句话原因\"}"
-                )),
-                HumanMessage(content=query),
-            ],
-            config=child_trace_config(config, "sql.complex_route.llm", tags=["llm", "sql_react"]),
-        )
-        payload = _parse_json_object(_response_text(response))
-    except Exception as e:
-        logger.warning("complex route LLM arbitration failed: %s", e)
-        payload = {}
-
-    signal = str(payload.get("route_signal") or "ambiguous").strip().lower()
-    if signal not in {"analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"}:
-        signal = "ambiguous"
-    return {
-        "route_signal": signal,
-        "route_signal_source": "llm",
-        "complexity_report": {"route_signal_reason": payload.get("reason", "")},
-    }
-
-
-async def route_complexity(state: SQLReactState) -> dict:
-    """Route selected schema to single SQL, complex plan, or clarification."""
-    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
-    decision = classify_query_complexity(
+    decision = assess_query_feasibility(
         query=query,
-        selected_tables=state.get("selected_tables", []),
+        selected_tables=selected_tables,
         relationships=state.get("table_relationships", []),
-        route_signal=state.get("route_signal") or None,
+        task_type=task_type or None,
+        decision_source=decision_source,
     )
-    report = {
-        **(state.get("complexity_report") or {}),
+    feasibility_decision = {
+        "execution_mode": decision.execution_mode,
+        "task_type": decision.task_type,
+        "can_single_sql": decision.can_single_sql,
+        "can_decompose": decision.can_decompose,
+        "needs_clarification": decision.needs_clarification,
+        "join_risk": decision.join_risk,
+        "decision_source": decision.decision_source,
+        "reason": decision.reason,
         "selected_tables_count": decision.selected_tables_count,
         "relationship_count": decision.relationship_count,
         "estimated_join_count": decision.estimated_join_count,
-        "query_intent_complexity": decision.query_intent_complexity,
     }
+    report.update(feasibility_decision)
     answer = ""
-    if decision.route_mode == "clarify":
+    if decision.execution_mode == "clarify":
         answer = (
             "这个问题涉及的表和业务范围较大。请缩小查询范围，例如指定时间、部门、指标，"
             "或说明你希望查看汇总分析还是明细列表。"
         )
     return {
-        "route_mode": decision.route_mode,
+        "route_mode": decision.execution_mode,
         "route_reason": decision.reason,
+        "feasibility_decision": feasibility_decision,
         "complexity_report": report,
         "answer": answer,
-        "is_sql": False if decision.route_mode == "clarify" else state.get("is_sql", False),
+        "is_sql": False if decision.execution_mode == "clarify" else state.get("is_sql", False),
     }
 
 
@@ -1093,6 +1134,28 @@ def _format_complex_plan_preview(plan: dict) -> str:
     return "\n".join(lines)
 
 
+def _normalize_complex_plan_tables(plan: dict, selected_tables: list[str], relationships: list[dict]) -> dict:
+    """Expand each SQL step table list with available relationship path tables."""
+    if not isinstance(plan, dict):
+        return plan
+    normalized = {**plan}
+    steps = []
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            steps.append(step)
+            continue
+        item = {**step}
+        if item.get("type") == "sql":
+            item["tables"] = _expand_step_tables_by_relationship_paths(
+                item.get("tables") or [],
+                selected_tables,
+                relationships,
+            )
+        steps.append(item)
+    normalized["steps"] = steps
+    return normalized
+
+
 async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
     """Generate and validate a complex query plan without executing it."""
     query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
@@ -1107,10 +1170,12 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
                 "你是复杂 NL2SQL 计划生成器。请把用户问题拆成可审计的执行计划，不要生成 SQL。\n"
                 "要求：\n"
                 "1. 只使用候选表中的表名\n"
-                "2. 每个 SQL 步骤建议不超过 5 张表\n"
-                "3. 多步骤合并必须给出 merge_keys\n"
-                "4. 如果无法稳定合并，返回 mode=clarify 且 steps 为空\n"
-                "5. 只返回 JSON，不要 Markdown\n"
+                "2. 按业务目标和可稳定合并的公共维度拆分 SQL 步骤，不要按表数量机械拆分\n"
+                "3. 每个 SQL 步骤的 tables 必须列全完成该步骤目标所需的分类表、维度表和 JOIN 桥接表；"
+                "不要只列事实表或端点表\n"
+                "4. 多步骤合并必须给出 merge_keys；依赖 SQL 步骤必须能输出与 merge_keys 同名的列别名\n"
+                "5. 如果无法稳定合并，返回 mode=clarify 且 steps 为空\n"
+                "6. 只返回 JSON，不要 Markdown\n"
                 "JSON 格式：{\"mode\":\"complex_plan|clarify\",\"reason\":\"...\",\"steps\":["
                 "{\"step\":1,\"type\":\"sql|python_merge|report\",\"goal\":\"...\","
                 "\"tables\":[\"...\"],\"depends_on\":[],\"merge_keys\":[\"...\"]}],"
@@ -1126,6 +1191,7 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
         config=child_trace_config(config, "sql.complex_plan.llm", tags=["llm", "sql_react"]),
     )
     plan = _parse_json_object(_response_text(response))
+    plan = _normalize_complex_plan_tables(plan, selected_tables, relationships)
     if plan.get("mode") == "clarify":
         return {
             "complex_plan": plan,
@@ -1199,6 +1265,22 @@ def _filter_relationships_for_tables(relationships: list[dict], tables: set[str]
     return result
 
 
+def _expand_step_tables_by_relationship_paths(
+    step_tables: list[str],
+    selected_tables: list[str],
+    relationships: list[dict],
+) -> list[str]:
+    """Add bridge tables available in the global selected schema for a SQL step."""
+    if len(step_tables) < 2:
+        return step_tables
+    allowed_tables = selected_tables or step_tables
+    return _expand_selected_tables_by_join_paths(
+        step_tables,
+        allowed_tables,
+        relationships or [],
+    )
+
+
 def _short_text(value, limit: int = 500) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = (text or "").strip()
@@ -1230,6 +1312,7 @@ def _build_complex_step_query(state: SQLReactState, step: dict, dependency_resul
         f"当前步骤可用表: {tables}\n"
         f"后续合并键: {merge_keys or '无'}\n"
         "请只生成完成当前步骤目标所需的 SELECT SQL，不要处理其他计划步骤。"
+        "如果存在后续合并键，请在 SELECT 中输出同名别名；无法输出 ID/编码时，至少输出同一业务维度的名称别名。"
         f"{dependency_text}"
     )
 
@@ -1261,6 +1344,75 @@ def _parse_rows_from_sql_result(result) -> list[dict] | None:
     return rows if len(rows) == len(value) else None
 
 
+def _normalize_merge_name(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(name or "").lower())
+
+
+def _resolve_merge_key_column(row: dict, merge_key: str) -> str | None:
+    if merge_key in row:
+        return merge_key
+
+    key_norm = _normalize_merge_name(merge_key)
+    if not key_norm:
+        return None
+
+    normalized_columns = {
+        _normalize_merge_name(column): column
+        for column in row
+        if _normalize_merge_name(column)
+    }
+    if key_norm in normalized_columns:
+        return normalized_columns[key_norm]
+
+    # LLM-generated SQL often returns descriptive aliases such as
+    # department_name for a planned merge key department. Keep this generic and
+    # conservative: only use prefix matches for non-trivial key names.
+    if len(key_norm) < 4 and not any("\u4e00" <= ch <= "\u9fff" for ch in key_norm):
+        return None
+    for column_norm, column in normalized_columns.items():
+        if column_norm.startswith(key_norm) or key_norm.startswith(column_norm):
+            return column
+    return None
+
+
+def _resolve_merge_label_column(row: dict, merge_key: str) -> str | None:
+    """Resolve a human-readable sibling column for an id/code merge key.
+
+    Complex plan steps are generated independently. One step may output a
+    stable id while another can only output the same business dimension's name.
+    This keeps the fallback structural by relying on common column suffixes
+    instead of business-specific terms.
+    """
+    key_norm = _normalize_merge_name(merge_key)
+    if not key_norm:
+        return None
+
+    stems = []
+    for suffix in ("id", "code", "编号", "编码", "代码"):
+        if key_norm.endswith(suffix) and len(key_norm) > len(suffix):
+            stems.append(key_norm[: -len(suffix)])
+    if not stems:
+        return None
+
+    normalized_columns = {
+        _normalize_merge_name(column): column
+        for column in row
+        if _normalize_merge_name(column)
+    }
+    for stem in stems:
+        for suffix in ("name", "名称", "名"):
+            candidate = f"{stem}{suffix}"
+            if candidate in normalized_columns:
+                return normalized_columns[candidate]
+    return None
+
+
+def _resolve_canonical_merge_key_column(row: dict, merge_key: str, prefer_label: bool) -> str | None:
+    if prefer_label:
+        return _resolve_merge_label_column(row, merge_key) or _resolve_merge_key_column(row, merge_key)
+    return _resolve_merge_key_column(row, merge_key)
+
+
 def _merge_dependency_rows(
     step: dict,
     execution_results: dict[str, dict],
@@ -1273,7 +1425,7 @@ def _merge_dependency_rows(
     if not depends_on:
         return None, "missing depends_on"
 
-    merged: dict[tuple, dict] = {}
+    rows_by_dep: dict[int | str, list[dict]] = {}
     for dep in depends_on:
         dep_key = str(dep)
         dep_entry = execution_results.get(dep_key) or {}
@@ -1282,13 +1434,34 @@ def _merge_dependency_rows(
         rows = _parse_rows_from_sql_result(dep_entry.get("result"))
         if rows is None:
             return None, f"dependency step {dep} result is not structured rows"
+        rows_by_dep[dep] = rows
+
+    prefer_label_key: dict[str, bool] = {}
+    for merge_key in merge_keys:
+        key = str(merge_key)
+        prefer_label_key[key] = any(
+            _resolve_merge_key_column(row, key) is None and _resolve_merge_label_column(row, key) is not None
+            for rows in rows_by_dep.values()
+            for row in rows
+        )
+
+    merged: dict[tuple, dict] = {}
+    for dep, rows in rows_by_dep.items():
         for row in rows:
-            key = tuple(row.get(k) for k in merge_keys)
+            key_columns = {
+                k: _resolve_canonical_merge_key_column(row, str(k), prefer_label_key.get(str(k), False))
+                for k in merge_keys
+            }
+            key = tuple(row.get(key_columns[k]) if key_columns[k] else None for k in merge_keys)
             if any(v is None for v in key):
                 return None, f"dependency step {dep} row missing merge key"
             bucket = merged.setdefault(key, {k: row.get(k) for k in merge_keys})
+            for merge_key in merge_keys:
+                column = key_columns[merge_key]
+                if column:
+                    bucket[merge_key] = row.get(column)
             for col, value in row.items():
-                if col in merge_keys:
+                if col in key_columns.values():
                     continue
                 out_col = col
                 if out_col in bucket and bucket[out_col] != value:
@@ -1409,9 +1582,14 @@ async def _execute_complex_sql_step(
     config=None,
 ) -> dict:
     step_no = step.get("step")
-    tables = step.get("tables") or []
+    tables = _expand_step_tables_by_relationship_paths(
+        step.get("tables") or [],
+        state.get("selected_tables") or [],
+        state.get("table_relationships", []),
+    )
     table_set = set(tables)
-    step_query = _build_complex_step_query(state, step, execution_results)
+    step_for_query = {**step, "tables": tables}
+    step_query = _build_complex_step_query(state, step_for_query, execution_results)
     step_state = {
         **state,
         "query": step_query,
@@ -1445,47 +1623,103 @@ async def _execute_complex_sql_step(
                 "error": docs_check.get("answer", "missing schema docs"),
             }
 
-        generation = await sql_generate(step_state, config=config)
-        step_state.update(generation)
-        if not step_state.get("is_sql"):
-            return {
-                "step": step_no,
-                "type": "sql",
-                "goal": step.get("goal", ""),
-                "tables": tables,
-                "sql": step_state.get("sql", ""),
-                "result": None,
-                "answer": step_state.get("answer", "未生成 SQL"),
-                "error": step_state.get("error") or step_state.get("answer", "not sql"),
-            }
+        while True:
+            generation = await sql_generate(step_state, config=config)
+            step_state.update(generation)
+            generated_sql = (step_state.get("sql") or "").strip()
+            if step_state.get("is_sql") and not generated_sql:
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": "",
+                    "result": None,
+                    "answer": "SQL 生成节点返回了空 SQL，已停止执行当前复杂计划步骤。",
+                    "error": "empty generated sql",
+                }
+            if not step_state.get("is_sql"):
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": None,
+                    "answer": step_state.get("answer", "未生成 SQL"),
+                    "error": step_state.get("error") or step_state.get("answer", "not sql"),
+                }
 
-        safety = await safety_check(step_state)
-        if safety.get("is_sql") is False:
-            return {
-                "step": step_no,
-                "type": "sql",
-                "goal": step.get("goal", ""),
-                "tables": tables,
-                "sql": step_state.get("sql", ""),
-                "result": None,
-                "answer": safety.get("answer", "SQL 安全检查未通过"),
-                "error": safety.get("answer", "SQL 安全检查未通过"),
-                "safety_report": safety.get("safety_report"),
-            }
-        step_state.update(safety)
+            safety = await safety_check(step_state)
+            if safety.get("is_sql") is False:
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": None,
+                    "answer": safety.get("answer", "SQL 安全检查未通过"),
+                    "error": safety.get("answer", "SQL 安全检查未通过"),
+                    "safety_report": safety.get("safety_report"),
+                }
+            step_state.update(safety)
 
-        executed = await execute_sql(step_state)
-        return {
-            "step": step_no,
-            "type": "sql",
-            "goal": step.get("goal", ""),
-            "tables": tables,
-            "sql": step_state.get("sql", ""),
-            "result": executed.get("result"),
-            "answer": executed.get("answer", ""),
-            "error": executed.get("error"),
-            "execution_history": executed.get("execution_history", []),
-        }
+            executed = await execute_sql(step_state)
+            step_state.update(executed)
+            if executed.get("error") is None and executed.get("result") is None and not executed.get("answer"):
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": None,
+                    "answer": "SQL 执行节点返回空结果，已停止当前复杂计划步骤。",
+                    "error": "empty execution result",
+                    "execution_history": executed.get("execution_history", []),
+                }
+            if not executed.get("error"):
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": executed.get("result"),
+                    "answer": executed.get("answer", ""),
+                    "error": None,
+                    "execution_history": executed.get("execution_history", []),
+                }
+
+            error_msg = str(executed.get("error") or "")
+            if not _should_repair_sql_error(error_msg):
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": executed.get("result"),
+                    "answer": executed.get("answer", ""),
+                    "error": error_msg,
+                    "execution_history": executed.get("execution_history", []),
+                }
+            if step_state.get("retry_count", 0) >= settings.resilience.max_sql_retries:
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": executed.get("result"),
+                    "answer": executed.get("answer", ""),
+                    "error": error_msg,
+                    "execution_history": executed.get("execution_history", []),
+                }
+
+            repair = await error_analysis(step_state, config=config)
+            step_state.update(repair)
     except Exception as e:
         logger.warning("complex plan step %s failed: %s", step_no, e, exc_info=True)
         return {
@@ -2191,8 +2425,7 @@ def build_sql_react_graph():
     graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("query_enhance", query_enhance)
     graph.add_node("select_tables", select_tables)
-    graph.add_node("infer_route_signal", infer_route_signal)
-    graph.add_node("route_complexity", route_complexity)
+    graph.add_node("assess_feasibility", assess_feasibility)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
     graph.add_node("sql_generate", sql_generate)
@@ -2208,8 +2441,7 @@ def build_sql_react_graph():
     graph.add_edge(START, "recall_evidence")
     graph.add_edge("recall_evidence", "query_enhance")
     graph.add_edge("query_enhance", "select_tables")
-    graph.add_edge("select_tables", "infer_route_signal")
-    graph.add_edge("infer_route_signal", "route_complexity")
+    graph.add_edge("select_tables", "assess_feasibility")
 
     def route_after_complexity(state: SQLReactState) -> str:
         if state.get("route_mode") == "clarify":
@@ -2218,7 +2450,7 @@ def build_sql_react_graph():
             return "complex_plan_generate"
         return "sql_retrieve"
 
-    graph.add_conditional_edges("route_complexity", route_after_complexity)
+    graph.add_conditional_edges("assess_feasibility", route_after_complexity)
     graph.add_conditional_edges("complex_plan_generate", route_after_complex_plan_generate)
 
     def route_after_complex_plan_approve(state: SQLReactState) -> str:

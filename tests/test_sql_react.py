@@ -738,6 +738,75 @@ class TestSelectTables:
     @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
     @patch("agents.flow.sql_react.load_full_table_metadata")
     @patch("agents.flow.sql_react.get_chat_model")
+    async def test_adds_multi_hop_join_path_from_semantic_relationships(
+        self,
+        mock_get_model,
+        mock_load_metadata,
+        _mock_relationships,
+        mock_semantic,
+    ):
+        """Selected endpoint tables should keep FK path tables needed for joins."""
+        from agents.flow.sql_react import select_tables
+
+        mock_load_metadata.return_value = [
+            {"table_name": "t_invoice", "table_comment": "发票管理表，包含关联凭证"},
+            {"table_name": "t_journal_entry", "table_comment": "记账凭证主表"},
+            {"table_name": "t_journal_item", "table_comment": "凭证分录明细表，包含科目和金额"},
+            {"table_name": "t_account", "table_comment": "会计科目表"},
+            {"table_name": "t_budget", "table_comment": "预算管理表"},
+        ]
+        mock_semantic.return_value = {
+            "t_invoice": {
+                "related_entry_id": {
+                    "business_name": "关联凭证ID",
+                    "is_fk": 1,
+                    "ref_table": "t_journal_entry",
+                    "ref_column": "id",
+                },
+            },
+            "t_journal_entry": {
+                "id": {"business_name": "凭证ID"},
+            },
+            "t_journal_item": {
+                "entry_id": {
+                    "business_name": "凭证ID",
+                    "is_fk": 1,
+                    "ref_table": "t_journal_entry",
+                    "ref_column": "id",
+                },
+                "account_code": {
+                    "business_name": "科目编码",
+                    "is_fk": 1,
+                    "ref_table": "t_account",
+                    "ref_column": "account_code",
+                },
+            },
+            "t_account": {
+                "account_code": {"business_name": "科目编码"},
+            },
+        }
+        mock_model = MagicMock()
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(content="t_invoice,t_account"))
+        mock_get_model.return_value = mock_model
+
+        result = await select_tables({
+            "query": "按会计科目分析发票收入",
+            "enhanced_query": "按会计科目分析发票收入",
+            "evidence": [],
+        })
+
+        assert set(result["selected_tables"][:4]) == {
+            "t_invoice",
+            "t_journal_entry",
+            "t_journal_item",
+            "t_account",
+        }
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.get_table_relationships", return_value=[])
+    @patch("agents.flow.sql_react.load_full_table_metadata")
+    @patch("agents.flow.sql_react.get_chat_model")
     async def test_adds_endpoint_tables_from_selected_relation_tables(
         self,
         mock_get_model,
@@ -818,34 +887,107 @@ class TestComplexRoute:
     """Test broad schema route decisions."""
 
     @pytest.mark.asyncio
-    async def test_route_complexity_single_sql(self):
-        from agents.flow.sql_react import route_complexity
+    async def test_assess_feasibility_single_sql(self):
+        from agents.flow.sql_react import assess_feasibility
 
         state = {
             "query": "去年亏损",
             "selected_tables": ["a", "b", "c"],
-            "table_relationships": [],
+            "table_relationships": [
+                {"from_table": "a", "to_table": "b"},
+                {"from_table": "b", "to_table": "c"},
+            ],
         }
 
-        result = await route_complexity(state)
+        result = await assess_feasibility(state)
 
         assert result["route_mode"] == "single_sql"
+        assert result["feasibility_decision"]["execution_mode"] == "single_sql"
 
     @pytest.mark.asyncio
-    async def test_route_complexity_clarify_for_broad_detail(self):
-        from agents.flow.sql_react import route_complexity
+    async def test_assess_feasibility_clarify_for_broad_detail_rule(self):
+        from agents.flow.sql_react import assess_feasibility
+        from agents.tool.storage.query_route_rules import QueryRouteRuleDecision
 
         state = {
             "query": "员工工资和部门角色权限",
             "selected_tables": [f"t_{i}" for i in range(9)],
             "table_relationships": [],
-            "route_signal": "detail",
         }
 
-        result = await route_complexity(state)
+        decision = QueryRouteRuleDecision(
+            route_signal="detail",
+            confidence=0.95,
+            rule_id=8,
+            rule_name="明细澄清",
+            priority=100,
+            match_type="contains",
+        )
+        with patch("agents.flow.sql_react.evaluate_query_route_rules", AsyncMock(return_value=decision)):
+            result = await assess_feasibility(state)
 
         assert result["route_mode"] == "clarify"
+        assert result["feasibility_decision"]["execution_mode"] == "clarify"
+        assert result["feasibility_decision"]["task_type"] == "detail"
         assert "缩小查询范围" in result["answer"]
+
+    @pytest.mark.asyncio
+    async def test_assess_feasibility_uses_rule_task_type(self):
+        from agents.flow.sql_react import assess_feasibility
+        from agents.tool.storage.query_route_rules import QueryRouteRuleDecision
+
+        decision = QueryRouteRuleDecision(
+            route_signal="analysis",
+            confidence=0.95,
+            rule_id=7,
+            rule_name="关系分析",
+            priority=100,
+            match_type="contains",
+        )
+        with patch("agents.flow.sql_react.evaluate_query_route_rules", AsyncMock(return_value=decision)):
+            result = await assess_feasibility({
+                "query": "收入成本预算回款费用之间的关系",
+                "selected_tables": ["t_journal_item", "t_account", "t_budget"],
+                "table_relationships": [{"from_table": "t_journal_item", "to_table": "t_account"}],
+            })
+
+        assert result["route_mode"] == "complex_plan"
+        assert result["feasibility_decision"]["execution_mode"] == "complex_plan"
+        assert result["feasibility_decision"]["task_type"] == "analysis"
+        assert result["feasibility_decision"]["decision_source"] == "rules"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_assess_feasibility_does_not_call_llm_for_cyclic_schema(self, mock_get_model):
+        from agents.flow.sql_react import assess_feasibility
+
+        result = await assess_feasibility({
+            "query": "收入成本预算回款费用之间的关系",
+            "selected_tables": ["a", "b", "c"],
+            "table_relationships": [
+                {"from_table": "a", "to_table": "b"},
+                {"from_table": "b", "to_table": "c"},
+                {"from_table": "a", "to_table": "c"},
+            ],
+        })
+
+        mock_get_model.assert_not_called()
+        assert result["route_mode"] == "single_sql_with_strict_checks"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_assess_feasibility_clarifies_disconnected_schema_without_rule(self, mock_get_model):
+        from agents.flow.sql_react import assess_feasibility
+
+        result = await assess_feasibility({
+            "query": "收入成本预算回款费用之间的关系",
+            "selected_tables": ["t_budget", "t_invoice"],
+            "table_relationships": [],
+        })
+
+        mock_get_model.assert_not_called()
+        assert result["route_mode"] == "clarify"
+        assert result["feasibility_decision"]["join_risk"] == "high"
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.get_chat_model")
@@ -966,6 +1108,128 @@ class TestComplexRoute:
         assert result["plan_execution_results"]["3"]["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
 
     @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_expands_sql_step_join_path(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        seen_selected_tables = []
+
+        async def fake_sql_retrieve(step_state, config=None):
+            seen_selected_tables.append(step_state["selected_tables"])
+            return {"docs": [Document(page_content="schema")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"sql": "SELECT 1", "answer": "SELECT 1", "is_sql": True}
+
+        async def fake_execute_sql(step_state):
+            return {
+                "result": '[{"ok":1}]',
+                "answer": "查询已执行完成。\nok：1",
+                "error": None,
+                "execution_history": [{"sql": step_state["sql"], "result": '[{"ok":1}]', "error": None}],
+            }
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql):
+            result = await execute_complex_plan_step({
+                "query": "按会计科目分析发票收入",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {
+                            "step": 1,
+                            "type": "sql",
+                            "goal": "按会计科目统计发票收入",
+                            "tables": ["t_invoice", "t_account"],
+                            "depends_on": [],
+                            "merge_keys": ["account_code"],
+                        },
+                    ],
+                },
+                "plan_approved": True,
+                "selected_tables": ["t_invoice", "t_journal_entry", "t_journal_item", "t_account"],
+                "table_relationships": [
+                    {"from_table": "t_invoice", "to_table": "t_journal_entry"},
+                    {"from_table": "t_journal_item", "to_table": "t_journal_entry"},
+                    {"from_table": "t_journal_item", "to_table": "t_account"},
+                ],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] is None
+        assert seen_selected_tables == [["t_invoice", "t_account", "t_journal_entry", "t_journal_item"]]
+        assert result["plan_execution_results"]["1"]["tables"] == [
+            "t_invoice",
+            "t_account",
+            "t_journal_entry",
+            "t_journal_item",
+        ]
+
+    def test_merge_dependency_rows_resolves_generic_merge_key_alias(self):
+        from agents.flow.sql_react import _merge_dependency_rows
+
+        step = {
+            "type": "python_merge",
+            "depends_on": [1, 2],
+            "merge_keys": ["department"],
+        }
+        rows, reason = _merge_dependency_rows(step, {
+            "1": {
+                "result": '[{"department_name":"产品部","total_income":100,"total_expense":30}]',
+                "error": None,
+            },
+            "2": {
+                "result": '[{"department":"产品部","expense_budget":80}]',
+                "error": None,
+            },
+        })
+
+        assert reason == ""
+        assert rows == [{
+            "department": "产品部",
+            "total_income": 100,
+            "total_expense": 30,
+            "expense_budget": 80,
+        }]
+
+    def test_merge_dependency_rows_aligns_id_merge_key_with_name_columns(self):
+        from agents.flow.sql_react import _merge_dependency_rows
+
+        step = {
+            "type": "python_merge",
+            "depends_on": [1, 2],
+            "merge_keys": ["department_id", "cost_center_id"],
+        }
+        rows, reason = _merge_dependency_rows(step, {
+            "1": {
+                "result": (
+                    '[{"department_id":3,"department_name":"产品部",'
+                    '"cost_center_id":3,"cost_center_name":"研发部","total_income":100}]'
+                ),
+                "error": None,
+            },
+            "2": {
+                "result": (
+                    '[{"department_name":"产品部","cost_center_name":"研发部",'
+                    '"income_expense_budget":80}]'
+                ),
+                "error": None,
+            },
+        })
+
+        assert reason == ""
+        assert rows is not None
+        assert len(rows) == 1
+        assert rows[0]["department_id"] == "产品部"
+        assert rows[0]["cost_center_id"] == "研发部"
+        assert rows[0]["total_income"] == 100
+        assert rows[0]["income_expense_budget"] == 80
+
+    @pytest.mark.asyncio
     async def test_execute_complex_plan_step_blocks_unsafe_generated_sql(self):
         from agents.flow.sql_react import execute_complex_plan_step
 
@@ -999,6 +1263,137 @@ class TestComplexRoute:
         assert result["error"] == "complex_plan_step_failed"
         assert "安全检查未通过" in result["answer"]
         assert result["plan_execution_results"]["1"]["error"]
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_rejects_empty_generated_sql(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"sql": "", "answer": "", "is_sql": True}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", new_callable=AsyncMock) as mock_execute:
+            result = await execute_complex_plan_step({
+                "query": "空 SQL 测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "生成空 SQL", "tables": ["a"], "depends_on": [], "merge_keys": ["id"]},
+                    ],
+                },
+                "plan_approved": True,
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert mock_execute.await_count == 0
+        assert result["error"] == "complex_plan_step_failed"
+        assert result["plan_execution_results"]["1"]["error"] == "empty generated sql"
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_rejects_empty_execution_payload(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"sql": "SELECT 1", "answer": "SELECT 1", "is_sql": True}
+
+        async def fake_execute_sql(step_state):
+            return {"result": None, "answer": "", "error": None, "execution_history": []}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql):
+            result = await execute_complex_plan_step({
+                "query": "空执行结果测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "执行空结果 SQL", "tables": ["a"], "depends_on": [], "merge_keys": ["id"]},
+                    ],
+                },
+                "plan_approved": True,
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] == "complex_plan_step_failed"
+        assert result["plan_execution_results"]["1"]["error"] == "empty execution result"
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_repairs_retryable_sql_error(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        generated_sql = []
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a\nid int\namount int")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            sql = "SELECT missing_amount FROM a" if not step_state.get("refine_feedback") else "SELECT amount FROM a"
+            generated_sql.append(sql)
+            return {"sql": sql, "answer": sql, "is_sql": True, "error": None}
+
+        async def fake_execute_sql(step_state):
+            if "missing_amount" in step_state["sql"]:
+                return {
+                    "result": "SQL 执行失败: Error: Unknown column 'missing_amount' in 'field list'",
+                    "answer": "SQL 执行失败: Error: Unknown column 'missing_amount' in 'field list'",
+                    "error": "Error: Unknown column 'missing_amount' in 'field list'",
+                    "execution_history": [{"sql": step_state["sql"], "result": None, "error": "unknown column"}],
+                }
+            return {
+                "result": '[{"amount":100}]',
+                "answer": "查询已执行完成。\namount：100",
+                "error": None,
+                "execution_history": [
+                    {"sql": "SELECT missing_amount FROM a", "result": None, "error": "unknown column"},
+                    {"sql": step_state["sql"], "result": '[{"amount":100}]', "error": None},
+                ],
+            }
+
+        async def fake_error_analysis(step_state, config=None):
+            return {"refine_feedback": "missing_amount 不存在，改用 amount", "retry_count": step_state.get("retry_count", 0) + 1}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql), \
+             patch("agents.flow.sql_react.error_analysis", side_effect=fake_error_analysis):
+            result = await execute_complex_plan_step({
+                "query": "复杂计划 SQL 错误修复测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "查询金额", "tables": ["a"], "depends_on": [], "merge_keys": ["id"]},
+                    ],
+                },
+                "plan_approved": True,
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] is None
+        assert generated_sql == ["SELECT missing_amount FROM a", "SELECT amount FROM a"]
+        assert result["plan_execution_results"]["1"]["sql"] == "SELECT amount FROM a"
+        assert result["plan_execution_results"]["1"]["result"] == '[{"amount":100}]'
 
 
 # ---------------------------------------------------------------------------
@@ -1599,8 +1994,9 @@ class TestBuildSqlReactGraph:
         assert "result_reflection" in node_names
         assert "query_enhance" in node_names
         assert "recall_evidence" in node_names
-        assert "infer_route_signal" in node_names
-        assert "route_complexity" in node_names
+        assert "assess_feasibility" in node_names
+        assert "infer_route_signal" not in node_names
+        assert "route_complexity" not in node_names
         assert "complex_plan_generate" in node_names
         assert "approve_complex_plan" in node_names
         assert "execute_complex_plan_step" in node_names
@@ -1873,6 +2269,57 @@ class TestRecallEvidence:
         context = result["recall_context"]
         assert context["business_related_tables"] == ["t_journal_item", "t_account", "t_expense_claim"]
         assert context["matched_terms"] == ["净利润"]
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.recall_agent_knowledge")
+    @patch("agents.flow.sql_react.recall_business_knowledge")
+    async def test_recall_evidence_matches_business_formula_terms(self, mock_business, mock_agent):
+        """Formula text from retrieved business knowledge should also drive table context."""
+        from agents.flow.sql_react import recall_evidence
+
+        mock_business.return_value = [
+            Document(
+                page_content=(
+                    "术语: 净利润\n"
+                    "公式: 收入 - 成本 - 费用\n"
+                    "同义词: 盈利, 亏损\n"
+                    "关联表: t_journal_entry,t_journal_item,t_account,t_expense_claim"
+                ),
+                metadata={"score": 0.9},
+            ),
+            Document(
+                page_content=(
+                    "术语: 预算执行率\n"
+                    "公式: actual_amount / budget_amount * 100\n"
+                    "同义词: 预算完成率\n"
+                    "关联表: t_budget"
+                ),
+                metadata={"score": 0.8},
+            ),
+            Document(
+                page_content=(
+                    "术语: 固定资产净值\n"
+                    "公式: original_value - accumulated_depreciation\n"
+                    "同义词: 资产净额\n"
+                    "关联表: t_fixed_asset"
+                ),
+                metadata={"score": 0.7},
+            ),
+        ]
+        mock_agent.return_value = []
+
+        result = await recall_evidence(
+            {
+                "query": "收入成本预算回款费用之间的关系",
+                "rewritten_query": "分析当前公司收入成本预算回款费用之间的关系",
+            },
+        )
+
+        context = result["recall_context"]
+        assert "t_journal_item" in context["business_related_tables"]
+        assert "t_journal_entry" in context["business_related_tables"]
+        assert "t_budget" in context["business_related_tables"]
+        assert "t_fixed_asset" not in context["business_related_tables"]
 
 
 # ---------------------------------------------------------------------------

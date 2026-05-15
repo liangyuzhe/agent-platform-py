@@ -17,7 +17,7 @@
 - **查询增强**：基于业务知识翻译术语和同义表达（如“亏损多少” -> 亏损金额计算口径），提高后续检索、选表和 SQL 生成命中率。
 - **Human-in-the-Loop 审批**：SQL 执行前人工确认，支持修改意见回退重生成；审批恢复使用 LangGraph `interrupt/Command(resume=...)`，SSE 展示执行、异常反思和二次确认过程。
 - **执行后反思修复**：SQL 执行成功但返回空集、`NULL`、全字段空值或零值可疑结果时，进入 `result_reflection` 直接生成修正 SQL，不再回到 `sql_generate` 重新发散。
-- **复杂查询模式切换**：5 张内走单 SQL，6-8 张走严格单 SQL，超过 8 张根据规则/LLM 语义信号进入复杂计划或澄清；复杂计划经用户确认后串行执行 SQL step，逐步安全检查、执行并把本地 merge/report step 写入可审计结果，避免超大 JOIN 幻觉和 token 膨胀。
+- **复杂查询模式切换**：`assess_feasibility` 不调用 LLM，基于规则引擎任务类型、关系图连通性和 JOIN 风险产出 `execution_mode`；复杂计划经用户确认后串行执行 SQL step，逐步安全检查、执行并把本地 merge/report step 写入可审计结果，避免超大 JOIN 幻觉和 token 膨胀。
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）按 `session_id` 隔离；SQL 场景单独保存上一轮 SQL 口径，支持“亏损多少”这类多轮追问。
 - **链路追踪与评测闭环**：LangSmith/CozeLoop 记录 LLM、Milvus、ES、MySQL fallback、SQL 执行和审批节点；Evaluation 页面展示 Accuracy@K、Precision@K、Recall@K、MRR、NDCG、P50/P95、首字延迟和 per-query 明细。
 - **安全、熔断与 Fallback**：只允许安全 `SELECT/WITH`；支持 SQLState 错误分类、可配置重试、超时控制、Redis -> MySQL fallback、检索失败降级为空 evidence。
@@ -26,7 +26,7 @@
 
 ## 功能演示（6 个端到端案例）
 
-以下 GIF 均为本地 Web UI 录制，覆盖 Chat/Knowledge 路由、SQL 生成与审批执行、多轮追问、管理表关联查询和多表聚合查询 6 条典型案例。
+以下 GIF 均为本地 Web UI 录制并加速压缩，覆盖 Chat/Knowledge 路由、SQL 生成与审批执行、多轮追问、管理表关联查询和复杂计划执行 6 条典型案例。
 
 ### Chat / Knowledge：外部公开知识路由
 
@@ -58,11 +58,11 @@
 
 ![SQL Query: 用户与角色](docs/assets/demos/sql-management-user-role-approved.gif)
 
-### Complex SQL：部门预算与报销对比
+### Complex Plan：收入成本预算回款费用关系
 
-提问“2025年按部门对比预算金额、实际发生额和已审批报销金额”，系统会召回预算、成本中心、费用报销等多表语义，生成待审批 SQL，并在确认后返回按部门聚合的对比结果。
+提问“收入成本预算回款费用之间的关系”，系统命中复杂分析规则，生成结构化执行计划；用户确认后按 SQL step 串行执行，并用本地 merge/report 汇总每步结果。
 
-![Complex SQL: 部门预算与报销对比](docs/assets/demos/sql-complex-budget-expense-approved.gif)
+![Complex Plan: 收入成本预算回款费用关系](docs/assets/demos/sql-complex-finance-relation-plan-approved.gif)
 
 ## 最新节点调用流程图
 
@@ -82,18 +82,17 @@ flowchart TD
     RecallCtx --> Enhance[query_enhance<br/>基于 evidence 增强业务术语]
     Enhance --> Select[select_tables<br/>轻量 table routing profile + LLM 选表]
     Select --> Rerank[本地语义重排 + 逻辑外键链式补表]
-    Rerank --> Signal[infer_route_signal<br/>规则或 LLM 复杂查询语义信号]
-    Signal --> Complexity[route_complexity<br/>single_sql / strict / complex_plan / clarify]
+    Rerank --> Feasible[assess_feasibility<br/>规则引擎 + 表关系结构特征]
 
-    Complexity -->|clarify| Clarify([返回澄清问题])
-    Complexity -->|complex_plan| PlanGen[complex_plan_generate<br/>结构化计划]
+    Feasible -->|clarify| Clarify([返回澄清问题])
+    Feasible -->|complex_plan| PlanGen[complex_plan_generate<br/>结构化计划]
     PlanGen --> PlanCheck{validate_complex_plan}
     PlanCheck -->|invalid / clarify| Clarify
     PlanCheck -->|valid| PlanApprove[approve_complex_plan<br/>用户确认计划]
     PlanApprove --> PlanExec[execute_complex_plan_step<br/>串行执行 SQL step + 本地 merge/report]
     PlanExec --> PlanEnd([返回分步执行结果])
 
-    Complexity -->|single_sql / strict| Retrieve[sql_retrieve<br/>按已选表加载完整语义模型]
+    Feasible -->|single_sql / strict| Retrieve[sql_retrieve<br/>按已选表加载完整语义模型]
     Retrieve --> CheckDocs{check_docs}
     CheckDocs -->|无 schema| NoSchema([友好错误返回])
     CheckDocs -->|有 schema| Generate[sql_generate<br/>SQL 生成 + 最多 3 轮补表]
@@ -120,7 +119,7 @@ flowchart TD
 | `recall_evidence` | 唯一的业务知识/few-shot 召回节点，调用 Milvus/ES/MySQL fallback |
 | `recall_context` | 运行态结构化证据，不是新检索；用于防止重复召回和跨节点语义漂移 |
 | `select_tables` | 只给 LLM 表说明和少量命中字段提示，不提前注入完整 schema |
-| `route_complexity` | 5 张内单 SQL，6-8 张严格单 SQL，超过 8 张按语义信号进入计划或澄清 |
+| `assess_feasibility` | 不调用 LLM；基于 DB 规则、关系图连通性和 JOIN 风险产出 `execution_mode` |
 | `result_reflection` | 处理“执行成功但结果异常”，直接生成修正 SQL，再重新安全检查和审批 |
 
 ## 架构概览
@@ -378,11 +377,11 @@ python -m scripts.cleanup_schema_indexes
 
 ### Admin 配置治理教程
 
-服务启动后打开 `http://localhost:8080/`，进入 `Admin` Tab。这里维护的是运行时可调整的语义资产和规则信号，目标是把业务口径、路由规则和 SQL 示例放到 MySQL/Admin 中治理，而不是写死在 Python 代码里。
+服务启动后打开 `http://localhost:8080/`，进入 `Admin` Tab。这里维护的是运行时可调整的语义资产和规则信号，目标是把业务口径、路由规则和 SQL 示例放到 MySQL/Admin 中治理，而不是写死在 Python 代码里。企业 NL2SQL 的人工治理不只包括字段语义，还包括黄金评测集、业务口径、SQL few-shot、意图匹配规则和复杂查询路由规则；每次修复失败 case 后，都应把样本回流到评测集中做回归验证。
 
 #### 1. 语义模型：让字段能被业务语言命中
 
-语义模型对应 MySQL `t_semantic_model`，用于把物理 schema 变成 NL2SQL 可理解的字段画像。技术 schema（字段类型、注释、PK/FK）由 `scripts.seed_semantic_model` 从 `information_schema` 同步；业务字段可以在 Admin 页面补充。
+语义模型对应 MySQL `t_semantic_model`，用于把物理 schema 变成 NL2SQL 可理解的字段画像。技术 schema（字段类型、注释、PK/FK）首次可由 `scripts.seed_semantic_model` 初始化；服务运行时由 `schema_sync` 监听 MySQL binlog DDL 做增量同步，并用 `information_schema` 轮询兜底，更新后刷新 Redis 缓存。业务字段可以在 Admin 页面补充。
 
 | 字段 | 用途 | 示例 |
 |------|------|------|
@@ -393,7 +392,7 @@ python -m scripts.cleanup_schema_indexes
 
 案例：用户问“查询各部门年度预算总金额”时，`t_budget.cost_center_id` 的同义词包含“部门”，`t_cost_center.department_id` 又通过逻辑外键指向 `t_department.id`。运行时 `select_tables` 会先用这些字段提示帮助 LLM 选表，再用 `ref_table/ref_column` 构建 Schema Graph，补齐 `t_budget -> t_cost_center -> t_department`。
 
-注意：Admin 页面主要维护业务名、同义词和描述；逻辑外键 `is_fk/ref_table/ref_column` 通常通过 `scripts.seed_semantic_model` 或 schema sync 维护，避免手工漏配 JOIN 关系。
+注意：Admin 页面主要维护业务名、同义词和描述；逻辑外键 `is_fk/ref_table/ref_column` 通常通过 `scripts.seed_semantic_model` 或 schema sync 维护。运行时 binlog 主要跟踪表结构 DDL 变化，业务语义仍需要配置化治理，避免手工漏配 JOIN 关系。
 
 #### 2. 业务知识：让指标口径稳定
 
@@ -457,19 +456,19 @@ priority: 120
 confidence: 0.95
 ```
 
-命中后系统会更稳定地进入 SQL 链路，并把问题补齐为“公司第一季度毛利率”。低置信规则可以保留但降低 `confidence`，让 LLM 仲裁有机会覆盖它。
+命中后系统会更稳定地进入 SQL 链路，并把问题补齐为“公司第一季度毛利率”。低置信规则可以保留但降低 `confidence`，由 dispatcher 的规则与 LLM 仲裁决定是否采用。
 
-#### 5. 复杂查询路由规则：决定计划模式还是澄清
+#### 5. 复杂查询路由规则：给可行性评估提供任务类型
 
-复杂查询路由规则对应 `t_query_route_rule`，只在选表结果超过单 SQL 表数预算时使用。它不决定最终 SQL，而是给 `route_complexity` 一个语义信号，帮助系统判断应该生成多步计划，还是先让用户缩小范围。
+复杂查询路由规则对应 `t_query_route_rule`。运行时不会再调用 LLM 判断复杂路由，而是由规则引擎给 `assess_feasibility` 提供 `task_type` 证据，再结合关系图连通性、是否存在多条 JOIN 路径和计划自洽性计算最终 `execution_mode`。表数量只作为观测指标，不作为路由阈值。
 
 | 字段 | 用途 | 示例 |
 |------|------|------|
-| `route_signal` | `analysis` / `report` / `comparison` 会倾向 `complex_plan`；`detail` / `export` / `sensitive` / `ambiguous` 会倾向 `clarify` | `analysis` |
+| `route_signal` | 兼容字段名，运行时解释为 `task_type`：`analysis` / `report` / `comparison` 可拆分；`detail` / `export` / `sensitive` 先澄清 | `analysis` |
 | `match_type` | 匹配方式：`contains` / `exact` / `regex` | `regex` |
 | `pattern` | 命中的查询表达式 | `.*收入.*成本.*预算.*关系.*` |
 | `priority` | 多条规则命中时的排序，值越大越先匹配 | `150` |
-| `confidence` | 人工配置的规则可靠度；当前代码中 `>= 0.8` 才直接采用规则，否则回退 LLM 仲裁 | `0.95` |
+| `confidence` | 人工配置的规则可靠度；当前代码中 `>= 0.8` 才采用为可行性评估证据 | `0.95` |
 
 案例 A：复杂分析问题进入计划模式。
 
@@ -483,7 +482,7 @@ confidence: 0.95
 enabled: true
 ```
 
-当用户问“分析今年收入、成本、预算、费用报销之间的关系”，如果补表后超过 8 张表，系统会先命中规则，得到 `route_signal=analysis`，然后进入 `complex_plan_generate`。Planner 会输出 `sql / python_merge / report` 结构化步骤，并校验表白名单、步骤依赖、`merge_keys` 和步骤上限，最后交给用户确认。
+当用户问“分析今年收入、成本、预算、费用报销之间的关系”，系统会先命中规则，得到 `task_type=analysis`。`assess_feasibility` 会根据该任务类型产出 `execution_mode=complex_plan`，然后进入 `complex_plan_generate`。Planner 会输出 `sql / python_merge / report` 结构化步骤，并校验表白名单、步骤依赖、`merge_keys` 和步骤上限，最后交给用户确认。
 
 案例 B：明细导出问题先澄清。
 
@@ -503,7 +502,7 @@ enabled: true
 
 - `0.9~1.0`：表达非常明确、误伤低的规则，可以直接采用。
 - `0.8~0.89`：较可靠，但仍建议结合评测观察。
-- `<0.8`：保留为弱信号，不直接接管路由，运行时回退给 LLM 仲裁。
+- `<0.8`：保留为弱信号，不作为 `assess_feasibility` 的任务类型证据，运行时回退到默认结构评估。
 
 ### 评测数据与报告
 
@@ -773,8 +772,8 @@ report = checker.check("DELETE FROM users WHERE 1=1")
 ### 5. SQL React 图流程
 
 ```
-recall_evidence → query_enhance → select_tables → infer_route_signal → route_complexity
-(业务知识+few-shot)  (术语翻译)      (LLM选表)       (规则/LLM语义信号)       (单SQL/计划模式)
+recall_evidence → query_enhance → select_tables → assess_feasibility
+(业务知识+few-shot)  (术语翻译)      (LLM选表)       (规则引擎+结构特征决策)
      → sql_retrieve → check_docs → sql_generate
        (MySQL语义模型)              (SQL生成+补表)
      → safety_check → approve → execute_sql
@@ -788,7 +787,7 @@ recall_evidence → query_enhance → select_tables → infer_route_signal → r
 4. **查询增强**：基于同一份 `recall_context.evidence` 翻译术语/同义词；业务知识召回支持 MySQL `term/synonyms` 兜底
 5. **表选择**：从 MySQL/Redis 加载表名+描述，并基于 `t_semantic_model` 生成轻量 table routing profile；LLM 只看表说明和当前 query 命中的少量字段提示
 6. **本地重排与补表**：复用 `recall_context.business_related_tables/few_shot_related_tables` 加权，结合逻辑外键做链式补表，例如 `t_budget -> t_cost_center -> t_department`
-7. **复杂度路由**：表数超过单 SQL 预算时，进入 `complex_plan` 或 `clarify`，不把超大 schema 直接塞进 SQL 生成 prompt
+7. **复杂度路由**：基于任务类型、关系图连通性和 JOIN 风险进入 `single_sql`、`complex_plan` 或 `clarify`，不按表数量机械切换
 8. **Schema 加载**：从 `t_semantic_model` 按已选表构建完整业务 schema 文档
 9. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示；生成结果经 `normalize_sql_answer()` 清洗/校验
 10. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
@@ -842,7 +841,7 @@ sequenceDiagram
     API->>G: sql_query
     S->>S: recall_evidence -> recall_context
     S->>S: query_enhance(reuse recall_context)
-    S->>S: select_tables(reuse recall_context) + route_complexity
+    S->>S: select_tables(reuse recall_context) + assess_feasibility
     S->>S: sql_retrieve
     S->>LLM: sql_generate
     LLM-->>S: SQL

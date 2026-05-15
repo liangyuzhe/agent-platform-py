@@ -1,58 +1,108 @@
-from agents.flow.complex_query import classify_query_complexity, validate_complex_plan
+from agents.flow.complex_query import assess_query_feasibility, validate_complex_plan
 
 
 def test_small_schema_routes_to_single_sql():
-    result = classify_query_complexity(
+    result = assess_query_feasibility(
         query="去年亏损",
         selected_tables=["t_journal_entry", "t_journal_item", "t_account"],
-        relationships=[],
+        relationships=[
+            {"from_table": "t_journal_item", "to_table": "t_journal_entry"},
+            {"from_table": "t_journal_item", "to_table": "t_account"},
+        ],
     )
 
-    assert result.route_mode == "single_sql"
+    assert result.execution_mode == "single_sql"
     assert result.selected_tables_count == 3
 
 
-def test_eight_tables_still_single_sql_with_strict_checks():
-    result = classify_query_complexity(
+def test_connected_schema_without_task_rule_routes_to_single_sql():
+    result = assess_query_feasibility(
         query="查询项目预算和费用明细",
-        selected_tables=[f"t_{i}" for i in range(8)],
-        relationships=[],
+        selected_tables=["t_budget", "t_cost_center", "t_department"],
+        relationships=[
+            {"from_table": "t_budget", "to_table": "t_cost_center"},
+            {"from_table": "t_cost_center", "to_table": "t_department"},
+        ],
     )
 
-    assert result.route_mode == "single_sql_with_strict_checks"
+    assert result.execution_mode == "single_sql"
+    assert result.task_type == "ambiguous"
+    assert result.can_decompose is False
 
 
-def test_more_than_eight_analysis_signal_routes_to_complex_plan():
-    result = classify_query_complexity(
+def test_cyclic_schema_without_task_rule_routes_to_strict_single_sql():
+    result = assess_query_feasibility(
+        query="查询项目预算和费用明细",
+        selected_tables=["a", "b", "c"],
+        relationships=[
+            {"from_table": "a", "to_table": "b"},
+            {"from_table": "b", "to_table": "c"},
+            {"from_table": "a", "to_table": "c"},
+        ],
+    )
+
+    assert result.execution_mode == "single_sql_with_strict_checks"
+    assert result.join_risk == "medium"
+
+
+def test_analysis_task_routes_to_complex_plan_independent_of_table_count():
+    result = assess_query_feasibility(
+        query="收入成本预算回款费用之间的关系",
+        selected_tables=["t_journal_item", "t_account", "t_budget"],
+        relationships=[{"from_table": "t_journal_item", "to_table": "t_account"}],
+        task_type="analysis",
+    )
+
+    assert result.execution_mode == "complex_plan"
+    assert result.task_type == "analysis"
+    assert result.can_decompose is True
+
+
+def test_analysis_task_routes_to_complex_plan_even_when_schema_is_disconnected():
+    result = assess_query_feasibility(
         query="今年收入成本预算回款费用之间的关系",
-        selected_tables=[f"t_{i}" for i in range(9)],
+        selected_tables=["t_journal_item", "t_budget", "t_receivable_payable"],
         relationships=[],
-        route_signal="analysis",
+        task_type="analysis",
     )
 
-    assert result.route_mode == "complex_plan"
+    assert result.execution_mode == "complex_plan"
 
 
-def test_more_than_eight_detail_signal_routes_to_clarify():
-    result = classify_query_complexity(
+def test_detail_signal_routes_to_clarify():
+    result = assess_query_feasibility(
         query="员工工资和部门角色权限",
-        selected_tables=[f"t_{i}" for i in range(9)],
+        selected_tables=["t_user", "t_role"],
         relationships=[],
-        route_signal="detail",
+        task_type="detail",
     )
 
-    assert result.route_mode == "clarify"
+    assert result.execution_mode == "clarify"
+    assert result.needs_clarification is True
 
 
-def test_more_than_eight_without_signal_routes_to_clarify():
-    result = classify_query_complexity(
+def test_disconnected_schema_without_task_rule_routes_to_clarify():
+    result = assess_query_feasibility(
         query="员工工资和部门角色权限",
-        selected_tables=[f"t_{i}" for i in range(9)],
+        selected_tables=["t_user", "t_journal_item"],
         relationships=[],
     )
 
-    assert result.route_mode == "clarify"
-    assert result.query_intent_complexity == "ambiguous"
+    assert result.execution_mode == "clarify"
+    assert result.task_type == "ambiguous"
+
+
+def test_analysis_task_uses_rule_over_schema_size():
+    result = assess_query_feasibility(
+        query="去年收入成本关系",
+        selected_tables=["t_journal_entry", "t_journal_item", "t_account"],
+        relationships=[{"from_table": "t_journal_entry", "to_table": "t_journal_item"}],
+        task_type="analysis",
+    )
+
+    assert result.execution_mode == "complex_plan"
+    assert result.can_single_sql is False
+    assert result.can_decompose is True
 
 
 def test_validate_complex_plan_accepts_valid_plan():
@@ -67,6 +117,27 @@ def test_validate_complex_plan_accepts_valid_plan():
     }
 
     ok, error = validate_complex_plan(plan, allowed_tables={"a", "b", "c"})
+
+    assert ok is True
+    assert error == ""
+
+
+def test_validate_complex_plan_accepts_allowed_tables_without_table_count_gate():
+    plan = {
+        "mode": "complex_plan",
+        "steps": [
+            {
+                "step": 1,
+                "type": "sql",
+                "goal": "查跨域指标",
+                "tables": ["a", "b", "c", "d", "e", "f"],
+                "depends_on": [],
+                "merge_keys": ["department"],
+            }
+        ],
+    }
+
+    ok, error = validate_complex_plan(plan, allowed_tables={"a", "b", "c", "d", "e", "f"})
 
     assert ok is True
     assert error == ""

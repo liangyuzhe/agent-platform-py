@@ -40,8 +40,7 @@ class SQLReactState(TypedDict):
     table_relationships: list[dict]              # 表关系 [{from_table, from_column, to_table, to_column}]
     route_mode: str                              # single_sql | single_sql_with_strict_checks | complex_plan | clarify
     route_reason: str                            # 路由原因
-    route_signal: str                            # analysis | report | comparison | detail | export | sensitive | ambiguous
-    route_signal_source: str                     # rules | llm | default | not_needed
+    feasibility_decision: dict                   # execution_mode/task_type/can_decompose/join_risk 等可行性评估
     complexity_report: dict                      # 表数、关系数、估算 JOIN 数等复杂度信息
     complex_plan: dict                           # 复杂查询执行计划
     plan_validation_error: str                   # 复杂计划校验错误
