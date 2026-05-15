@@ -3,6 +3,7 @@ name = "financial-copilot-platform"
 version = "0.1.0"
 description = "Financial Copilot Platform built with LangChain and LangGraph"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
 dependencies = [
     "langchain>=0.3",
     "langchain-core>=0.3",
