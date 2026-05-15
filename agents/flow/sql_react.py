@@ -1532,6 +1532,30 @@ def _run_local_complex_step(step: dict, execution_results: dict[str, dict]) -> d
             "error": None,
         }
 
+    if step_type == "report" and step.get("merge_keys"):
+        rows, reason = _merge_dependency_rows(step, execution_results)
+        if rows is not None:
+            return {
+                "step": step_no,
+                "type": step_type,
+                "goal": step.get("goal", ""),
+                "depends_on": step.get("depends_on", []),
+                "merge_keys": step.get("merge_keys", []),
+                "result": rows,
+                "answer": f"报告步骤已完成本地合并，共 {len(rows)} 行。",
+                "error": None,
+            }
+        return {
+            "step": step_no,
+            "type": step_type,
+            "goal": step.get("goal", ""),
+            "depends_on": step.get("depends_on", []),
+            "merge_keys": step.get("merge_keys", []),
+            "result": _dependency_summary(step, execution_results),
+            "answer": f"报告步骤未能进行结构化行合并（{reason}），已保留依赖步骤摘要。",
+            "error": None,
+        }
+
     return {
         "step": step_no,
         "type": step_type,
@@ -1561,8 +1585,40 @@ def _format_complex_execution_answer(plan: dict, execution_results: dict[str, di
         if entry.get("error"):
             lines.append(f"   错误: {_short_text(entry['error'], 300)}")
         else:
-            lines.append(f"   结果: {_short_text(entry.get('answer') or entry.get('result'), 360)}")
+            lines.append(f"   结果: {_format_complex_entry_result(entry)}")
     return "\n".join(lines)
+
+
+def _format_row_preview(row: dict, max_columns: int = 8) -> str:
+    items = list(row.items())
+    rendered = "，".join(
+        f"{key}：{_format_result_value(value)}"
+        for key, value in items[:max_columns]
+    )
+    if len(items) > max_columns:
+        rendered += "，..."
+    return rendered
+
+
+def _format_structured_rows_preview(rows: list[dict], max_rows: int = 3) -> str:
+    if not rows:
+        return ""
+    preview_rows = [_format_row_preview(row) for row in rows[:max_rows]]
+    suffix = f"\n   仅展示前 {max_rows} 行，共 {len(rows)} 行。" if len(rows) > max_rows else ""
+    return "\n   合并结果预览:\n   " + "\n   ".join(preview_rows) + suffix
+
+
+def _format_complex_entry_result(entry: dict) -> str:
+    answer = str(entry.get("answer") or "").strip()
+    result = entry.get("result")
+    preview = ""
+    if entry.get("type") in {"python_merge", "report"} and isinstance(result, list):
+        structured_rows = [row for row in result if isinstance(row, dict)]
+        if len(structured_rows) == len(result):
+            preview = _format_structured_rows_preview(structured_rows)
+    if answer:
+        return _short_text(answer + preview, 700)
+    return _short_text(result, 700)
 
 
 def _joined_plan_sql(execution_results: dict[str, dict]) -> str:

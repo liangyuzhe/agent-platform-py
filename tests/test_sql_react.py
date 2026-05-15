@@ -1106,6 +1106,8 @@ class TestComplexRoute:
         assert result["plan_execution_results"]["1"]["sql"] == "SELECT period, revenue FROM a"
         assert result["plan_execution_results"]["2"]["sql"] == "SELECT period, budget FROM b"
         assert result["plan_execution_results"]["3"]["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
+        assert "合并结果预览" in result["answer"]
+        assert "period：2025-01，revenue：100，budget：80" in result["answer"]
 
     @pytest.mark.asyncio
     async def test_execute_complex_plan_step_expands_sql_step_join_path(self):
@@ -1228,6 +1230,37 @@ class TestComplexRoute:
         assert rows[0]["cost_center_id"] == "研发部"
         assert rows[0]["total_income"] == 100
         assert rows[0]["income_expense_budget"] == 80
+
+    def test_report_step_with_merge_keys_produces_local_merge_preview(self):
+        from agents.flow.sql_react import _format_complex_execution_answer, _run_local_complex_step
+
+        step = {
+            "step": 3,
+            "type": "report",
+            "goal": "汇总收入和预算关系",
+            "depends_on": [1, 2],
+            "merge_keys": ["period"],
+        }
+        execution_results = {
+            "1": {
+                "result": '[{"period":"2025-01","revenue":100}]',
+                "answer": "查询已执行完成。",
+                "error": None,
+            },
+            "2": {
+                "result": '[{"period":"2025-01","budget":80}]',
+                "answer": "查询已执行完成。",
+                "error": None,
+            },
+        }
+
+        entry = _run_local_complex_step(step, execution_results)
+        execution_results["3"] = entry
+        answer = _format_complex_execution_answer({"steps": [step]}, execution_results)
+
+        assert entry["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
+        assert "合并结果预览" in answer
+        assert "period：2025-01，revenue：100，budget：80" in answer
 
     @pytest.mark.asyncio
     async def test_execute_complex_plan_step_blocks_unsafe_generated_sql(self):
