@@ -37,7 +37,10 @@ class SQLReactState(TypedDict):
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     table_names: list[str]                       # 所有可用表名（启动时缓存）
     selected_tables: list[str]                   # LLM 选中的相关表名
+    table_metadata: dict                         # {table_name: display/business description}
     table_relationships: list[dict]              # 表关系 [{from_table, from_column, to_table, to_column}]
+    security_context: dict                       # 当前用户、角色和数据权限上下文
+    authorization_report: dict                   # 表/SQL 权限检查结果
     route_mode: str                              # single_sql | single_sql_with_strict_checks | complex_plan | clarify
     route_reason: str                            # 路由原因
     feasibility_decision: dict                   # execution_mode/task_type/can_decompose/join_risk 等可行性评估
@@ -80,6 +83,7 @@ class FinalGraphState(TypedDict):
     query: Annotated[str, latest_non_empty]
     session_id: str
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
+    security_context: dict                       # 当前用户、角色和数据权限上下文
     intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat
     rewritten_query: Annotated[str, latest_non_empty]  # classify 或前端预分类产出的独立查询
     sql: str

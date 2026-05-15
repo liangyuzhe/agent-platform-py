@@ -51,6 +51,41 @@ class ApproveRequest(BaseModel):
     feedback: str = ""
 
 
+def _split_csv(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _build_security_context(session_id: str, headers=None) -> dict:
+    """Build V1 security context from request headers with session fallback."""
+    headers = headers or {}
+    user_id = headers.get("x-user-id") or headers.get("X-User-Id") or session_id
+    username = headers.get("x-user-name") or headers.get("X-User-Name") or user_id
+    company_id_raw = headers.get("x-company-id") or headers.get("X-Company-Id")
+    try:
+        company_id = int(company_id_raw) if company_id_raw else None
+    except ValueError:
+        company_id = None
+    department_ids = []
+    for value in _split_csv(headers.get("x-department-ids") or headers.get("X-Department-Ids")):
+        try:
+            department_ids.append(int(value))
+        except ValueError:
+            continue
+    allowed_tables_header = headers.get("x-allowed-tables") or headers.get("X-Allowed-Tables")
+    allowed_tables = _split_csv(allowed_tables_header) if allowed_tables_header else None
+    return {
+        "user_id": user_id,
+        "username": username,
+        "role_ids": _split_csv(headers.get("x-role-ids") or headers.get("X-Role-Ids")),
+        "department_ids": department_ids,
+        "company_id": company_id,
+        "data_scopes": {},
+        "allowed_tables": allowed_tables,
+        "denied_tables": _split_csv(headers.get("x-denied-tables") or headers.get("X-Denied-Tables")),
+        "column_policies": {},
+    }
+
+
 def _load_chat_history(session_id: str, query: str = "") -> list[dict]:
     """从 session store 加载对话历史。"""
     session = get_session(session_id)
@@ -235,7 +270,7 @@ async def classify_intent_endpoint(req: QueryRequest):
 
 
 @router.post("/invoke", response_model=QueryResponse)
-async def query_invoke(req: QueryRequest):
+async def query_invoke(req: QueryRequest, request: Request = None):
     """查询调用：传入 intent 时跳过分类，直接路由到子图。"""
     graph = build_final_graph()
     graph_thread_id = _new_graph_thread_id(req.session_id)
@@ -248,6 +283,10 @@ async def query_invoke(req: QueryRequest):
         "chat_history": chat_history,
         "intent": req.intent or "",
         "rewritten_query": req.rewritten_query or "",
+        "security_context": _build_security_context(
+            req.session_id,
+            request.headers if request is not None else None,
+        ),
     }
 
     try:

@@ -20,6 +20,9 @@ from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.tool.storage.query_route_rules import evaluate_query_route_rules
+from agents.tool.security.policies import authorize_tables, build_audit_event
+from agents.tool.security.presentation import format_result_for_user
+from agents.tool.security.audit import write_audit_log
 from agents.config.settings import settings
 from agents.tool.trace.tracing import callbacks_from_config, child_trace_config, traced_tool_call
 
@@ -126,6 +129,30 @@ def _field_label_from_sql_alias(field: str, sql: str) -> str | None:
     return None
 
 
+def _field_label_from_semantic_model(field: str, state: SQLReactState) -> str | None:
+    semantic_model = state.get("semantic_model", {}) or {}
+    selected_tables = state.get("selected_tables", []) or []
+    ordered_tables = [
+        table for table in selected_tables
+        if table in semantic_model
+    ]
+    ordered_tables.extend(
+        table for table in semantic_model
+        if table not in ordered_tables
+    )
+    for table in ordered_tables:
+        column_meta = (semantic_model.get(table) or {}).get(field)
+        if not isinstance(column_meta, dict):
+            continue
+        business_name = str(column_meta.get("business_name") or "").strip()
+        if business_name:
+            return business_name
+        column_comment = str(column_meta.get("column_comment") or "").strip()
+        if column_comment:
+            return column_comment
+    return None
+
+
 def _friendly_field_label(field: str, value, state: SQLReactState, matched_terms: list[dict[str, str]], row: dict) -> str:
     query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
     non_flag_fields = [k for k, v in row.items() if not _is_flag_field(k, v)]
@@ -137,6 +164,10 @@ def _friendly_field_label(field: str, value, state: SQLReactState, matched_terms
     alias_label = _field_label_from_sql_alias(field, state.get("sql", ""))
     if alias_label:
         return alias_label
+
+    semantic_label = _field_label_from_semantic_model(field, state)
+    if semantic_label:
+        return semantic_label
 
     docs_label = _field_label_from_docs(field, state.get("docs", []))
     if docs_label:
@@ -225,6 +256,15 @@ def _format_sql_result_fallback(result: str, state: SQLReactState | None = None)
 
 async def _summarize_sql_result(state: SQLReactState, result: str) -> str:
     """Summarize SQL result locally from SQL aliases, schema docs, evidence and query."""
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    if not _query_matched_terms(query, state.get("evidence", [])):
+        text, _metadata = format_result_for_user(
+            result,
+            semantic_model=state.get("semantic_model", {}),
+            table_names=state.get("selected_tables", []),
+            sql=state.get("sql", ""),
+        )
+        return text
     return _format_sql_result_fallback(result, state)
 
 
@@ -991,7 +1031,7 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
             logger.warning("Failed to load table relationships: %s", e)
         logger.info("select_tables: %d candidates, using directly: %s, %d relationships",
                     len(candidate_tables), selected, len(relationships))
-        return {"selected_tables": selected, "table_relationships": relationships}
+        return {"selected_tables": selected, "table_relationships": relationships, "table_metadata": table_metadata}
 
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
@@ -1065,7 +1105,40 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
 
     logger.info("select_tables: LLM selected %d from %d candidates: %s, %d relationships",
                 len(selected), len(candidate_tables), selected, len(relationships))
-    return {"selected_tables": selected, "table_relationships": relationships}
+    return {"selected_tables": selected, "table_relationships": relationships, "table_metadata": table_metadata}
+
+
+async def authorize_selected_tables(state: SQLReactState, config=None) -> dict:
+    """Block the SQL path when selected tables require unavailable permissions."""
+    selected = state.get("selected_tables", [])
+    report = authorize_tables(
+        selected,
+        state.get("security_context"),
+        table_metadata=state.get("table_metadata", {}),
+        stage="selected_tables",
+    )
+    if report.allowed:
+        return {"authorization_report": report.to_dict()}
+    _write_permission_denied_audit(state, report, event_type="table_permission_denied")
+    return {
+        "authorization_report": report.to_dict(),
+        "answer": report.message,
+        "is_sql": False,
+    }
+
+
+def _write_permission_denied_audit(state: SQLReactState, report, *, event_type: str) -> None:
+    write_audit_log(build_audit_event(
+        event_type,
+        query=state.get("query", ""),
+        context=state.get("security_context"),
+        selected_tables=state.get("selected_tables", []),
+        denied_tables=report.denied_tables,
+        display_tables=report.display_denied_tables,
+        status="denied",
+        error="permission_denied",
+        extra={"stage": report.stage},
+    ))
 
 
 async def assess_feasibility(state: SQLReactState, config=None) -> dict:
@@ -1653,6 +1726,8 @@ async def _execute_complex_sql_step(
         "enhanced_query": step_query,
         "selected_tables": tables,
         "table_relationships": _filter_relationships_for_tables(state.get("table_relationships", []), table_set),
+        "table_metadata": state.get("table_metadata", {}),
+        "security_context": state.get("security_context", {}),
         "docs": [],
         "semantic_model": {},
         "sql": "",
@@ -1720,6 +1795,21 @@ async def _execute_complex_sql_step(
                     "safety_report": safety.get("safety_report"),
                 }
             step_state.update(safety)
+
+            authorization = await authorize_sql(step_state)
+            if authorization.get("is_sql") is False:
+                return {
+                    "step": step_no,
+                    "type": "sql",
+                    "goal": step.get("goal", ""),
+                    "tables": tables,
+                    "sql": step_state.get("sql", ""),
+                    "result": None,
+                    "answer": authorization.get("answer", "SQL 权限检查未通过"),
+                    "error": authorization.get("error") or "permission_denied",
+                    "authorization_report": authorization.get("authorization_report"),
+                }
+            step_state.update(authorization)
 
             executed = await execute_sql(step_state)
             step_state.update(executed)
@@ -2006,6 +2096,25 @@ async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: lis
     return unique_new
 
 
+def _authorize_missing_tables_or_response(state: SQLReactState, missing_tables: list[str]) -> dict | None:
+    report = authorize_tables(
+        missing_tables,
+        state.get("security_context"),
+        table_metadata=state.get("table_metadata", {}),
+        stage="missing_tables",
+    )
+    if report.allowed:
+        return None
+    _write_permission_denied_audit(state, report, event_type="missing_table_permission_denied")
+    return {
+        "authorization_report": report.to_dict(),
+        "answer": report.message,
+        "sql": "",
+        "is_sql": False,
+        "error": "permission_denied",
+    }
+
+
 def _build_sql_messages(query: str, docs_text: str, refine_context: str, history_context: str, evidence_text: str, few_shot_text: str, relationships_text: str = "") -> list:
     """Build messages for sql_generate LLM call."""
     return [
@@ -2143,6 +2252,9 @@ async def sql_generate(state: SQLReactState, config=None) -> dict:
 
         # LLM needs more tables — re-retrieve
         logger.info("sql_generate: round %d, LLM needs tables: %s", round_idx + 1, missing)
+        denied_response = _authorize_missing_tables_or_response(state, missing)
+        if denied_response:
+            return denied_response
         new_docs = await _retrieve_missing_tables(missing, all_docs, callbacks=callbacks)
         if not new_docs:
             logger.info("sql_generate: no new docs found for %s, using what we have", missing)
@@ -2206,6 +2318,40 @@ async def safety_check(state: SQLReactState) -> dict:
         }
 
     return {"safety_report": None}
+
+
+def _tables_from_sql(sql: str) -> list[str]:
+    tables: list[str] = []
+    seen: set[str] = set()
+    for table in _SQL_TABLE_RE.findall(sql or ""):
+        if table not in seen:
+            seen.add(table)
+            tables.append(table)
+    return tables
+
+
+async def authorize_sql(state: SQLReactState, config=None) -> dict:
+    """Conservative V1 SQL authorization over referenced tables."""
+    if not state.get("is_sql"):
+        return {"authorization_report": state.get("authorization_report", {})}
+    sql_tables = _tables_from_sql(state.get("sql", ""))
+    if not sql_tables:
+        sql_tables = state.get("selected_tables", [])
+    report = authorize_tables(
+        sql_tables,
+        state.get("security_context"),
+        table_metadata=state.get("table_metadata", {}),
+        stage="sql",
+    )
+    if report.allowed:
+        return {"authorization_report": report.to_dict()}
+    _write_permission_denied_audit(state, report, event_type="sql_permission_denied")
+    return {
+        "authorization_report": report.to_dict(),
+        "answer": report.message,
+        "is_sql": False,
+        "error": "permission_denied",
+    }
 
 
 def approve(state: SQLReactState) -> dict:
@@ -2481,6 +2627,7 @@ def build_sql_react_graph():
     graph.add_node("recall_evidence", recall_evidence)
     graph.add_node("query_enhance", query_enhance)
     graph.add_node("select_tables", select_tables)
+    graph.add_node("authorize_selected_tables", authorize_selected_tables)
     graph.add_node("assess_feasibility", assess_feasibility)
     graph.add_node("sql_retrieve", sql_retrieve)
     graph.add_node("check_docs", check_docs)
@@ -2489,6 +2636,7 @@ def build_sql_react_graph():
     graph.add_node("approve_complex_plan", approve_complex_plan)
     graph.add_node("execute_complex_plan_step", execute_complex_plan_step)
     graph.add_node("safety_check", safety_check)
+    graph.add_node("authorize_sql", authorize_sql)
     graph.add_node("approve", approve)
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("error_analysis", error_analysis)
@@ -2497,7 +2645,14 @@ def build_sql_react_graph():
     graph.add_edge(START, "recall_evidence")
     graph.add_edge("recall_evidence", "query_enhance")
     graph.add_edge("query_enhance", "select_tables")
-    graph.add_edge("select_tables", "assess_feasibility")
+    graph.add_edge("select_tables", "authorize_selected_tables")
+
+    def route_after_table_authorization(state: SQLReactState) -> str:
+        if state.get("is_sql") is False and state.get("answer"):
+            return END
+        return "assess_feasibility"
+
+    graph.add_conditional_edges("authorize_selected_tables", route_after_table_authorization)
 
     def route_after_complexity(state: SQLReactState) -> str:
         if state.get("route_mode") == "clarify":
@@ -2528,10 +2683,17 @@ def build_sql_react_graph():
 
     def route_after_safety(state: SQLReactState) -> str:
         if state.get("is_sql"):
-            return "approve"
+            return "authorize_sql"
         return END
 
     graph.add_conditional_edges("safety_check", route_after_safety)
+
+    def route_after_sql_authorization(state: SQLReactState) -> str:
+        if state.get("is_sql"):
+            return "approve"
+        return END
+
+    graph.add_conditional_edges("authorize_sql", route_after_sql_authorization)
 
     def route_after_approve(state: SQLReactState) -> str:
         if state.get("approved"):

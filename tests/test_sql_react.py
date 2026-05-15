@@ -1483,6 +1483,94 @@ class TestSafetyCheck:
 
 
 # ---------------------------------------------------------------------------
+# authorization nodes
+# ---------------------------------------------------------------------------
+
+class TestAuthorizationNodes:
+    """Test SQL data authorization gates."""
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.write_audit_log")
+    async def test_authorize_selected_tables_blocks_denied_business_domain(self, mock_audit):
+        from agents.flow.sql_react import authorize_selected_tables
+
+        result = await authorize_selected_tables({
+            "query": "查询所有用户真实姓名",
+            "selected_tables": ["t_user", "t_role"],
+            "security_context": {"allowed_tables": ["t_role"]},
+            "table_metadata": {
+                "t_user": "用户/员工账号信息",
+                "t_role": "系统角色信息",
+            },
+        })
+
+        assert result["is_sql"] is False
+        assert "用户/员工账号信息" in result["answer"]
+        assert "t_user" not in result["answer"]
+        assert result["authorization_report"]["allowed"] is False
+        assert result["authorization_report"]["denied_tables"] == ["t_user"]
+        audit_event = mock_audit.call_args[0][0]
+        assert audit_event["event_type"] == "table_permission_denied"
+        assert audit_event["denied_tables"] == ["t_user"]
+        assert audit_event["display_tables"] == ["用户/员工账号信息"]
+
+    @pytest.mark.asyncio
+    async def test_authorize_sql_blocks_table_not_allowed_by_context(self):
+        from agents.flow.sql_react import authorize_sql
+
+        result = await authorize_sql({
+            "query": "查询所有用户真实姓名",
+            "is_sql": True,
+            "sql": "SELECT real_name FROM t_user",
+            "selected_tables": ["t_user"],
+            "security_context": {"allowed_tables": ["t_role"]},
+            "table_metadata": {"t_user": "用户/员工账号信息"},
+        })
+
+        assert result["is_sql"] is False
+        assert "用户/员工账号信息" in result["answer"]
+        assert result["authorization_report"]["stage"] == "sql"
+
+    @pytest.mark.asyncio
+    async def test_complex_plan_sql_step_runs_authorize_sql_before_execute(self):
+        """Complex plan SQL steps must not bypass SQL authorization."""
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [_mock_doc("t_user: real_name")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"is_sql": True, "sql": "SELECT real_name FROM t_user", "answer": "SELECT real_name FROM t_user"}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", new_callable=AsyncMock) as mock_execute:
+            result = await execute_complex_plan_step({
+                "query": "复杂计划权限测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "查用户", "tables": ["t_user"], "depends_on": [], "merge_keys": ["id"]},
+                    ],
+                },
+                "plan_approved": True,
+                "security_context": {"allowed_tables": ["t_role"]},
+                "table_metadata": {"t_user": "用户/员工账号信息"},
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        step_result = result["plan_execution_results"]["1"]
+        assert "用户/员工账号信息" in step_result["answer"]
+        assert step_result["error"] == "permission_denied"
+        mock_execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # approve node
 # ---------------------------------------------------------------------------
 
@@ -1870,6 +1958,43 @@ HAVIN"""
         assert result["is_sql"] is True
         assert "JOIN" in result["sql"]
 
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react.get_semantic_model_by_tables")
+    @patch("agents.flow.sql_react.create_format_tool")
+    @patch("agents.flow.sql_react.get_chat_model")
+    async def test_generate_blocks_unauthorized_missing_tables(
+        self, mock_get_model, mock_format, mock_filter
+    ):
+        """Missing-table retrieval must not bypass table permissions."""
+        from agents.flow.sql_react import sql_generate
+
+        first_resp = MagicMock()
+        first_resp.tool_calls = [{
+            "args": {
+                "answer": "",
+                "is_sql": False,
+                "needs_more_tables": True,
+                "missing_tables": ["t_user"],
+            }
+        }]
+
+        mock_model = MagicMock()
+        mock_model.bind_tools.return_value = mock_model
+        mock_model.ainvoke = AsyncMock(return_value=first_resp)
+        mock_get_model.return_value = mock_model
+
+        state = {
+            "query": "每个部门的负责人姓名",
+            "docs": [Document(page_content="t_department: id, name", metadata={"table_name": "t_department"})],
+            "security_context": {"allowed_tables": ["t_department"]},
+            "table_metadata": {"t_user": "用户/员工账号信息"},
+        }
+        result = await sql_generate(state)
+
+        assert result["is_sql"] is False
+        assert "用户/员工账号信息" in result["answer"]
+        mock_filter.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # execute_sql node
@@ -1890,6 +2015,52 @@ class TestExecuteSql:
 
         assert '[{"id": 1' in result["result"]
         assert result["answer"] == "查询已执行完成。\nid：1\nname：Alice"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_execute_uses_business_field_names_from_semantic_model(self, mock_mcp_execute):
+        """User-visible SQL result should use business field names when available."""
+        from agents.flow.sql_react import execute_sql as exec_node
+
+        mock_mcp_execute.return_value = '[{"real_name":"张三","name":"财务审核"}]'
+
+        result = await exec_node({
+            "sql": "SELECT u.real_name, r.name FROM t_user u JOIN t_role r ON r.id = 1",
+            "selected_tables": ["t_user", "t_role"],
+            "semantic_model": {
+                "t_user": {"real_name": {"business_name": "真实姓名"}},
+                "t_role": {"name": {"business_name": "角色名称"}},
+            },
+            "execution_history": [],
+        })
+
+        assert "真实姓名：张三" in result["answer"]
+        assert "角色名称：财务审核" in result["answer"]
+        assert "real_name" not in result["answer"]
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_execute_business_term_path_uses_semantic_field_names(self, mock_mcp_execute):
+        """Business-term formatting should still avoid leaking physical field names."""
+        from agents.flow.sql_react import execute_sql as exec_node
+
+        mock_mcp_execute.return_value = '[{"real_name":"张三"}]'
+
+        result = await exec_node({
+            "query": "查询用户姓名",
+            "sql": "SELECT real_name FROM t_user",
+            "selected_tables": ["t_user"],
+            "semantic_model": {
+                "t_user": {"real_name": {"business_name": "真实姓名"}},
+            },
+            "evidence": [
+                "术语: 用户姓名\n同义词: 姓名\n关联表: t_user",
+            ],
+            "execution_history": [],
+        })
+
+        assert "真实姓名：张三" in result["answer"]
+        assert "real_name" not in result["answer"]
 
     @pytest.mark.asyncio
     @patch("agents.tool.sql_tools.mcp_client.execute_sql")
@@ -2028,6 +2199,8 @@ class TestBuildSqlReactGraph:
         assert "query_enhance" in node_names
         assert "recall_evidence" in node_names
         assert "assess_feasibility" in node_names
+        assert "authorize_selected_tables" in node_names
+        assert "authorize_sql" in node_names
         assert "infer_route_signal" not in node_names
         assert "route_complexity" not in node_names
         assert "complex_plan_generate" in node_names
