@@ -632,98 +632,15 @@ curl -X POST http://localhost:8080/api/document/insert \
 
 ## 核心设计
 
-### 1. LangGraph 图编排
+前面的“核心特性”和“最新节点调用流程图”是当前能力与主链路的权威说明。本节只保留实现层补充，避免重复描述同一条 SQL React 流程。
 
-所有业务流程用 **StateGraph** 定义，节点间通过 TypedDict 共享状态：
+### 1. LangGraph 状态编排
 
-```python
-# 定义状态
-class RAGChatState(TypedDict):
-    query: str
-    docs: list[Document]
-    messages: Annotated[list[BaseMessage], add_messages]
-    answer: str
+业务流程由 **StateGraph** 组织，节点间通过 TypedDict 共享运行态。外层 `Final Graph` 负责意图分类与路由，SQL 查询进入 `SQL React` 子图；审批、复杂计划确认和反思修正依赖 LangGraph `interrupt/Command(resume=...)` 做中断恢复。
 
-# 构建图
-graph = StateGraph(RAGChatState)
-graph.add_node("retrieve", retrieve)
-graph.add_node("chat", chat)
-graph.add_edge(START, "retrieve")
-graph.add_edge("retrieve", "chat")
-graph.add_edge("chat", END)
+这种拆分让主链路保持可观测、可恢复，也让 `recall_context`、选表结果、权限上下文和 SQL 审批状态可以在节点间明确传递，减少跨节点重复检索和隐式状态污染。
 
-app = graph.compile()
-result = await app.ainvoke({"query": "..."})
-```
-
-**优势：**
-- 节点自动并行执行（无依赖的节点）
-- 原生支持中断/恢复（Human-in-the-Loop）
-- 状态流转清晰，可调试
-
-### 2. 混合检索 + 重排序
-
-```
-Query → [Milvus(向量), ES(BM25)] → RRF 融合 → Cross-Encoder 重排序 → Top-K
-```
-
-- **Milvus**：稠密向量相似度检索
-- **Elasticsearch**：BM25 关键词检索（不是向量！）
-- **RRF**：Reciprocal Rank Fusion，无需调参
-- **Cross-Encoder**：`BAAI/bge-reranker-v2-m3`，精排序
-
-### 3. 分层记忆系统
-
-| 层级 | 存储 | 内容 | 触发方式 |
-|------|------|------|----------|
-| 短期记忆 | `Session.history` 滑动窗口 | 最近 `MEMORY_SHORT_WINDOW_MESSAGES` 条消息，直接注入意图识别/重写 | 每轮读取时裁剪 |
-| 中期记忆 | `Session.summary` | LLM 将旧消息和已有摘要合并后的滚动摘要 | 历史超过 `MEMORY_SUMMARY_MAX_HISTORY_LEN` 后异步压缩 |
-| 长期记忆 | Milvus `source=conversation_memory` | 被压缩归档的旧对话，按 `session_id` 隔离 | 压缩成功后写入向量库，后续按当前 query 语义召回 |
-
-**压缩与召回流程：**
-1. 每轮完成后保存 Q&A 到 session。
-2. 后台 memory manager 判断历史长度，超过阈值时保留最近 `MEMORY_SUMMARY_KEEP_RECENT` 条。
-3. 旧消息与已有摘要合并成新的 `Session.summary`。
-4. 被归档的旧消息写入 Milvus 长期记忆。
-5. 后续查询只携带短期窗口 + 摘要；如果当前 session 有长期记忆，再按 query 召回相关归档片段。
-
-结构化实体、事实、偏好提取模块仍保留为扩展能力，适合后续把稳定用户偏好或业务事实沉淀为更可控的长期记忆。
-
-### 4. SQL 安全分析
-
-```python
-checker = SQLSafetyChecker()
-report = checker.check("DELETE FROM users WHERE 1=1")
-# report.risks = ["DELETE with always-true WHERE"]
-# report.is_safe = False
-```
-
-检测模式：DROP TABLE、DELETE without WHERE、TRUNCATE、UPDATE with always-true WHERE 等。
-
-### 5. SQL React 图流程
-
-```
-recall_evidence → query_enhance → select_tables → assess_feasibility
-(业务知识+few-shot)  (术语翻译)      (LLM选表)       (规则引擎+结构特征决策)
-     → sql_retrieve → check_docs → sql_generate
-       (MySQL语义模型)              (SQL生成+补表)
-     → safety_check → approve → execute_sql
-          (安全检查)     (人工审批)     (MCP执行)
-```
-
-**核心流程**：
-1. **意图与查询重写**：在外层 `classify_intent` 一次完成，SQL React 子图不再做二次 rewrite。
-2. **证据检索**：并行检索业务知识（公式/术语）+ 智能体知识（SQL 示例），RRF 融合
-3. **召回上下文**：把本轮 evidence/few-shot 解析成 `recall_context`，只把命中当前 query 的业务知识和 few-shot 表证据写入相关表，避免召回噪声污染选表
-4. **查询增强**：基于同一份 `recall_context.evidence` 翻译术语/同义词；业务知识召回支持 MySQL `term/synonyms` 兜底
-5. **表选择**：从 MySQL/Redis 加载表名+描述，并基于 `t_semantic_model` 生成轻量 table routing profile；LLM 只看表说明和当前 query 命中的少量字段提示
-6. **本地重排与补表**：复用 `recall_context.business_related_tables/few_shot_related_tables` 加权，结合逻辑外键做链式补表，例如 `t_budget -> t_cost_center -> t_department`
-7. **复杂度路由**：基于任务类型、关系图连通性和 JOIN 风险进入 `single_sql`、`complex_plan` 或 `clarify`，不按表数量机械切换
-8. **Schema 加载**：从 `t_semantic_model` 按已选表构建完整业务 schema 文档
-9. **SQL 生成**：含自动补表（最多 3 轮）+ 表关系 JOIN 提示；生成结果经 `normalize_sql_answer()` 清洗/校验
-10. **安全检查 + 审批 + 执行**：SQL 安全分析 → 人工审批 → MCP 执行
-
-### 6. 检索数据源分工
+### 2. 检索数据源分工
 
 当前项目把“结构化元数据”和“非结构化知识”分开存储，避免用向量库承担精确 schema 查询。
 
@@ -740,95 +657,34 @@ recall_evidence → query_enhance → select_tables → assess_feasibility
 
 `source=mysql_schema` 的 Milvus/ES 记录是旧版 schema 向量检索遗留数据。当前 NL2SQL 不再读取这些记录；清理后，Milvus/ES 只保留业务知识、SQL few-shot、用户文档等非结构化检索数据，schema 统一由 Redis/MySQL 提供。
 
-**执行后自修正**：
+### 3. 三级记忆系统
+
+| 层级 | 存储 | 内容 | 触发方式 |
+|------|------|------|----------|
+| 短期记忆 | `Session.history` 滑动窗口 | 最近 `MEMORY_SHORT_WINDOW_MESSAGES` 条消息，直接注入意图识别/重写 | 每轮读取时裁剪 |
+| 中期记忆 | `Session.summary` | LLM 将旧消息和已有摘要合并后的滚动摘要 | 历史超过 `MEMORY_SUMMARY_MAX_HISTORY_LEN` 后异步压缩 |
+| 长期记忆 | Milvus `source=conversation_memory` | 被压缩归档的旧对话，按 `session_id` 隔离 | 压缩成功后写入向量库，后续按当前 query 语义召回 |
+
+**压缩与召回流程：**
+1. 每轮完成后保存 Q&A 到 session。
+2. 后台 memory manager 判断历史长度，超过阈值时保留最近 `MEMORY_SUMMARY_KEEP_RECENT` 条。
+3. 旧消息与已有摘要合并成新的 `Session.summary`。
+4. 被归档的旧消息写入 Milvus 长期记忆。
+5. 后续查询只携带短期窗口 + 摘要；如果当前 session 有长期记忆，再按 query 召回相关归档片段。
+
+结构化实体、事实、偏好提取模块仍保留为扩展能力，适合后续把稳定用户偏好或业务事实沉淀为更可控的长期记忆。
+
+### 4. 安全执行与结果自修正
+
+- SQL 安全检查只允许安全 `SELECT/WITH`，拦截 DROP、TRUNCATE、DELETE、UPDATE 和 always-true 条件等高风险语句。
+- 权限门禁在选表后、补表前、审批前和复杂计划 SQL step 中执行，拒绝时只展示业务数据域名称并写入审计事件。
 - 执行失败时，`is_retryable()` 判断错误类型，可重试错误进入 `error_analysis → sql_generate`
 - 执行成功但结果异常（空集、`NULL`、包装结构中的 `rows: []` 等）进入 `result_reflection`
 - `result_reflection` 直接生成修正后的 SQL，然后走 `safety_check → approve → execute_sql`，不再重复进入 `sql_generate`
 - 审批恢复使用 SSE 展示“执行中 → 异常检测 → 反思生成修正 SQL → 等待确认”的过程，避免用户误以为重复审批同一条 SQL
 - `query` 和 `rewritten_query` 使用 `latest_non_empty` reducer，允许新一轮非空 query 覆盖旧 checkpoint，approve/resume 没有新值时保留当前值，避免 LangGraph 并发更新错误
 
-**时序调用图**：
-
-```mermaid
-sequenceDiagram
-    participant U as 用户/前端
-    participant API as Query API
-    participant G as Final Graph
-    participant S as SQL React
-    participant LLM as LLM
-    participant DB as MCP MySQL
-
-    U->>API: /api/query/classify
-    API->>G: classify_intent
-    G-->>API: intent + rewritten_query
-
-    U->>API: /api/query/invoke
-    API->>G: sql_query
-    S->>S: recall_evidence -> recall_context
-    S->>S: query_enhance(reuse recall_context)
-    S->>S: select_tables(reuse recall_context) + assess_feasibility
-    S->>S: sql_retrieve
-    S->>LLM: sql_generate
-    LLM-->>S: SQL
-    S->>S: normalize_sql_answer + safety_check
-    S-->>API: interrupt(sql)
-    API-->>U: pending_approval
-
-    U->>API: /api/query/approve/stream
-    API-->>U: SSE status: 正在执行 SQL
-    API->>G: Command(resume)
-    G->>S: approve -> execute_sql
-    S->>DB: execute SQL
-    DB-->>S: result
-
-    alt 结果正常
-        S-->>API: answer/result
-        API-->>U: SSE result: completed
-    else 结果异常
-        S->>LLM: result_reflection
-        LLM-->>S: 修正后的 SQL
-        S->>S: normalize_sql_answer + safety_check
-        S-->>API: interrupt(reflected sql)
-        API-->>U: SSE status: 已反思并生成修正 SQL
-        API-->>U: SSE result: pending_approval
-    end
-```
-
-### 6. 意图路由 + 查询重写
-
-意图分类和查询重写合并为一次 LLM 调用，返回 `{intent, rewritten_query}`：
-
-```
-用户问题 + 对话历史 → classify_intent → sql_query → SQL React
-                                      → chat      → RAG Chat
-```
-
-- 意图分类基于 `domain_summary`（自动生成的数据库领域摘要），不硬编码
-- 可配置规则引擎与 LLM 并行执行，命中规则时可仲裁最终意图；业务关键词和重写模板维护在 MySQL/Admin 中
-- 重写后的查询直接传递给下游，下游节点跳过重复的 LLM 调用
-
-### 7. Human-in-the-Loop 审批
-
-```python
-# LangGraph interrupt 机制
-user_decision = interrupt({
-    "sql": "SELECT * FROM orders",
-    "message": "请审批此 SQL",
-})
-
-if user_decision.get("approved"):
-    return {"approved": True}
-
-return {
-    "approved": False,
-    "answer": user_decision.get("feedback", "SQL 已被拒绝。"),
-    "is_sql": False,
-}
-```
-
-审批通过后继续 `execute_sql`；审批不通过时直接结束并返回用户反馈。审批恢复使用 `Command(resume=...)`，不在 resume 时写回 `query`，避免父图/子图同一步重复更新状态。
-
-### 8. Token 预算管理
+### 5. Token 预算管理
 
 ```python
 counter = TokenCounter()
@@ -837,7 +693,7 @@ fitted = counter.fit_to_budget(parts, max_tokens=28672)
 # 自动裁剪低优先级内容，防止超出上下文窗口
 ```
 
-### 9. SFT 扩展预留
+### 6. SFT 扩展预留
 
 ```
 ChatModel 调用 → SFTHandler 采集 → 教师模型评分/修正 → JSONL 导出
