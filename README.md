@@ -24,9 +24,9 @@
 - **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路，避免在样本不足时把错误 SQL 和错误口径固化进模型。
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini。
 
-## 功能演示（6 个端到端案例）
+## 功能演示（7 个端到端案例）
 
-以下 GIF 均为本地 Web UI 录制并加速压缩，覆盖 Chat/Knowledge 路由、SQL 生成与审批执行、多轮追问、管理表关联查询和复杂计划执行 6 条典型案例。
+以下 GIF 均为本地 Web UI 录制并加速压缩，覆盖 Chat/Knowledge 路由、SQL 生成与审批执行、多轮追问、管理表关联查询、权限门禁和复杂计划执行 7 条典型案例。
 
 ### Chat / Knowledge：外部公开知识路由
 
@@ -57,6 +57,12 @@
 提问“查询所有用户的真实姓名以及他们被分配的角色名称”，系统命中用户、角色和用户角色绑定等管理类表语义，完成管理表关联 SQL 查询。
 
 ![SQL Query: 用户与角色](docs/assets/demos/sql-management-user-role-approved.gif)
+
+### Permission Gate：没有用户数据权限
+
+同样提问“查询所有用户的真实姓名以及他们被分配的角色名称”，但当前用户只允许访问角色数据；系统在表级权限门禁处停止，返回业务数据域权限提示，不暴露物理表名，也不会进入 SQL 审批执行。
+
+![Permission Gate: 用户角色数据权限拦截](docs/assets/demos/sql-permission-user-role-denied.gif)
 
 ### Complex Plan：收入成本预算回款费用关系
 
@@ -220,12 +226,6 @@ financial-copilot-platform/
 │   └── static/                     # 前端
 │       └── index.html              # Chat + SQL Agent + 文档上传 UI
 │
-├── scripts/                        # 种子数据脚本
-│   ├── seed_semantic_model.py      # 语义模型初始化 + information_schema 同步
-│   ├── seed_business_knowledge.py  # 业务知识种子 + Milvus/ES 索引
-│   ├── seed_agent_knowledge.py     # 智能体知识种子 + Milvus/ES 索引
-│   └── seed_financial.py           # 财务测试数据
-│
 ├── tests/                          # 测试
 ├── docs/                           # 技术文档
 │   ├── iterations.md               # 迭代优化记录
@@ -233,7 +233,6 @@ financial-copilot-platform/
 ├── python_langchain_design.md       # 技术设计文档
 │
 └── data/                           # 数据目录
-    ├── business_knowledge_seed.json # 可配置业务知识种子
     └── sft/                        # SFT 导出数据（预留）
 ```
 
@@ -317,71 +316,13 @@ uvicorn agents.api.app:app --host 0.0.0.0 --port 8080 --reload
 | API 文档 | http://localhost:8080/docs | Swagger UI |
 | 健康检查 | http://localhost:8080/health | 服务状态 |
 
-## 初始化脚本教程
-
-这些脚本用于把 NL2SQL 需要的“数据、语义、业务口径、SQL 示例”准备好。代码只负责加载和同步，具体业务口径应放在 MySQL 或 seed 配置文件里，不应写在查询逻辑里。
-
-### 推荐顺序
-
-全新环境建议直接执行总入口：
-
-```bash
-python -m scripts.seed_all
-```
-
-它会按顺序执行：
-
-1. `seed_financial`：创建财务测试业务表并写入样例数据。
-2. `seed_semantic_model`：初始化 `t_semantic_model`，同步字段类型、注释、主键、外键和业务映射。
-3. `seed_business_knowledge`：把业务术语、公式、同义词写入 `t_business_knowledge`，并索引到 Milvus/ES。
-4. `seed_agent_knowledge`：写入 SQL Q&A few-shot 示例，并索引到 Milvus/ES。
-5. `seed_intent_rules`：写入可配置意图规则，辅助 LLM 稳定路由。
-
-意图规则表 `t_intent_rule` 由服务启动时自动确保存在。规则内容不写在运行时代码里；需要固化高频路由规则时，可通过 `data/intent_rules_seed.json` 初始化，也可在 Admin 页面新增、编辑、删除。规则还支持可选 `rewrite_template`，用于把“第一季度毛利率”这类省略主体的问题补齐成“公司第一季度毛利率”。
-
-### 脚本说明
-
-| 脚本 | 为什么执行 | 写入/影响 | 什么时候执行 |
-|------|------------|-----------|--------------|
-| `scripts.seed_financial` | 准备本地演示和测试数据，否则 SQL Agent 没有业务表可查 | 创建 `t_account`、`t_journal_entry`、`t_journal_item` 等财务表和样例数据；包含可重复刷新的上一年度已过账亏损场景 | 首次搭建、重置测试库、验证“去年亏损/亏损多少” |
-| `scripts.seed_semantic_model` | 让 NL2SQL 理解字段业务含义，而不只看到物理字段名 | 创建/更新 `t_semantic_model`，从 `information_schema` 同步技术 schema，并写入业务名/同义词/描述 | 表结构变更后、首次搭建 |
-| `scripts.seed_business_knowledge` | 提供业务术语、公式、同义词，例如“亏损”对应某个业务口径 | 创建/更新 `t_business_knowledge`，并写入 Milvus/ES 检索索引 | 业务口径变更后、首次搭建 |
-| `scripts.seed_agent_knowledge` | 提供 SQL few-shot 示例，帮助 LLM 学习项目内常见 SQL 写法 | 创建/更新 `t_agent_knowledge`，并写入 Milvus/ES 检索索引 | 新增高质量 SQL 示例后 |
-| `scripts.seed_intent_rules` | 提供高频、确定性强的路由规则，和 LLM 意图识别并行后仲裁 | 创建/更新 `t_intent_rule`；规则数据来自 `data/intent_rules_seed.json` 或 Admin 页面 | 首次搭建、路由规则调整后 |
-| `scripts.seed_all` | 一键完成完整初始化，减少漏跑脚本 | 顺序执行以上脚本；schema 只进入 MySQL/Redis，不再写入 Milvus/ES | 全新环境优先使用 |
-| `scripts.cleanup_schema_indexes` | 清理旧版本遗留的 schema 向量索引 | 删除 Milvus/ES 中 `source=mysql_schema` 的历史记录 | 升级到 MySQL/Redis schema 检索后执行一次 |
-
-### 单独执行
-
-```bash
-# 1. 只创建财务测试表和样例数据
-python -m scripts.seed_financial
-
-# 2. 只同步语义模型
-python -m scripts.seed_semantic_model
-
-# 3. 只同步业务知识
-python -m scripts.seed_business_knowledge
-
-# 4. 只同步 SQL few-shot 示例
-python -m scripts.seed_agent_knowledge
-
-# 5. 只同步可配置意图规则
-python -m scripts.seed_intent_rules
-
-# 6. 清理旧 schema 向量索引（升级后执行一次）
-python -m scripts.cleanup_schema_indexes
-```
-
-`scripts.seed_financial` 会额外写入一组 `LOSS-YYYY-*` 凭证，用于稳定验证“去年亏损”“亏损多少”等 NL2SQL 场景。脚本每次执行都会先清理同年度旧的 `LOSS-YYYY-*` 凭证，再重新插入上一年度 12 个月的已过账收入、成本、费用分录，避免重复累加。该数据只用于测试库造数，不参与运行时 SQL 生成逻辑。
-
-### Admin 配置治理教程
+## 配置治理教程
 
 服务启动后打开 `http://localhost:8080/`，进入 `Admin` Tab。这里维护的是运行时可调整的语义资产和规则信号，目标是把业务口径、路由规则和 SQL 示例放到 MySQL/Admin 中治理，而不是写死在 Python 代码里。企业 NL2SQL 的人工治理不只包括字段语义，还包括黄金评测集、业务口径、SQL few-shot、意图匹配规则和复杂查询路由规则；每次修复失败 case 后，都应把样本回流到评测集中做回归验证。
 
 #### 1. 语义模型：让字段能被业务语言命中
 
-语义模型对应 MySQL `t_semantic_model`，用于把物理 schema 变成 NL2SQL 可理解的字段画像。技术 schema（字段类型、注释、PK/FK）首次可由 `scripts.seed_semantic_model` 初始化；服务运行时由 `schema_sync` 监听 MySQL binlog DDL 做增量同步，并用 `information_schema` 轮询兜底，更新后刷新 Redis 缓存。业务字段可以在 Admin 页面补充。
+语义模型对应 MySQL `t_semantic_model`，用于把物理 schema 变成 NL2SQL 可理解的字段画像。技术 schema（字段类型、注释、PK/FK）由 `schema_sync` 监听 MySQL binlog DDL 做增量同步，并用 `information_schema` 轮询兜底，更新后刷新 Redis 缓存。业务字段可以在 Admin 页面补充。
 
 | 字段 | 用途 | 示例 |
 |------|------|------|
@@ -392,7 +333,7 @@ python -m scripts.cleanup_schema_indexes
 
 案例：用户问“查询各部门年度预算总金额”时，`t_budget.cost_center_id` 的同义词包含“部门”，`t_cost_center.department_id` 又通过逻辑外键指向 `t_department.id`。运行时 `select_tables` 会先用这些字段提示帮助 LLM 选表，再用 `ref_table/ref_column` 构建 Schema Graph，补齐 `t_budget -> t_cost_center -> t_department`。
 
-注意：Admin 页面主要维护业务名、同义词和描述；逻辑外键 `is_fk/ref_table/ref_column` 通常通过 `scripts.seed_semantic_model` 或 schema sync 维护。运行时 binlog 主要跟踪表结构 DDL 变化，业务语义仍需要配置化治理，避免手工漏配 JOIN 关系。
+注意：Admin 页面主要维护业务名、同义词和描述；逻辑外键 `is_fk/ref_table/ref_column` 通常通过 schema sync 或 Admin 治理维护。运行时 binlog 主要跟踪表结构 DDL 变化，业务语义仍需要配置化治理，避免手工漏配 JOIN 关系。
 
 #### 2. 业务知识：让指标口径稳定
 
@@ -599,24 +540,13 @@ python -m agents.eval.cli run-nl2sql \
 
 ### 业务知识配置
 
-默认业务知识来自：
+业务知识应通过 Admin 页面或管理 API 维护。修改业务术语、公式、同义词后，触发业务知识重建索引，让 Milvus/ES 检索立即使用新内容：
 
 ```bash
-data/business_knowledge_seed.json
+curl -X POST http://localhost:8080/api/admin/business-knowledge/reindex
 ```
 
-这个文件是可配置数据，不是运行逻辑。修改业务术语、公式、同义词后，重新执行：
-
-```bash
-python -m scripts.seed_business_knowledge
-```
-
-如果不同项目有不同业务口径，不要改 Python 脚本，指定自己的 JSON 文件：
-
-```bash
-BUSINESS_KNOWLEDGE_SEED_FILE=/path/to/business_knowledge.json \
-  python -m scripts.seed_business_knowledge
-```
+如果不同项目有不同业务口径，建议沉淀为项目级配置数据，再通过 Admin/API 导入到 `t_business_knowledge`。
 
 JSON 格式：
 
@@ -635,8 +565,8 @@ JSON 格式：
 
 - MySQL、Milvus、Elasticsearch 已启动。
 - `.env` 里配置了 MySQL、Embedding 模型、Milvus、ES。
-- `seed_business_knowledge` 和 `seed_agent_knowledge` 需要 Embedding 配置可用，因为会写向量索引。
-- 如果只想先打开前端和 API，可以先启动服务；但 SQL Agent 的业务增强和 few-shot 质量依赖这些 seed 数据。
+- 业务知识和 SQL few-shot 重建索引需要 Embedding 配置可用，因为会写向量索引。
+- 如果只想先打开前端和 API，可以先启动服务；但 SQL Agent 的业务增强和 few-shot 质量依赖 Admin 中维护的语义资产。
 
 ## API 接口
 
@@ -807,13 +737,7 @@ recall_evidence → query_enhance → select_tables → assess_feasibility
 | 会话状态、checkpoint、schema 缓存、领域摘要缓存 | Redis | key-value 精确读取 | API、LangGraph、schema sync | 高频状态数据需要低延迟读写，Redis 作为缓存和会话存储 |
 | 实际业务数据 | MySQL 业务表 | LLM 生成 SELECT，经审批后由 MCP MySQL 执行 | `execute_sql` | MySQL 是业务数据权威来源，SQL 执行前必须经过安全检查和人工确认 |
 
-`source=mysql_schema` 的 Milvus/ES 记录是旧版 schema 向量检索遗留数据。当前 NL2SQL 不再读取这些记录，升级后可执行：
-
-```bash
-python -m scripts.cleanup_schema_indexes
-```
-
-清理后，Milvus/ES 只保留业务知识、SQL few-shot、用户文档等非结构化检索数据；schema 统一由 Redis/MySQL 提供。
+`source=mysql_schema` 的 Milvus/ES 记录是旧版 schema 向量检索遗留数据。当前 NL2SQL 不再读取这些记录；清理后，Milvus/ES 只保留业务知识、SQL few-shot、用户文档等非结构化检索数据，schema 统一由 Redis/MySQL 提供。
 
 **执行后自修正**：
 - 执行失败时，`is_retryable()` 判断错误类型，可重试错误进入 `error_analysis → sql_generate`

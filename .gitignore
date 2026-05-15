@@ -37,6 +37,8 @@ htmlcov/
 data/eval/
 outputs/
 docs/assets/demos/raw/
+scripts/
+README.full.local.md
 
 # Type checking
 .mypy_cache/

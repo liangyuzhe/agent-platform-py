@@ -3034,3 +3034,390 @@ recall_evidence
 .venv/bin/python -m pytest tests/test_complex_query.py tests/test_sql_react.py::TestComplexRoute tests/test_sql_react.py::TestBuildSqlReactGraph::test_graph_has_all_nodes tests/test_complex_query_eval.py -q
 # 28 passed
 ```
+
+## Iteration 45：数据权限前置、业务化结果展示与全链路审计
+
+### 背景
+
+当前 NL2SQL 链路已经具备意图路由、选表、SQL 生成、安全检查、人工审批、执行、自动修复和复杂计划能力，但企业级数据接入还缺少三个关键闭环：
+
+1. **数据权限不能只靠 SQL 执行失败兜底**
+   如果用户无权访问某类数据，系统不应该把无权限表静默过滤后继续让 LLM 猜 SQL。这样会导致两类问题：一是 LLM 找不到正确表后产生幻觉；二是用户无法理解为什么“同一个问题有时查不到”。正确做法是先识别问题需要的数据域，再明确告诉用户缺少哪个业务数据域的权限，并停止后续 SQL 链路。
+
+2. **自动补表也必须经过权限门禁**
+   当前 `sql_generate` 支持 `needs_more_tables=true` 后调用 `_retrieve_missing_tables()` 补表。如果只在 `select_tables` 后做权限检查，LLM 仍可能在 SQL 生成阶段要求补充一张无权限表，从而绕过前置门禁。因此补表入口必须复用同一套权限检查。
+
+3. **用户可见结果不能暴露物理 schema**
+   SQL 执行必须使用物理表名和字段名，但用户看到的结果、权限提示、记忆摘要和报告应该展示业务数据名称和业务字段名称。例如 `t_user.real_name` 应展示为“真实姓名”，`t_role.name` 应展示为“角色名称”。物理表名和字段名只应进入审计日志和管理员排障视图。
+
+同时，企业环境还要求**全链路审计**：记录每一次自然语言提问、重写后的问题、AI 生成 SQL、审批状态、执行参数、结果行数、脱敏字段和错误信息。一旦发生敏感数据泄露，需要能定位到“哪个用户、什么时间、通过什么问题、拿到了哪些数据域和多少行结果”。
+
+### 设计原则
+
+- **先识别，再授权，不静默过滤**：`select_tables` 负责识别业务相关表；新增权限节点负责判定是否可访问。无权限时返回友好提示并结束链路。
+- **用户提示用业务名，审计记录用物理名**：普通用户只看到“员工薪酬数据”“费用报销数据”等业务数据域；审计日志保留 `t_xxx.column` 级别证据。
+- **权限是多道门，不是单点检查**：选表后、补表时、SQL 执行前都要检查。
+- **SQL 授权兜底分阶段落地**：V1 在执行审批前提取 SQL 涉及表并做表级授权；后续再引入 SQL AST 解析、列级授权和行级条件注入。
+- **结果出站统一治理**：V1 先将物理字段名映射为业务字段名；后续在同一出站层增加列级脱敏，再进入用户展示、记忆和报告。
+- **审计默认不存明细值**：审计日志默认记录元数据、行数、字段、SQL hash、脱敏字段和错误，不保存完整敏感结果，避免审计库变成新的敏感数据源。
+
+### 目标链路
+
+普通单 SQL 链路升级为：
+
+```text
+classify_intent
+-> recall_evidence
+-> query_enhance
+-> select_tables
+-> authorize_selected_tables
+-> assess_feasibility
+-> sql_retrieve
+-> check_docs
+-> sql_generate
+-> safety_check
+-> authorize_sql
+-> approve
+-> execute_sql
+-> format_result_for_user
+```
+
+权限拒绝分支统一写入审计：
+
+```text
+authorize_selected_tables / authorize_missing_tables / authorize_sql
+-> write_audit_log(permission_denied)
+-> END
+```
+
+`sql_generate` 的补表分支升级为：
+
+```text
+LLM returns needs_more_tables + missing_tables
+-> authorize_missing_tables
+-> retrieve_missing_tables
+-> continue sql_generate
+```
+
+复杂计划链路升级为：
+
+```text
+complex_plan_generate
+-> validate_complex_plan
+-> authorize_complex_plan_tables
+-> approve_complex_plan
+-> execute_complex_plan_step
+   -> per-step safety_check
+   -> per-step authorize_sql
+   -> per-step execute_sql
+   -> per-step format_result_for_user
+```
+
+### 权限模型
+
+新增运行时 `SecurityContext`，由 API 层或登录态注入到 LangGraph state：
+
+```json
+{
+  "user_id": "u_001",
+  "username": "alice",
+  "role_ids": ["finance_manager"],
+  "department_ids": [10, 12],
+  "company_id": 1,
+  "data_scopes": {
+    "department": [10, 12],
+    "cost_center": [1001, 1002],
+    "owner_user": ["u_001"]
+  }
+}
+```
+
+语义模型和权限策略拆开维护：
+
+| 层级 | 建议表 | 作用 |
+|------|--------|------|
+| 表/数据域权限 | `t_role_table_permission` | 定义角色可访问哪些业务数据域或物理表 |
+| 字段权限 | `t_role_column_permission` | 定义字段可见、拒绝、脱敏策略 |
+| 行级策略 | `t_role_row_policy` | 定义某角色在某表上的行过滤模板 |
+| 敏感字段策略 | `t_sensitive_column_policy` | 定义手机号、邮箱、身份证、薪酬等字段的敏感级别和 mask 策略 |
+| 审计日志 | `t_query_audit_log` | 记录每次自然语言查询和 SQL 执行链路 |
+
+`t_semantic_model` 继续作为 schema 与业务语义权威源，维护字段业务名、同义词、字段描述和逻辑外键；权限策略表只引用其 `table_name/column_name`，不把业务语义重复写一份。
+
+### 表级权限交互
+
+`select_tables` 仍然从全部可见 schema 元数据中识别“问题需要哪些表”，但不直接把无权限表过滤掉后继续执行。新增 `authorize_selected_tables`：
+
+```text
+selected_tables = [t_user, t_user_role, t_role]
+unauthorized_tables = [t_user]
+```
+
+普通用户可见回答：
+
+```text
+当前问题需要访问「用户/员工账号信息」相关数据，但你暂无该数据权限。
+请联系管理员开通后再查询。
+```
+
+审计日志记录：
+
+```json
+{
+  "event": "table_permission_denied",
+  "physical_tables": ["t_user"],
+  "display_tables": ["用户/员工账号信息"],
+  "query": "查询所有用户的真实姓名以及他们被分配的角色名称",
+  "user_id": "u_001"
+}
+```
+
+这里不建议对普通用户暴露 `t_user`、`t_user_role` 等物理表名。物理信息仅用于管理员审计和排障。
+
+### 补表权限交互
+
+当前 `sql_generate` 在 LLM 返回 `needs_more_tables=true` 时会调用 `_retrieve_missing_tables(missing, ...)`。该入口必须改为：
+
+```text
+authorize_missing_tables(missing_tables)
+  if denied:
+    return permission_denied answer and stop
+  else:
+    retrieve_missing_tables
+```
+
+示例：
+
+```text
+LLM: 现有表不足，需要补充 t_salary_detail
+权限节点: 当前用户无权访问 t_salary_detail 对应的「员工薪酬明细」
+用户提示: 当前查询需要访问「员工薪酬明细」数据，但你暂无权限。
+```
+
+这可以防止“选表阶段没选中无权限表，但 SQL 生成阶段又补出来”的绕过路径。
+
+### SQL 执行前授权兜底
+
+即使前面两道门通过，也必须在 `safety_check` 后新增 `authorize_sql`：
+
+V1 已落地的是保守表级授权：
+
+1. 从生成 SQL 的 `FROM/JOIN` 中提取真实访问表。
+2. 如果解析不到表，回退到 `selected_tables` 做授权。
+3. 使用同一套 `authorize_tables` 策略检查 `allowed_tables/denied_tables`。
+4. 无权限时在进入人工审批前停止，返回业务数据域提示，并写入 `sql_permission_denied` 审计事件。
+
+后续增强再引入 SQL AST：
+
+1. 解析表、列、别名和子查询。
+2. 校验列级权限，发现无权限列时拒绝或转脱敏。
+3. 根据行级策略注入过滤条件，例如：
+
+```sql
+-- 原始 SQL
+SELECT claim_no, total_amount FROM t_expense_claim;
+
+-- 注入行级权限后
+SELECT claim_no, total_amount
+FROM t_expense_claim
+WHERE department_id IN (10, 12);
+```
+
+4. 对解析失败、未知表、未知列、`SELECT *` 展开失败等情况默认拒绝，不交给 LLM 自行修复。
+
+该节点与 `SQLSafetyChecker` 的职责不同：
+
+| 节点 | 关注点 |
+|------|--------|
+| `safety_check` | SQL 是否危险，例如 DDL/DML、DROP、DELETE、权限变更 |
+| `authorize_sql` | 当前用户是否有权访问 SQL 中涉及的表、列和行范围 |
+
+### 结果业务化展示
+
+新增 `format_result_for_user`，它不改变数据库执行结果，只改变用户可见结果：
+
+```text
+SQL 原始结果
+-> physical column/table -> business name
+-> answer / memory / report
+```
+
+字段映射来源：
+
+```text
+t_semantic_model.business_name
+t_semantic_model.column_comment
+t_semantic_model.business_description
+```
+
+例子：
+
+```json
+{
+  "columns": ["real_name", "name"],
+  "rows": [["张三", "财务审核"]]
+}
+```
+
+在用户侧展示为：
+
+```text
+真实姓名：张三
+角色名称：财务审核
+```
+
+对同名字段必须结合表或 SQL alias 判断，例如：
+
+| 物理字段 | 所属表 | 展示名 |
+|----------|--------|--------|
+| `t_role.name` | 角色表 | 角色名称 |
+| `t_department.name` | 部门表 | 部门名称 |
+| `t_account.account_name` | 会计科目表 | 科目名称 |
+
+因此 SQL 生成 prompt 仍要求 LLM 尽量使用业务别名：
+
+```sql
+SELECT u.real_name AS 真实姓名, r.name AS 角色名称
+```
+
+但最终不能依赖 LLM，必须通过结果后处理兜底。
+
+### 脱敏与记忆边界
+
+本轮 V1 已实现业务字段名替换，后续列级脱敏需要在以下动作之前完成：
+
+- 用户展示
+- `_summarize_sql_result`
+- `[上一轮SQL上下文]` 的展示结果
+- 摘要记忆
+- 长期向量记忆
+- 复杂计划 `python_merge/report`
+
+这样可以保证后续多轮追问、记忆召回、报告生成都不会重新暴露未脱敏字段。当前版本先保证用户侧不直接暴露 `real_name/name` 这类物理字段名，手机号、邮箱、薪酬明细等敏感字段的具体 mask 策略放到下一阶段。
+
+推荐策略：
+
+| 策略 | 行为 |
+|------|------|
+| `allow` | 原样展示 |
+| `mask` | 展示部分内容，例如手机号 `138****1234` |
+| `aggregate_only` | 允许聚合结果，不允许明细 |
+| `deny` | 直接拒绝查询 |
+
+### 全链路审计
+
+本轮新增 `write_audit_log` 的 best-effort 骨架，权限拒绝路径会记录审计事件，包括选表阶段拒绝、补表阶段拒绝和 SQL 执行前拒绝。该写入当前使用日志落地并保证 no-throw，不阻断用户请求。
+
+完整生产版审计需要覆盖所有终态，包括成功、拒绝、用户未审批、SQL 安全拒绝、权限拒绝、执行失败和自动修复失败。
+
+建议字段：
+
+| 字段 | 说明 |
+|------|------|
+| `audit_id` | 审计 ID |
+| `parent_audit_id` | 复杂计划父记录 |
+| `step_id` | 复杂计划步骤 ID |
+| `session_id` / `thread_id` | 会话与 LangGraph 线程 |
+| `user_id` / `role_ids` | 用户与角色 |
+| `query` / `rewritten_query` / `enhanced_query` | 原始问题与改写问题 |
+| `intent` / `execution_mode` | 意图与执行模式 |
+| `selected_tables` | 选中的物理表 |
+| `display_tables` | 用户可见业务数据域 |
+| `generated_sql` | LLM 生成 SQL |
+| `authorized_sql` | 注入行级策略后的 SQL |
+| `sql_hash` | SQL hash，便于去重和检索 |
+| `approval_status` | 待审批、已通过、已拒绝 |
+| `requested_columns` | SQL 涉及字段 |
+| `denied_tables` / `denied_columns` | 被拒绝的数据 |
+| `masked_columns` | 已脱敏字段 |
+| `row_count` | 返回行数 |
+| `result_schema` | 返回字段结构 |
+| `status` / `error` | 执行状态与错误 |
+| `latency_ms` | 总耗时 |
+| `trace_id` | LangSmith/CozeLoop trace |
+| `created_at` | 创建时间 |
+
+审计日志默认不保存完整结果值。如需合规留样，只能保存已脱敏样例，并通过配置开关控制。
+
+### 迭代开发拆分
+
+#### Task 1：权限数据模型与 SecurityContext
+
+- 已实现：在 API 请求进入 LangGraph 前构建 `SecurityContext`，支持从请求头读取 `x-user-id`、`x-role-ids`、`x-department-ids`、`x-allowed-tables`、`x-denied-tables`。
+- 已实现：`SQLReactState` / `FinalGraphState` 增加 `security_context`、`authorization_report`，dispatcher 会把权限上下文传入 SQL 子图。
+- 后续：新增权限策略表和 Admin 维护入口，覆盖表级、列级、行级和脱敏策略。
+
+验收：
+
+- 已覆盖 API 默认上下文和请求头解析单测。
+
+#### Task 2：选表后权限门禁
+
+- 已实现：新增 `authorize_selected_tables` 节点。
+- 已实现：`select_tables` 不静默过滤无权限表，而是保留选中表和表级业务描述。
+- 已实现：无权限时返回业务数据域名称提示，并结束 SQL 链路。
+- 已实现：审计记录 `table_permission_denied`。
+
+验收：
+
+- 用户查询无权限表时不会进入 `sql_retrieve/sql_generate`。
+- 用户提示不暴露物理表名。
+
+#### Task 3：补表权限门禁
+
+- 已实现：改造 `sql_generate` 中 `_retrieve_missing_tables()` 调用点。
+- 已实现：LLM 要求补表时先执行 `_authorize_missing_tables_or_response`。
+- 已实现：无权限补表直接停止，返回业务数据域权限提示，并记录审计。
+
+验收：
+
+- 构造 LLM 返回 `missing_tables=["t_salary_detail"]` 的测试，确认不会加载 schema。
+- 审计记录补表阶段的拒绝事件。
+
+#### Task 4：SQL 执行前授权
+
+- 已实现：新增 `authorize_sql` 节点，位于 `safety_check` 与 `approve` 之间。
+- 已实现：V1 通过 `FROM/JOIN` 提取 SQL 涉及表并校验表级权限。
+- 已实现：复杂计划的每个 SQL step 在 `safety_check` 后、`execute_sql` 前复用 `authorize_sql`。
+- 后续：引入 SQL AST 解析，提取列、别名和子查询；实现列级权限、行级 predicate 注入、`SELECT *` 展开与拒绝策略。
+
+验收：
+
+- 已覆盖 SQL 生成绕过选表后直接 JOIN 无权限表时被 `authorize_sql` 拒绝。
+- 已覆盖复杂计划 SQL step 不会绕过执行前授权。
+
+#### Task 5：结果脱敏与业务化展示
+
+- 已实现：新增 `format_result_for_user`。
+- 已实现：从 `semantic_model` 和 SQL alias 构建 `physical -> display` 映射，中文别名保持不变。
+- 已实现：`_summarize_sql_result` 使用业务化展示；业务术语命中路径也优先读取 `semantic_model` 字段业务名。
+- 后续：新增 `mask_result`，在字段展示前执行列级脱敏，并扩展到复杂计划 merge/report 的结构化结果。
+
+验收：
+
+- 已覆盖 `t_role.name` 与 `t_department.name` 按表顺序展示为不同业务名。
+- 已覆盖 SQL 执行结果将 `real_name/name` 展示为“真实姓名/角色名称”。
+
+#### Task 6：全链路审计日志
+
+- 已实现：新增 `write_audit_log` no-throw 骨架。
+- 已实现：表级权限拒绝、补表权限拒绝、SQL 执行前权限拒绝写审计事件。
+- 后续：新增 `t_query_audit_log`，成功、失败、拒绝、审批取消、安全拒绝都写审计；复杂计划写父审计和 step 审计。
+- 后续：审计默认只存元数据、行数、字段结构、SQL hash，不存完整明细。
+
+验收：
+
+- 已覆盖权限拒绝能定位用户、query、被拒绝物理表和业务数据域。
+
+### 回归测试计划
+
+1. 表级无权限：查询“所有用户真实姓名”，提示无权限，不进入 SQL 生成。
+2. 补表无权限：LLM 要求补充薪酬明细表，系统拒绝补表并结束。
+3. SQL 兜底：LLM 生成未授权表 JOIN，`authorize_sql` 拒绝。
+4. 业务化展示：结果列显示“真实姓名/角色名称”，不显示 `real_name/name`。
+5. 复杂计划：每个 SQL step 都走执行前权限检查。
+6. 后续补充：列级脱敏、行级权限、审计落库、复杂计划 step 审计和脱敏 merge/report。
+
+### 当前结论
+
+数据权限不能作为 SQL 执行失败后的补丁，而应该进入 NL2SQL 主链路：先让系统判断“这个问题需要什么业务数据”，再判断“当前用户是否有权访问”。本轮 V1 已经把表级权限接入选表后、补表时、SQL 审批前和复杂计划 SQL step，避免 LLM 因看不到表而幻觉，也避免补表和复杂计划绕过表级权限边界。下一阶段重点是把表级策略扩展到 SQL AST、行级权限、列级脱敏和持久化审计。

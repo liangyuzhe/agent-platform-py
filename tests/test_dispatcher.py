@@ -63,6 +63,27 @@ async def test_dispatcher_uses_current_query_and_rewrite_with_same_thread():
     assert fake_sql_graph.states[1]["rewritten_query"] == "我们公司第一季度的员工工资情况"
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_forwards_security_context_to_sql_subgraph():
+    """Security context from API state must reach SQL React authorization nodes."""
+    from agents.flow.dispatcher import sql_react
+
+    fake_sql_graph = _RecordingSqlGraph()
+
+    with patch("agents.flow.sql_react.build_sql_react_graph", return_value=fake_sql_graph):
+        await sql_react({
+            "query": "查询所有用户真实姓名",
+            "rewritten_query": "查询所有用户真实姓名",
+            "chat_history": [],
+            "security_context": {"user_id": "u-1", "allowed_tables": ["t_role"]},
+        })
+
+    assert fake_sql_graph.states[0]["security_context"] == {
+        "user_id": "u-1",
+        "allowed_tables": ["t_role"],
+    }
+
+
 def test_arbitration_uses_llm_intent_when_no_rule_signal():
     from agents.flow.dispatcher import _arbitrate_intent
 

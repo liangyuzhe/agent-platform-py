@@ -211,6 +211,7 @@ async def sql_react(state: FinalGraphState, config=None) -> dict:
             "query": query,
             "rewritten_query": state.get("rewritten_query", ""),
             "chat_history": state.get("chat_history", []),
+            "security_context": state.get("security_context", {}),
         },
         config=config,
     )
